@@ -104,13 +104,14 @@ impl<S: IsolatedStateCopy + SemanticStateTransaction, D: SnapshotValue>
             .checked_add(metadata_bytes as u64)
             .ok_or(ExecutionControlError::Overflow)?;
         let reservation = budget.reserve(SnapshotResourceKind::Snapshot, Some(estimate))?;
+        let authority = reservation.authority();
         let conversation = self
             .conversation
             .copy_snapshot(&reservation)
             .map_err(component)?;
-        let queue_copy = queue.copy_snapshot_value(&reservation).map_err(component)?;
+        let queue_copy = queue.copy_snapshot_value(&authority).map_err(component)?;
         let input = input_guard
-            .copy_snapshot_value(&reservation)
+            .copy_snapshot_value(&authority)
             .map_err(component)?;
         let neural = self.neural.copy_isolated(&reservation).map_err(component)?;
         Ok(PublicationSnapshot {
@@ -180,17 +181,18 @@ impl<S: IsolatedStateCopy + SemanticStateTransaction, D: SnapshotValue>
         let reservation = saved
             .budget
             .reserve(SnapshotResourceKind::Restore, Some(estimate))?;
+        let authority = reservation.authority();
         let conversation = saved
             .conversation
-            .copy_snapshot_value(&reservation)
+            .copy_snapshot_value(&authority)
             .map_err(component)?;
         let mut queue = saved
             .queue
-            .copy_snapshot_value(&reservation)
+            .copy_snapshot_value(&authority)
             .map_err(component)?;
         let mut candidate_input = saved
             .input
-            .copy_snapshot_value(&reservation)
+            .copy_snapshot_value(&authority)
             .map_err(component)?;
         self.conversation
             .validate_snapshot_retention(&conversation)

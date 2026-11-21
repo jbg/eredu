@@ -1,33 +1,13 @@
 //! Prepaid bounded receipt transport with a final all-rank delivery decision.
 use super::*;
 use eredu_core::{
-    consensus::BoundedConsensusTransport, BackendFailure, BoundedCompletion, BoundedCompletionWait,
-    BoundedSubmissionOutcome, Completion, CompletionCancellationMode,
+    BackendFailure, BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Completion,
+    CompletionCancellationMode,
 };
 
 const MAGIC: u32 = 0x4552_4350;
 const VERSION: u32 = 1;
 const HEADER_WORDS: usize = 16;
-
-/// Native facts and shared failure ownership for a capture receipt exchange.
-/// Implementations reuse their selected portable-word transport. Estimates must
-/// include retained input/output and native temporaries plus host resolution;
-/// runtime separately prices its framing buffers. These are logical reservations,
-/// never an assertion about physical allocator ceilings.
-pub trait PartitionCaptureTransport: BoundedConsensusTransport {
-    /// Rank in the exact retained participant topology.
-    fn capture_rank(&self) -> usize;
-    /// Selected bounded wait; querying it must not submit work.
-    fn capture_wait(&self) -> Result<BoundedCompletionWait, CaptureError>;
-    /// Rejects a previously failed shared execution/communication owner.
-    fn ensure_capture_active(&self) -> Result<(), BackendFailure>;
-    /// Side-effect-free upper bound for one equal-word gather and host resolution.
-    fn estimate_capture_gather(&self, local_words: usize) -> Result<CaptureUsage, CaptureError>;
-    /// Fences this execution after transport or unagreed protocol failure. This does not establish
-    /// native completion: the exact completion owner still settles or quarantines
-    /// submitted work before releasing resources, including on polling errors.
-    fn fail_capture_exchange(&self, error: &PartitionCaptureExchangeError);
-}
 
 /// Cooperative receipt exchange phase, distinct from a model computation phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +114,7 @@ where
             return Err(PartitionCaptureExchangeError::Protocol("admitted topology"));
         }
         u32::try_from(participants).map_err(|_| CaptureError::Overflow)?;
-        let wait = transport.capture_wait()?;
+        let wait = crate::capture::partition::capture_wait(transport)?;
         if !T::Completion::supports_cancellation(wait.cancellation()) {
             return Err(
                 CaptureError::Unsupported("capture transport cancellation policy".into()).into(),
@@ -212,7 +192,7 @@ where
                 PartitionCaptureExchangeError::LocalRejected { .. }
                     | PartitionCaptureExchangeError::PeerRejected { .. }
             ) {
-                transport.fail_capture_exchange(error);
+                transport.fence_capture_exchange();
             }
         }
         result

@@ -24,15 +24,15 @@ struct Support {
     transform: bool,
     paged: bool,
     weight_paging: bool,
-    rejected_dtype: Option<StateTensorDtype>,
+    rejected_dtype: Option<StateStorageDtype>,
     maximum_element_bytes: Option<u8>,
     storage_queries: RefCell<Vec<StateStorageDtype>>,
     queries: RefCell<Vec<(WeightLoweringKind, WeightLoweringDescriptor)>>,
-    state_queries: RefCell<Vec<(StateComponentPolicy, StateComponentPlacement)>>,
+    state_queries: RefCell<Vec<(Vec<StateTensorDimension>, StateComponentPlacement)>>,
 }
 
 impl ReplicatedTextMechanismSupport for Support {
-    fn facts(&self, _: &CacheResidencyPolicy) -> BackendMechanismFacts {
+    fn facts(&self, _: StateComponentPlacement) -> BackendMechanismFacts {
         BackendMechanismFacts::new(
             NeuralOperatorCapabilities::NONE,
             if self.weight_paging {
@@ -79,17 +79,17 @@ impl ReplicatedTextMechanismSupport for Support {
 
     fn supports_state_component(
         &self,
-        component: &StateComponentPolicy,
+        shape: &[StateTensorDimension],
         storage_dtype: StateStorageDtype,
         placement: StateComponentPlacement,
     ) -> bool {
         self.storage_queries.borrow_mut().push(storage_dtype);
         self.state_queries
             .borrow_mut()
-            .push((component.clone(), placement));
+            .push((shape.to_vec(), placement));
         self.maximum_element_bytes
             .is_none_or(|maximum| storage_dtype.bytes().get() <= maximum)
-            && self.rejected_dtype != Some(component.dtype())
+            && self.rejected_dtype != Some(storage_dtype)
             && (placement == StateComponentPlacement::Device || self.paged)
     }
 }
@@ -470,14 +470,16 @@ fn exact_state_components_retain_dtype_shape_and_semantic_placement() {
         .borrow()
         .iter()
         .all(
-            |(component, placement)| component.residency() == StateResidencyClass::SealablePaged
-                || *placement == StateComponentPlacement::Device
+            |(shape, placement)| *placement == StateComponentPlacement::Device
+                || declared.iter().any(|component| component.residency()
+                    == StateResidencyClass::SealablePaged
+                    && component.shape() == shape)
         ));
     assert!(select_replicated_text_realization(&requirements, &request, &report).is_ok());
 
     let unsupported = Support {
         paged: true,
-        rejected_dtype: Some(StateTensorDtype::Float32),
+        rejected_dtype: Some(StateStorageDtype::F32),
         ..Support::default()
     };
     let report = synthesize_replicated_text_capabilities(&requirements, &request, &unsupported);

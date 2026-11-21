@@ -171,10 +171,8 @@ mod tests {
 
     use super::*;
     use crate::RealtimeIngressContract;
-    use crate::{
-        RealtimePayloadContract, RealtimePayloadGeneration, RealtimePayloadOwnerIdentity,
-        TokenDomain,
-    };
+    use crate::{RealtimePayloadContract, RealtimePayloadGeneration, RealtimePayloadOwnerIdentity};
+    use eredu_core::sampling::TokenDomain;
     use eredu_core::RealtimeSpeechConfig;
 
     fn schedule(text_delay: usize) -> RealtimeChannelLayout {

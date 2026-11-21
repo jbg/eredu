@@ -10,100 +10,10 @@ use safemlx::ops::indexing::{ArrayIndex, IntoStrideBy};
 
 use super::score_readout::CHUNK;
 
-#[cfg(test)]
-mod tests;
-
 mod routed;
 mod token_scores;
 
-pub(in crate::composition::mlx) struct SpeculativeCaptureProvider {
-    stream: Stream,
-    partition: Option<MlxDistributedSession>,
-}
-impl SpeculativeCaptureProvider {
-    pub(in crate::composition::mlx) fn new(
-        stream: Stream,
-        partition: Option<MlxDistributedSession>,
-    ) -> Self {
-        Self { stream, partition }
-    }
-}
-
-impl eredu_runtime::capture::CaptureBackendProvider for SpeculativeCaptureProvider {
-    type Tensor = MlxTensor;
-    type Error = Error;
-    type Backend<'a> = NativeCapture<'a>;
-    fn backend(&mut self) -> NativeCapture<'_> {
-        NativeCapture {
-            stream: &self.stream,
-            domain: None,
-            partition: self.partition.as_ref(),
-        }
-    }
-}
-
-pub(in crate::composition::mlx) fn speculative_capture(
-    plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
-    request: eredu_core::SpeculativeRequestId,
-    stream: &Stream,
-) -> Result<
-    Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Exception>>>,
-    eredu_core::speculative::SpeculativeControlError,
-> {
-    Ok(
-        eredu_runtime::capture::SpeculativeCaptureObserver::from_admitted(
-            plan,
-            SpeculativeCaptureProvider::new(stream.clone(), None),
-            |error: &eredu_runtime::capture::CaptureExecutionError<Error>| {
-                Exception::custom(error.to_string())
-            },
-            request,
-            std::sync::Arc::new(super::intervention::NativeInterventionEstimator),
-        )?
-        .map(|observer| {
-            Box::new(observer)
-                as Box<
-                    dyn eredu_runtime::inspection::SpeculativeActivationObserver<
-                        MlxTensor,
-                        Exception,
-                    >,
-                >
-        }),
-    )
-}
-
-#[cfg(test)]
-thread_local! {
-    static HOST_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-    static TRANSFORM_FAILURE: std::cell::RefCell<Option<Exception>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(super) struct TestCaptureFailure;
-#[cfg(test)]
-impl Drop for TestCaptureFailure {
-    fn drop(&mut self) {
-        TRANSFORM_FAILURE.with(|slot| {
-            slot.borrow_mut().take();
-        });
-    }
-}
-#[cfg(test)]
-pub(super) fn fail_next_transform(error: Exception) -> TestCaptureFailure {
-    TRANSFORM_FAILURE.with(|slot| {
-        assert!(slot.borrow_mut().replace(error).is_none());
-    });
-    TestCaptureFailure
-}
-
-#[cfg(test)]
-pub(super) fn record_host_read(elements: usize) {
-    HOST_READS.with(|reads| {
-        let (total, largest) = reads.get();
-        reads.set((total + elements, largest.max(elements)));
-    });
-}
-
+#[cfg(feature = "tensor-capture")]
 pub(crate) fn capabilities() -> CaptureCapabilities {
     CaptureCapabilities {
         transformations: vec![CaptureTransformKind::RoutedUnits, CaptureTransformKind::Preview, CaptureTransformKind::Slice,
@@ -121,115 +31,32 @@ pub(crate) fn capabilities() -> CaptureCapabilities {
     }
 }
 
-pub(in crate::composition::mlx) struct NativeCapture<'a> {
+#[doc(hidden)]
+pub struct NativeCapture<'a> {
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) domain: Option<CaptureTokenDomain<'a>>,
     pub(in crate::composition::mlx) partition:
         Option<&'a crate::backend::distributed::MlxDistributedSession>,
 }
 
-/// Includes a conservative logical allowance for source/contiguous backing, all
-/// elementwise reduction temporaries (bounded chunks), host conversion buffers,
-/// and worst-case JSON numbers. Private allocator workspace is not claimed bounded.
-pub(super) fn estimate_shape(
-    source: &[u64],
-    selection: &CaptureSelection,
-    slice: &ResolvedCaptureSlice,
-) -> Result<CaptureUsage, CaptureError> {
-    if matches!(selection.transform, CaptureTransform::RoutedUnits) {
-        return routed::estimate(source, slice);
-    }
-    let source_elements = elements(source)?;
-    let selected = match selection.transform {
-        CaptureTransform::TopCandidates { .. } | CaptureTransform::TokenScores { .. } => {
-            source.last().copied().unwrap_or(0)
-        }
-        _ => elements(&slice.shape)?,
-    };
-    if source_elements > i32::MAX as u64
-        || source
-            .iter()
-            .chain(slice.strides.iter())
-            .any(|n| *n > i32::MAX as u64)
-    {
-        return Err(CaptureError::Unsupported(
-            "MLX capture shape/index exceeds signed 32-bit indexing".into(),
-        ));
-    }
-    let chunks = selected.div_ceil(CHUNK);
-    let (host_bytes, encoded_bytes, temporary_elements) = match &selection.transform {
-        CaptureTransform::RoutedUnits => unreachable!("handled before dense estimation"),
-        CaptureTransform::TokenScores { token_ids, .. } => {
-            if token_ids.is_empty()
-                || token_ids.len() > 64
-                || source
-                    .last()
-                    .is_none_or(|width| token_ids.iter().any(|id| u64::from(*id) >= *width))
-            {
-                return Err(CaptureError::Invalid(
-                    "selected score IDs exceed the runtime vocabulary or count limit".into(),
-                ));
-            }
-            let count = token_ids.len() as u64;
-            (
-                add(256, add(mul(count, 128)?, mul(chunks, 8)?)?)?,
-                add(1024, mul(count, 512)?)?,
-                selected.min(CHUNK),
-            )
-        }
-        CaptureTransform::TopCandidates { count } => {
-            if *count == 0 || source.last().is_none_or(|vocabulary| count > vocabulary) {
-                return Err(CaptureError::Invalid(
-                    "candidate count exceeds the runtime vocabulary".into(),
-                ));
-            }
-            (
-                add(80, mul(*count, 20)?)?,
-                add(384, mul(*count, 80)?)?,
-                *count,
-            )
-        }
-        CaptureTransform::Preview { max_elements } => {
-            let n = selected.min(*max_elements);
-            (mul(n, 16)?, add(128, mul(n, 32)?)?, n)
-        }
-        CaptureTransform::Slice | CaptureTransform::FullTensor => {
-            (mul(selected, 16)?, add(128, mul(selected, 32)?)?, selected)
-        }
-        CaptureTransform::Summary => (add(128, mul(chunks, 128)?)?, 512, selected.min(CHUNK)),
-        CaptureTransform::Histogram { edges } => {
-            let bins = edges.len().saturating_sub(1) as u64;
-            if bins == 0 || bins > 128 {
-                return Err(CaptureError::Unsupported("histogram bin count".into()));
-            }
-            (
-                add(mul(bins, 16)?, mul(chunks, mul(add(bins, 3)?, 8)?)?)?,
-                add(256, mul(add(bins, 1)?, 64)?)?,
-                selected.min(CHUNK),
-            )
-        }
-    };
-    // Candidate capture touches only the selected logits row: its temporaries
-    // (dtype copy, finite mask, argsort indices) are all row-sized, and the
-    // source backing is an inference allocation that exists regardless of
-    // capture. Charging the whole source would veto prefill candidate capture
-    // — where the source is [batch, prompt, vocabulary] — for any real prompt.
-    let (retained_source, retained_selected) = match &selection.transform {
-        CaptureTransform::TopCandidates { .. } | CaptureTransform::TokenScores { .. } => {
-            let vocabulary = source.last().copied().unwrap_or(0);
-            (vocabulary, vocabulary)
-        }
-        _ => (source_elements, selected),
-    };
-    Ok(CaptureUsage {
-        captures: 1,
-        retained_bytes: add(
-            add(mul(retained_source, 8)?, mul(retained_selected, 16)?)?,
-            add(4096, mul(temporary_elements, 128)?)?,
-        )?,
-        host_bytes,
-        encoded_bytes,
-    })
+/// Native allocation facts for the MLX capture operations.
+pub(super) const CAPTURE_WORKSPACE: CaptureWorkspaceModel = CaptureWorkspaceModel {
+    max_index: i32::MAX as u64,
+    reduction_chunk: std::num::NonZeroU64::new(CHUNK).unwrap(),
+    source_bytes_per_element: 8,
+    selected_bytes_per_element: 16,
+    workspace_base_bytes: 4096,
+    workspace_bytes_per_element: 128,
+    routed: Some(RoutedCaptureWorkspace {
+        base_bytes: 4096,
+        source_bytes_per_element: 24,
+        bytes_per_route: 192,
+    }),
+};
+
+fn bound_score_row(row: Option<u64>) -> Result<i32, Exception> {
+    row.and_then(|row| i32::try_from(row).ok())
+        .ok_or_else(|| Exception::custom("missing or unrepresentable admitted score row"))
 }
 
 impl CaptureBackend for NativeCapture<'_> {
@@ -237,7 +64,7 @@ impl CaptureBackend for NativeCapture<'_> {
         &self,
         request: &PartitionRoutedUnitCaptureRequest<'_>,
     ) -> Result<CaptureUsage, CaptureError> {
-        routed::estimate_partition(request)
+        CAPTURE_WORKSPACE.estimate_partition_routed(request)
     }
     fn capture_partition_routed_units(
         &mut self,
@@ -252,7 +79,7 @@ impl CaptureBackend for NativeCapture<'_> {
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError> {
-        estimate_shape(shape, selection, slice)
+        CAPTURE_WORKSPACE.estimate(shape, selection, slice)
     }
     fn capture_routed_units(
         &mut self,
@@ -333,7 +160,7 @@ impl CaptureBackend for NativeCapture<'_> {
         let shape = self
             .shape(tensor)
             .map_err(|e| CaptureError::Invalid(e.to_string()))?;
-        estimate_shape(&shape, selection, slice)
+        CAPTURE_WORKSPACE.estimate(&shape, selection, slice)
     }
 
     fn estimate_generated(
@@ -352,7 +179,7 @@ impl CaptureBackend for NativeCapture<'_> {
                 let shape = self
                     .shape(prototype)
                     .map_err(|error| CaptureError::Invalid(error.to_string()))?;
-                estimate_shape(&shape, selection, slice)
+                CAPTURE_WORKSPACE.estimate(&shape, selection, slice)
             }
             None => self.estimate(prototype, selection, slice),
         }
@@ -363,15 +190,12 @@ impl CaptureBackend for NativeCapture<'_> {
         tensor: &MlxTensor,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        score_row: Option<u64>,
     ) -> Result<CapturePayload, Error> {
         let stream = self.stream;
         // Reservation precedes even this evaluation. No observation-owned lazy
         // source is kept while later model blocks execute.
         tensor.as_array().evaluated()?;
-        #[cfg(test)]
-        if let Some(error) = TRANSFORM_FAILURE.with(|slot| slot.borrow_mut().take()) {
-            return Err(error.into());
-        }
         let indices: Vec<_> = slice
             .starts
             .iter()
@@ -392,11 +216,8 @@ impl CaptureBackend for NativeCapture<'_> {
             CaptureTransform::RoutedUnits => Err(Error::observation(CaptureError::Invalid(
                 "routed units require actual route metadata".into(),
             ))),
-            CaptureTransform::TokenScores {
-                position,
-                token_ids,
-            } => self
-                .token_scores(tensor, token_ids, *position)
+            CaptureTransform::TokenScores { token_ids, .. } => self
+                .token_scores(tensor, token_ids, bound_score_row(score_row)?)
                 .map_err(Into::into),
             CaptureTransform::TopCandidates { count } => {
                 let vocabulary = *tensor
@@ -406,7 +227,7 @@ impl CaptureBackend for NativeCapture<'_> {
                 let row = tensor
                     .as_array()
                     .reshape(&[-1, vocabulary], stream)?
-                    .try_index_device((-1, ..), stream)?
+                    .try_index_device((bound_score_row(score_row)?, ..), stream)?
                     .as_dtype(Dtype::Float32, stream)?;
                 if count_mask(row.is_finite(stream)?, stream)? != vocabulary as u64 {
                     return Err(
@@ -418,11 +239,6 @@ impl CaptureBackend for NativeCapture<'_> {
                     .try_index_device((vocabulary - *count as i32)..vocabulary, stream)?
                     .contiguous(false, stream)?;
                 let scores = row.take(&indices, stream)?;
-                #[cfg(test)]
-                {
-                    record_host_read(*count as usize);
-                    record_host_read(*count as usize);
-                }
                 let indices = indices.evaluated()?;
                 let scores = scores.evaluated()?;
                 let candidates = indices
@@ -467,18 +283,12 @@ impl CaptureBackend for NativeCapture<'_> {
 }
 
 fn scalar_f32(array: Array) -> Result<f64, Exception> {
-    super::score_readout::scalar_f32(array, report_host_read)
+    Ok(f64::from(array.evaluated()?.as_slice::<f32>()[0]))
 }
 
 fn count_mask(mask: Array, stream: &Stream) -> Result<u64, Exception> {
-    super::score_readout::count_mask(mask, stream, report_host_read)
-}
-
-fn report_host_read(elements: usize) {
-    #[cfg(test)]
-    record_host_read(elements);
-    #[cfg(not(test))]
-    let _ = elements;
+    let sum = mask.as_dtype(Dtype::Uint32, stream)?.sum(false, stream)?;
+    Ok(u64::from(sum.evaluated()?.as_slice::<u32>()[0]))
 }
 
 fn summary(flat: &Array, stream: &Stream) -> Result<CaptureSummary, Exception> {
@@ -579,36 +389,56 @@ fn histogram(flat: &Array, edges: &[f32], stream: &Stream) -> Result<CaptureHist
     Ok(out)
 }
 
-pub(super) fn observer<'a>(
-    capture: &'a mut eredu_runtime::capture::CaptureSession,
-    stream: &'a Stream,
-    domain: Option<CaptureTokenDomain<'a>>,
-    prediction: u64,
-) -> impl RuntimeActivationObserver<MlxTensor, Error> + 'a {
-    let native = NativeCapture {
-        partition: None,
-        stream,
-        domain,
-    };
-    if capture.plan().invocation_bounds().is_some() {
-        eredu_runtime::intervention::CaptureObserver::new(capture, native, capture_error)
-    } else {
-        eredu_runtime::intervention::CaptureObserver::for_step(
-            capture,
-            native,
-            prediction,
-            capture_error,
-        )
+/// Native observations, placement, and estimates used by the portable speculative collector.
+#[doc(hidden)]
+pub struct MlxSpeculativeCaptureMechanisms;
+
+impl CaptureWorkspace for MlxSpeculativeCaptureMechanisms {
+    fn capture_workspace() -> CaptureWorkspaceModel {
+        CAPTURE_WORKSPACE
     }
 }
 
-/// Portable policy failures remain directly discoverable in the public source
-/// chain; native failures keep their original error and creation location.
-pub(crate) fn capture_error(error: eredu_runtime::capture::CaptureExecutionError<Error>) -> Error {
-    match error {
-        eredu_runtime::capture::CaptureExecutionError::Admission(error) => {
-            Error::observation(error)
+impl eredu_core::capture::SpeculativeCapturePrimitives for MlxSpeculativeCaptureMechanisms {
+    type Queues = crate::composition::mlx::speculative::autoregressive::MlxAutoregressiveMechanisms;
+    type Transport = MlxDistributedSession;
+    type InvocationTensor = Array;
+    type ObserverError = Error;
+    type Scores = Array;
+    type Tensor = MlxTensor;
+    type Error = Error;
+    type InvocationError = Exception;
+    type Backend<'a> = NativeCapture<'a>;
+
+    fn capture_backend<'a>(
+        stream: &'a Stream,
+        partition: Option<&'a Self::Transport>,
+    ) -> NativeCapture<'a> {
+        NativeCapture {
+            stream,
+            domain: None,
+            partition,
         }
-        eredu_runtime::capture::CaptureExecutionError::Backend(error) => error,
+    }
+
+    fn intervention_mechanisms() -> eredu_core::intervention::InterventionMechanisms {
+        super::intervention::mechanisms()
+    }
+
+    fn intervention_estimator(
+    ) -> std::sync::Arc<dyn eredu_core::intervention::InterventionEstimator> {
+        std::sync::Arc::new(super::intervention::NativeInterventionEstimator)
+    }
+
+    fn generated_creation_bytes(shape: &[u64]) -> Result<u64, CaptureError> {
+        super::model_session::partition_capture::generated_creation_bytes(shape)
+    }
+
+    fn observation_failure(error: eredu_core::BackendFailure) -> Error {
+        Error::observation(error)
+    }
+
+    fn invocation_failure(error: &dyn std::error::Error) -> Exception {
+        Exception::custom(error.to_string())
     }
 }

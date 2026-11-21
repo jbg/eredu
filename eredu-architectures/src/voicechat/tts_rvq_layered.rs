@@ -1,5 +1,7 @@
 //! Independently leased feedback bank and shared projection over ordinary traversal.
 
+use eredu_core::SubmissionBackend;
+
 use super::{
     tts_mog::{f32_shape, TtsError},
     tts_mog_layered::MogExecution,
@@ -16,7 +18,6 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParameterGroupOwner, ParameterRole, StatelessComponentState,
-    SubmissionBackend,
 };
 use std::marker::PhantomData;
 

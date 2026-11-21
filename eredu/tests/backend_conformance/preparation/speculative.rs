@@ -19,7 +19,7 @@ fn draft_sampling_failure_agrees_before_the_next_collective_forward() {
                 GenerationRequest {
                     output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
-                    input: PreparedChatInput::prepared_backend_input(
+                    input: PreparedChatInput::prepared_input(
                         &chat,
                         vec![CONTROL_REJECTION_PROMPT_TOKEN],
                     ),

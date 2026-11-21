@@ -12,9 +12,7 @@ description = "MLX backend implementation for Eredu's neutral contracts"
 readme = "README.md"
 include = [
     "src/**",
-    "tests/**",
     "examples/*.rs",
-    "examples/support/**",
     "validation/**",
     "doc/**",
     "README.md",
@@ -31,43 +29,16 @@ targets = [
 no-default-features = true
 features = ["image"]
 
-[[example]]
-name = "mimi_realtime_bench"
-path = "examples/mimi_realtime_bench.rs"
-
-[[example]]
-name = "personaplex_full_path_bench"
-path = "examples/personaplex_full_path_bench.rs"
-
-[[example]]
-name = "personaplex_quantization_eval"
-path = "examples/personaplex_quantization_eval.rs"
-
-[[example]]
-name = "lfm3_audio_reference"
-path = "examples/lfm3_audio_reference.rs"
-required-features = ["audio"]
-
-[[example]]
-name = "capture_discovery"
-path = "examples/capture_discovery.rs"
-required-features = ["tensor-capture"]
-
 [features]
-tensor-capture = [
-    "eredu-core/tensor-capture",
-    "eredu-runtime/tensor-capture",
-    "eredu-architectures/tensor-capture",
-    "eredu-evaluation/tensor-capture",
-]
+tensor-capture = ["eredu-core/tensor-capture"]
 default = []
 accelerate = ["safemlx/accelerate"]
 metal = ["safemlx/metal"]
 cuda = ["safemlx/cuda"]
 distributed = []
 nccl = ["cuda", "distributed", "safemlx/nccl"]
-image = ["eredu-architectures/image"]
-audio = ["eredu-architectures/audio"]
+image = []
+audio = []
 # Opt-in native diagnostic tooling; no collection in ordinary builds.
 projection-profiling = []
 
@@ -78,8 +49,6 @@ workspace = true
 eredu-core.workspace = true
 eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
-eredu-runtime.workspace = true
-eredu-architectures.workspace = true
 eredu-gguf.workspace = true
 safemlx = { workspace = true, default-features = false, features = ["safetensors"] }
 eredu-backend-mlx-macros.workspace = true
@@ -91,14 +60,3 @@ sha2.workspace = true
 thiserror = "2"
 smallvec = "1"
 ref-cast = "1"
-
-[dev-dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-eredu-codec.workspace = true
-eredu-evaluation.workspace = true
-eredu-media = { workspace = true, default-features = false }
-eredu-text = { workspace = true, default-features = false }
-tempfile.workspace = true
-float_eq = "1"
-pretty_assertions = "1"

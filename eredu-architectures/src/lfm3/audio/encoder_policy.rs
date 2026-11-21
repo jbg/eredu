@@ -3,11 +3,11 @@
 use super::*;
 use crate::lfm3::audio::{placement::prepare_audio_units, ArtifactError, BindingSource};
 use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_core::BackendFailure;
 use eredu_runtime::{
     ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddressMap, ExecutionUnitLayout,
     LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward, RuntimeLayerState,
-    WeightBinding,
 };
 use std::{iter, marker::PhantomData, ops::Range};
 
@@ -126,19 +126,15 @@ impl PreparedAudioEncoder {
     }
 
     /// Connects the retained encoder units to a generic parameter materializer.
-    pub fn bind<B, P>(
+    pub fn bind<B, M>(
         self,
         context: &<B::Tensor as Tensor>::Context,
-        bind_units: impl FnOnce(
-            SharedCheckpointSource,
-            ExecutionUnitAddressMap,
-            Vec<Vec<WeightBinding>>,
-            &dyn Fn() -> Result<Vec<EncoderModule<B>>, BackendFailure>,
-        ) -> Result<P, BackendFailure>,
-    ) -> Result<PolicyEncoder<B, P>, BackendFailure>
+        residency: eredu_runtime::LayerWeightResidency,
+        mechanisms: &M,
+    ) -> Result<PolicyEncoder<B, M::UnitPolicy<EncoderModule<B>>>, BackendFailure>
     where
         B: NeuralBackend,
-        P: LayerwisePolicy<B, EncoderModule<B>>,
+        M: eredu_runtime::ParameterUnitMechanisms<B>,
     {
         let Self {
             declaration,
@@ -146,13 +142,20 @@ impl PreparedAudioEncoder {
             invocations,
             units,
         } = self;
-        let policy = bind_units(source, invocations.clone(), units, &|| {
-            declaration
-                .units()
-                .map(|unit| build(&declaration, unit, context))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(BackendFailure::from_error)
-        })?;
+        let (policy, _) = eredu_runtime::bind_parameter_units(
+            mechanisms,
+            source,
+            invocations.clone(),
+            units,
+            residency,
+            || {
+                declaration
+                    .units()
+                    .map(|unit| build(&declaration, unit, context))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(BackendFailure::from_error)
+            },
+        )?;
         Ok(PolicyEncoder {
             declaration,
             invocations,

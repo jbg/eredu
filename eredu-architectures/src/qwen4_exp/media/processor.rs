@@ -1,12 +1,15 @@
 //! Retained processor semantics and authoritative input representation selection.
 use super::{AdmittedMediaInput, MediaAdmissionConfig, MediaIngress, MediaInputError};
 use crate::processor_execution::{
-    PreparedProcessor, ProcessorExecutionError, ProcessorInputAdmission, ProcessorMechanisms,
+    PreparedProcessor, ProcessorExecutionError, ProcessorInputAdmission,
 };
+use eredu_core::input::PreparedInputInspector;
+use eredu_core::input::ProcessorMechanisms;
+use eredu_core::PreparedModelInput;
 use eredu_core::{InputModality as Modality, InputPayloadKind, TokenizedMultimodalRequest};
 use eredu_runtime::{
-    ModalityProcessorRequirements, PreparedInputInspector, PreparedModelInput,
-    ProcessorExecutionRequirements, ProcessorPrimitive as Primitive, SelectedProcessorExecution,
+    ModalityProcessorRequirements, ProcessorExecutionRequirements, ProcessorPrimitive as Primitive,
+    SelectedProcessorExecution,
 };
 
 /// Source-independent selected preparation; owns no checkpoint or native context.

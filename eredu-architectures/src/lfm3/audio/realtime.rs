@@ -1,9 +1,12 @@
 //! Incremental speech generation over the shared realtime transaction.
 
+use eredu_core::sampling::DenseSamplingBackend;
+
 use super::{
     AudioPhase, AudioSchedule, AudioScheduleError, DepthDeclaration, DepthFrame, DepthProgress,
     PreparedAudio,
 };
+use eredu_core::sampling::SamplingBackend;
 use eredu_core::{
     execution_control::{SnapshotEstimate, SnapshotLimits, SnapshotResourceKind, SnapshotUsage},
     scheduler::SemanticStateTransaction,
@@ -13,12 +16,12 @@ use eredu_nn::{Index, Tensor, TensorElementType};
 use eredu_runtime::{
     execution_control::{
         snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateError,
-        IsolatedStateFork, IsolatedStateSnapshot, SnapshotBudget, SnapshotReservation,
-        SnapshotRetainedGrowth, SnapshotValue,
+        IsolatedStateFork, IsolatedStateSnapshot, SnapshotBudget, SnapshotRetainedGrowth,
+        SnapshotRetention, SnapshotValue,
     },
-    DenseSamplingBackend, GenerationSampler, RealtimeFrameExecutionError, RealtimeFrameTransition,
+    GenerationSampler, RealtimeFrameExecutionError, RealtimeFrameTransition,
     RealtimeGenerationBranch, RealtimeGenerationContract, RealtimeGenerationState,
-    RealtimeGenerationTransactionError, SamplingBackend,
+    RealtimeGenerationTransactionError,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -115,7 +118,7 @@ impl SnapshotValue for AudioSampling {
         ])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             text_sampler: self.text_sampler.copy_snapshot_value(retention)?,
             speech_sampler: self.speech_sampler.copy_snapshot_value(retention)?,
@@ -300,10 +303,8 @@ pub trait AudioExecutionKernel {
 
     /// Holds the branch's reservation through all native work in an advance.
     /// Unresolved work must retain it even when the operation fails or unwinds.
-    fn with_fork_retention<T>(
-        retention: SnapshotRetainedGrowth,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, BackendFailure>;
+    fn hold_fork_retention(retention: SnapshotRetainedGrowth)
+        -> Result<impl Sized, BackendFailure>;
 }
 
 type Random<K> = <<K as AudioExecutionKernel>::SamplerBackend as SamplingBackend>::RandomState;
@@ -529,13 +530,12 @@ where
             .try_borrow_mut()
             .map_err(|_| AudioSessionError::Busy)?;
         let result = if let Some(fork) = &self.fork {
-            K::with_fork_retention(fork.growth.clone(), || {
-                self.generation
-                    .execute_frame_transition_checked(&(), &mut *transition, |branch| {
-                        let bytes = (fork.estimate)(branch)?;
-                        fork.growth.admit(bytes).map_err(failure)
-                    })
-            })?
+            let _retention = K::hold_fork_retention(fork.growth.clone())?;
+            self.generation
+                .execute_frame_transition_checked(&(), &mut *transition, |branch| {
+                    let bytes = (fork.estimate)(branch)?;
+                    fork.growth.admit(bytes).map_err(failure)
+                })
         } else {
             self.generation
                 .execute_frame_transition(&(), &mut *transition)

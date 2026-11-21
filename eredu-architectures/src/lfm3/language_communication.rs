@@ -1,18 +1,21 @@
 //! Communication and publication for the LFM3 language pipeline.
 
 use super::{PreparedLanguagePartition, SelectedLanguagePartition};
+use eredu_core::communication::{
+    BoundaryDimensionContract, BoundaryRoleContract, CommunicationCompletionPolicy,
+    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperationRequirement,
+    CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits,
+    RoleExactBoundaryContract,
+};
+use eredu_core::communication::{CommunicationOperation, PipelineActivationDtype};
 use eredu_core::{
     checkpoint::TensorDtype, BackendFailure, CollectiveGroupId, CompletionCancellationMode,
     ParallelRankTopology,
 };
 use eredu_runtime::{
     project_communication_manifest, ArchitectureBoundary, ArchitectureGroupKind,
-    BoundaryDimensionContract, BoundaryRoleContract, CommunicationCompletionPolicy,
-    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
-    CommunicationOperationRequirement, CommunicationRouteDescriptor, CommunicationRouteId,
-    CommunicationTensorLimits, LayeredPartitionDriver, PartitionBoundaryRoute,
-    PartitionOutputPublication, PartitionedExecutionPlan, PipelineActivationDtype,
-    PipelineWireContract, RoleExactBoundaryContract, TopologyCommunicationPlan,
+    LayeredPartitionDriver, PartitionBoundaryRoute, PartitionOutputPublication,
+    PartitionedExecutionPlan, PipelineWireContract, TopologyCommunicationPlan,
 };
 use std::time::Duration;
 

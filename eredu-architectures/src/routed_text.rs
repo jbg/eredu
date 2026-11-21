@@ -5,229 +5,29 @@ use std::{
     marker::PhantomData,
 };
 
+use eredu_nn::tensor_movement::IndexedMovement;
 use eredu_nn::{
     GroupSelection, GroupedGatedProductOperator, GroupedLinearOperator, GroupedNeuralBackend,
     GroupedRelu2Operator, Tensor,
 };
 use eredu_runtime::{
-    AddressableGroupedBank, IndexedMovement, ParameterBankAcquisition, ParameterBankKey,
-    ParameterProvider, RoutedBankId, RoutedExpertRequest,
+    AddressableGroupedBank, ParameterBankAcquisition, ParameterBankKey, ParameterProvider,
+    RoutedBankId, RoutedExpertRequest,
 };
 
 use crate::{ExpertRealizationPlan, ExpertResidencyCatalog};
 
-/// Architecture-owned grouped equation and exact per-unit realization plan.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RoutedGroupedPlan {
-    /// Activated selected-linear banks with owned output rows.
-    Linear(ExpertRealizationPlan<eredu_nn::GroupedLinearSpec>),
-    /// Gated-product grouped banks.
-    Gated(ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>),
-    /// ReLU-squared grouped banks.
-    Relu2(ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>),
-}
-
-impl RoutedGroupedPlan {
-    fn partition_routes(
-        &self,
-        routes: &BTreeMap<usize, usize>,
-        exchange: bool,
-    ) -> BTreeMap<usize, usize> {
-        routes
-            .iter()
-            .map(|(unit, count)| {
-                let replicated = match self {
-                    Self::Gated(plan) => plan.unit_is_replicated(*unit),
-                    Self::Relu2(plan) => plan.unit_is_replicated(*unit),
-                    Self::Linear(plan) => plan.unit_is_replicated(*unit),
-                };
-                (*unit, if exchange && !replicated { 1 } else { *count })
-            })
-            .collect()
-    }
-
-    pub(crate) fn with_catalog_distribution(
-        self,
-        catalog: &ExpertResidencyCatalog,
-    ) -> Result<Self, String> {
-        Ok(match self {
-            Self::Linear(plan) => Self::Linear(plan.with_catalog_distribution(catalog)?),
-            Self::Gated(plan) => Self::Gated(plan.with_catalog_distribution(catalog)?),
-            Self::Relu2(plan) => Self::Relu2(plan.with_catalog_distribution(catalog)?),
-        })
-    }
-
-    pub(crate) fn project_local_groups(
-        &self,
-        topology: eredu_core::ParallelRankTopology,
-    ) -> Result<Vec<usize>, crate::ExpertRealizationPlanError> {
-        match self {
-            Self::Linear(plan) => plan.project_local_groups(topology),
-            Self::Gated(plan) => plan.project_local_groups(topology),
-            Self::Relu2(plan) => plan.project_local_groups(topology),
-        }
-    }
-
-    /// Checkpoint-global members owned by this rank for this bank alone.
-    pub fn local_global_group_indices(&self) -> &[usize] {
-        match self {
-            Self::Linear(plan) => plan.local_global_group_indices(),
-            Self::Gated(plan) => plan.local_global_group_indices(),
-            Self::Relu2(plan) => plan.local_global_group_indices(),
-        }
-    }
-
-    /// Whether this bank is invoked by the specified logical unit.
-    pub fn has_unit(&self, owner: &str, unit: usize) -> bool {
-        match self {
-            Self::Linear(plan) => plan.unit_spec(owner, unit).is_some(),
-            Self::Gated(plan) => plan.unit_spec(owner, unit).is_some(),
-            Self::Relu2(plan) => plan.unit_spec(owner, unit).is_some(),
-        }
-    }
-    /// Returns the architecture-global routed member count.
-    pub fn global_group_count(&self) -> usize {
-        match self {
-            Self::Linear(plan) => plan.global_expert_count(),
-            Self::Gated(plan) => plan.global_expert_count(),
-            Self::Relu2(plan) => plan.global_expert_count(),
-        }
-    }
-
-    /// Returns the selected expert-axis width.
-    pub fn expert_parallel_size(&self) -> usize {
-        match self {
-            Self::Linear(plan) => plan.expert_parallel_size(),
-            Self::Gated(plan) => plan.expert_parallel_size(),
-            Self::Relu2(plan) => plan.expert_parallel_size(),
-        }
-    }
-
-    /// Returns this rank's coordinate in the selected expert axis.
-    pub fn expert_parallel_rank(&self) -> usize {
-        match self {
-            Self::Linear(plan) => plan.expert_parallel_rank(),
-            Self::Gated(plan) => plan.expert_parallel_rank(),
-            Self::Relu2(plan) => plan.expert_parallel_rank(),
-        }
-    }
-
-    /// Returns the selected-linear plan when that equation was selected.
-    pub const fn linear(&self) -> Option<&ExpertRealizationPlan<eredu_nn::GroupedLinearSpec>> {
-        match self {
-            Self::Linear(plan) => Some(plan),
-            _ => None,
-        }
-    }
-
-    /// Returns the gated-product plan when that equation was selected.
-    pub const fn gated(&self) -> Option<&ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>> {
-        match self {
-            Self::Gated(plan) => Some(plan),
-            Self::Linear(_) | Self::Relu2(_) => None,
-        }
-    }
-
-    /// Returns the ReLU-squared plan when that equation was selected.
-    pub const fn relu2(&self) -> Option<&ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>> {
-        match self {
-            Self::Relu2(plan) => Some(plan),
-            Self::Linear(_) | Self::Gated(_) => None,
-        }
-    }
-}
-
-impl From<ExpertRealizationPlan<eredu_nn::GroupedLinearSpec>> for RoutedGroupedPlan {
-    fn from(plan: ExpertRealizationPlan<eredu_nn::GroupedLinearSpec>) -> Self {
-        Self::Linear(plan)
-    }
-}
-
-impl From<ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>> for RoutedGroupedPlan {
-    fn from(plan: ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>) -> Self {
-        Self::Gated(plan)
-    }
-}
-
-impl From<ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>> for RoutedGroupedPlan {
-    fn from(plan: ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>) -> Self {
-        Self::Relu2(plan)
-    }
-}
-
-/// Converts one architecture-owned grouped specification into the opaque
-/// routed plan retained by the neutral execution driver.
-pub trait RoutedGroupedSpec: Clone {
-    /// Erases the concrete grouped equation after architecture preparation.
-    fn into_routed_grouped_plan(plan: ExpertRealizationPlan<Self>) -> RoutedGroupedPlan;
-}
-
-impl RoutedGroupedSpec for eredu_nn::GroupedLinearSpec {
-    fn into_routed_grouped_plan(plan: ExpertRealizationPlan<Self>) -> RoutedGroupedPlan {
-        RoutedGroupedPlan::Linear(plan)
-    }
-}
-
-impl RoutedGroupedSpec for eredu_nn::GroupedGatedProductSpec {
-    fn into_routed_grouped_plan(plan: ExpertRealizationPlan<Self>) -> RoutedGroupedPlan {
-        RoutedGroupedPlan::Gated(plan)
-    }
-}
-
-impl RoutedGroupedSpec for eredu_nn::GroupedRelu2Spec {
-    fn into_routed_grouped_plan(plan: ExpertRealizationPlan<Self>) -> RoutedGroupedPlan {
-        RoutedGroupedPlan::Relu2(plan)
-    }
-}
+pub use eredu_runtime::expert_residency::{RoutedGroupedPlan, RoutedGroupedSpec};
 
 mod banks;
 pub use banks::{PlannedAddressableBank, PlannedResidentBank};
-mod partition_units;
-pub(crate) use partition_units::PartitionUnitProvider;
 
-/// Checked text modules paired with every independently selected routed bank.
-pub struct PreparedRoutedTextArchitecture<A> {
-    text: crate::replicated_text::PreparedReplicatedTextArchitecture<A>,
-    bank_residency: eredu_runtime::ParameterBankResidency,
-    banks: BTreeMap<RoutedBankId, SelectedRoutedBank>,
-    rows: Option<eredu_runtime::SelectedRowLookups>,
-}
-
-impl<A> PreparedRoutedTextArchitecture<A> {
-    /// Exact row mechanisms selected before architecture/session construction.
-    pub fn row_lookups(&self) -> Option<&eredu_runtime::SelectedRowLookups> {
-        self.rows.as_ref()
-    }
-
-    /// Shared text architecture and exact prepared sources.
-    pub const fn text(&self) -> &crate::replicated_text::PreparedReplicatedTextArchitecture<A> {
-        &self.text
-    }
-    /// Placement selected for independently identified banks.
-    pub const fn bank_residency(&self) -> eredu_runtime::ParameterBankResidency {
-        self.bank_residency
-    }
-    /// Complete bank facts consumed by reusable materialization mechanisms.
-    pub const fn banks(&self) -> &BTreeMap<RoutedBankId, SelectedRoutedBank> {
-        &self.banks
-    }
-    /// Moves text modules and identified banks into execution.
-    pub fn into_parts(
-        self,
-    ) -> (
-        crate::replicated_text::PreparedReplicatedTextModules<A>,
-        eredu_runtime::ParameterBankResidency,
-        BTreeMap<RoutedBankId, SelectedRoutedBank>,
-        Option<eredu_runtime::SelectedRowLookups>,
-    ) {
-        (
-            self.text.into_modules(),
-            self.bank_residency,
-            self.banks,
-            self.rows,
-        )
-    }
-}
+/// Checked text modules with the exact selected routed bank plans.
+pub type PreparedRoutedTextArchitecture<A> =
+    eredu_runtime::executable_binding::routed_session::PreparedRoutedTextArchitecture<
+        A,
+        SelectedRoutedBank,
+    >;
 
 /// Failure while pairing one selected routed realization with concrete modules.
 #[derive(Debug, thiserror::Error)]
@@ -397,22 +197,23 @@ fn project_bank_members_with_tasks(
             } else {
                 metadata.byte_len()
             };
-            let companions =
-                if transforms && metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4 {
-                    match parameter.role() {
-                        crate::ExpertParameterRole::QuantizableProjection {
-                            scales_binding,
-                            biases_binding,
-                        } => {
-                            let quantization =
-                                task.executable().weight_quantization().ok_or_else(|| {
-                                    RoutedTextPreparationError::Invalid(format!(
-                                        "addressable transform target {:?} has no packed format",
-                                        task.name()
-                                    ))
-                                })?;
-                            Some(
-                                eredu_runtime::QuantizationCompanionBindings::new(
+            let companions = if transforms
+                && metadata.dtype() != &eredu_checkpoint::recipe::RecipeDtype::F4
+            {
+                match parameter.role() {
+                    crate::ExpertParameterRole::QuantizableProjection {
+                        scales_binding,
+                        biases_binding,
+                    } => {
+                        let quantization =
+                            task.executable().weight_quantization().ok_or_else(|| {
+                                RoutedTextPreparationError::Invalid(format!(
+                                    "addressable transform target {:?} has no packed format",
+                                    task.name()
+                                ))
+                            })?;
+                        Some(
+                                eredu_core::residency::parameter_binding::QuantizationCompanionBindings::new(
                                     scales_binding,
                                     quantization.has_biases().then(|| biases_binding.clone()),
                                 )
@@ -420,12 +221,12 @@ fn project_bank_members_with_tasks(
                                     RoutedTextPreparationError::Invalid(error.to_string())
                                 })?,
                             )
-                        }
-                        crate::ExpertParameterRole::Preserved => None,
                     }
-                } else {
-                    None
-                };
+                    crate::ExpertParameterRole::Preserved => None,
+                }
+            } else {
+                None
+            };
             let shared_task = shared_tasks.resolve(
                 parameter.logical_target(),
                 metadata.shape(),
@@ -470,6 +271,11 @@ fn project_bank_members_with_tasks(
             }
             crate::ExpertResidencyDistribution::ExpertParallel => {
                 eredu_runtime::AddressableBankDistribution::ExpertParallel
+            }
+            _ => {
+                return Err(RoutedTextPreparationError::Invalid(
+                    "unsupported expert bank distribution".into(),
+                ))
             }
         };
         let placement = eredu_runtime::AddressableBankMemberPlacement::new(
@@ -823,12 +629,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_gpt_oss_routed_text_architecture<B, S>(
@@ -926,12 +732,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_lfm2_routed_text_architecture<B, S>(
@@ -1047,12 +853,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_kimi_linear_routed_text_architecture<B, S>(
@@ -1178,12 +984,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_qwen_hybrid_routed_text_architecture<B, S>(
@@ -1287,12 +1093,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_deepseek_v3_routed_text_architecture<B, S>(
@@ -1391,12 +1197,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_deepseek_v4_routed_text_architecture<B, S>(
@@ -1495,12 +1301,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 fn prepare_nemotron_h_routed_text_architecture<B, S>(
@@ -1622,40 +1428,12 @@ where
             context,
         )
         .map_err(RoutedTextPreparationError::Invalid)?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
-}
-
-/// Receives one statically paired ReLU-squared routed architecture.
-pub trait Relu2RoutedTextArchitectureVisitor<B, S>
-where
-    B: eredu_nn::GroupedNeuralBackend,
-    S: eredu_runtime::LayerRuntimeState<B>,
-{
-    /// Completed construction output.
-    type Output;
-    /// Mechanism binding failure.
-    type Error;
-
-    /// Called immediately before architecture construction begins.
-    fn construction_started(&mut self) {}
-
-    /// Binds one architecture-owned prepared handoff to backend mechanisms.
-    fn visit<A>(
-        self,
-        prepared: PreparedRoutedTextArchitecture<A>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
+    ))
 }
 
 /// Constructs an admitted ReLU-squared routed family and invokes a generic visitor.
@@ -1667,10 +1445,13 @@ pub fn visit_relu2_routed_text_architecture<B, S, V>(
     mut visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-    V: Relu2RoutedTextArchitectureVisitor<B, S>,
+    V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
     visitor.construction_started();
     let prepared = prepare_nemotron_h_routed_text_architecture::<B, S>(
@@ -1680,140 +1461,63 @@ where
         context,
     )
     .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit(prepared, store)
-        .map_err(RoutedTextDispatchError::Backend)
+    bind_selected_routed_text(prepared, store, visitor)
 }
 
-/// Receives one statically paired gated routed architecture.
-pub trait RoutedTextArchitectureVisitor<B, S>
-where
-    B: eredu_nn::GroupedNeuralBackend,
-    S: eredu_runtime::LayerRuntimeState<B>,
-{
-    /// Completed construction output.
-    type Output;
-    /// Mechanism binding failure.
-    type Error;
+pub use eredu_runtime::executable_binding::routed_session::{
+    RoutedPredictionProfileDispatcher, RoutedPredictionTargetVisitor,
+    RoutedTextArchitectureVisitor, RoutedTextDispatchError,
+};
 
-    /// Called immediately before architecture construction begins.
-    fn construction_started(&mut self) {}
-
-    /// Binds a retained prediction preparation and its distinct source authorities.
-    /// Family selection and equations stay in the architecture-owned preparation.
-    fn visit_prediction<A, W>(
-        self,
-        _prepared: PreparedRoutedTextArchitecture<A>,
-        _prediction: W,
-        _target_source: eredu_checkpoint::store::SharedCheckpointSource,
-        _provider_source: eredu_checkpoint::store::SharedCheckpointSource,
-        _binding: crate::prepared_execution::PredictionBinding,
-    ) -> Result<Self::Output, RoutedTextDispatchError<Self::Error>>
-    where
-        Self: Sized,
-        B: eredu_nn::BlockwiseAttentionBackend
-            + eredu_nn::DistributedNeuralBackend
-            + eredu_nn::HyperNeuralBackend,
-        A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A::StaticModules: Clone,
-        W: crate::prediction_extension::PreparedRoutedPrediction<B, A>,
-    {
-        Err(RoutedTextDispatchError::Architecture(
-            "retained routed prediction binding is unavailable".into(),
-        ))
+fn routed_session_error<E: std::fmt::Display>(
+    error: eredu_runtime::executable_binding::PreparedExecutionError<E>,
+) -> RoutedTextDispatchError<E> {
+    use eredu_runtime::executable_binding::PreparedExecutionError;
+    match error {
+        PreparedExecutionError::Backend(error) => RoutedTextDispatchError::Backend(error),
+        PreparedExecutionError::Architecture(error) => RoutedTextDispatchError::Architecture(error),
+        error => RoutedTextDispatchError::Architecture(error.to_string()),
     }
-
-    /// Binds one architecture-owned prepared handoff to backend mechanisms.
-    fn visit<A>(
-        self,
-        prepared: PreparedRoutedTextArchitecture<A>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
 }
 
-/// Family-blind backend visitor for an exact routed prediction target.
-pub trait RoutedPredictionTargetVisitor<B, S, M>
+pub(crate) fn bind_selected_routed_text<B, S, A, V>(
+    prepared: PreparedRoutedTextArchitecture<A>,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    visitor: V,
+) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::GroupedNeuralBackend
-        + eredu_nn::HyperNeuralBackend,
-    S: eredu_runtime::RuntimeState<B>,
-    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::GroupedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<B, S>
+        + 'static,
+    A::StaticModules: Clone,
+    V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
-    /// Completed backend adapter.
-    type Output;
-    /// Backend binding failure.
-    type Error;
-
-    /// Called immediately before architecture construction begins.
-    fn construction_started(&mut self) {}
-
-    /// Receives a routed target only after exact extension pairing.
-    fn visit<A>(
-        self,
-        prepared: PreparedRoutedTextArchitecture<A>,
-        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
-            M,
-        >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + crate::prediction_extension::MaterializedPredictionTarget<B>
-            + 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
-}
-
-/// Supplies exact state-profile visitors while architecture dispatch selects
-/// the admitted routed prediction family.
-pub trait RoutedPredictionProfileDispatcher<B, M>
-where
-    B: eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::GroupedNeuralBackend
-        + eredu_nn::HyperNeuralBackend,
-    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-{
-    /// Completed construction output shared by both admitted profiles.
-    type Output;
-    /// Mechanism-binding failure shared by both admitted profiles.
-    type Error;
-    /// State selected for mixed-attention and compressed-latent execution.
-    type GatedState: eredu_runtime::LayerRuntimeState<B>;
-    /// State selected for pooling-attention DeepSeek-V4 execution.
-    type PoolingState: eredu_runtime::LayerRuntimeState<B>;
-    /// Exact visitor for mixed-attention and compressed-latent profiles.
-    type GatedVisitor: RoutedPredictionTargetVisitor<
-        B,
-        Self::GatedState,
-        M,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Exact visitor for the DeepSeek-V4 profile.
-    type PoolingVisitor: RoutedPredictionTargetVisitor<
-        B,
-        Self::PoolingState,
-        M,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-
-    /// Consumes the dispatcher into its compressed-latent visitor.
-    fn into_gated_visitor(self) -> Self::GatedVisitor;
-    /// Consumes the dispatcher into its pooling-attention visitor.
-    fn into_pooling_visitor(self) -> Self::PoolingVisitor;
+    let mechanisms = visitor.session_mechanisms(store.clone());
+    let (session, facts) =
+        eredu_runtime::executable_binding::routed_session::construct_selected_routed_session(
+            &visitor,
+            prepared,
+            mechanisms,
+            Default::default(),
+            store,
+            &[],
+        )
+        .map_err(routed_session_error)?;
+    let executable = eredu_runtime::executable_binding::routed_session::bind_routed_text(
+        &visitor,
+        session,
+        facts,
+        (),
+    );
+    Ok(eredu_runtime::executable_binding::install_text_route::<
+        V::BoundRouted<A>,
+        _,
+        _,
+    >(executable))
 }
 
 /// Selects, constructs, and pairs an admitted routed prediction target
@@ -1827,12 +1531,14 @@ pub fn dispatch_routed_prediction_target_architecture<B, M, D>(
     dispatcher: D,
 ) -> Result<D::Output, RoutedTextDispatchError<D::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-    D: RoutedPredictionProfileDispatcher<B, M>,
+    D: RoutedPredictionProfileDispatcher<B, M, SelectedRoutedBank>,
     <D::GatedState as eredu_runtime::LayerRuntimeState<B>>::LayerState:
         eredu_nn::AttentionCache<B::Tensor>
             + eredu_runtime::RuntimeStateComponents<B>
@@ -1915,7 +1621,9 @@ pub fn visit_gated_routed_prediction_target_architecture<B, S, M, V>(
     mut visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::GroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
@@ -1924,7 +1632,7 @@ where
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::CompressedAttentionCache<B::Tensor>,
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-    V: RoutedPredictionTargetVisitor<B, S, M>,
+    V: RoutedPredictionTargetVisitor<B, S, M, SelectedRoutedBank>,
 {
     visitor.construction_started();
     let prepared = prepare_deepseek_v3_routed_text_architecture::<B, S>(
@@ -1947,14 +1655,16 @@ pub fn visit_pooling_routed_prediction_target_architecture<B, S, M, V>(
     mut visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::GroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-    V: RoutedPredictionTargetVisitor<B, S, M>,
+    V: RoutedPredictionTargetVisitor<B, S, M, SelectedRoutedBank>,
 {
     visitor.construction_started();
     let prepared = prepare_deepseek_v4_routed_text_architecture::<B, S>(
@@ -1975,7 +1685,9 @@ pub fn visit_routed_prediction_target_architecture<B, S, M, A, V>(
     visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::GroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
@@ -1987,13 +1699,39 @@ where
         + 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
-    V: RoutedPredictionTargetVisitor<B, S, M>,
+    V: RoutedPredictionTargetVisitor<B, S, M, SelectedRoutedBank>,
 {
-    let extension = A::pair_prediction_extension(extension)
+    let mut extension = A::pair_prediction_extension(extension)
         .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit(prepared, extension, store)
-        .map_err(RoutedTextDispatchError::Backend)
+    let mechanisms = visitor.session_mechanisms(store.clone());
+    let weights = visitor
+        .prediction_weight_options::<A>(&mut extension)
+        .map_err(RoutedTextDispatchError::Backend)?;
+    let (session, facts) =
+        eredu_runtime::executable_binding::routed_session::construct_selected_routed_session(
+            &visitor,
+            prepared,
+            mechanisms,
+            weights,
+            store,
+            &[],
+        )
+        .map_err(routed_session_error)?;
+    use eredu_runtime::executable_binding::routed_session::{
+        bind_routed_text, install_routed_prediction,
+    };
+    let executable = bind_routed_text(&visitor, session, facts, ());
+    let executable = install_routed_prediction::<B, A, SelectedRoutedBank, _, V, _, M, _>(
+        executable,
+        extension,
+        visitor.into_prediction_binding(),
+    )
+    .map_err(|error| RoutedTextDispatchError::Backend(error.into()))?;
+    Ok(eredu_runtime::executable_binding::install_text_route::<
+        V::BoundRoutedPrediction<A>,
+        _,
+        _,
+    >(executable))
 }
 
 /// Constructs an admitted pooling-attention routed family and invokes generic mechanisms.
@@ -2005,12 +1743,14 @@ pub fn visit_pooling_routed_text_architecture<B, S, V>(
     mut visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::HyperNeuralBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::HyperNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::GroupedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
-    V: RoutedTextArchitectureVisitor<B, S>,
+    V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
     visitor.construction_started();
     let prepared = prepare_deepseek_v4_routed_text_architecture::<B, S>(
@@ -2020,9 +1760,7 @@ where
         context,
     )
     .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit(prepared, store)
-        .map_err(RoutedTextDispatchError::Backend)
+    bind_selected_routed_text(prepared, store, visitor)
 }
 
 /// Constructs the exact admitted gated routed family and invokes a generic mechanism visitor.
@@ -2034,7 +1772,9 @@ pub fn visit_routed_text_architecture<B, S, V>(
     mut visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::GroupedNeuralBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
@@ -2042,7 +1782,7 @@ where
         + eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::CompressedAttentionCache<B::Tensor>,
-    V: RoutedTextArchitectureVisitor<B, S>,
+    V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
     visitor.construction_started();
     if diffusion_args(inspection).is_some() {
@@ -2053,9 +1793,7 @@ where
             context,
         )
         .map_err(RoutedTextDispatchError::Architecture)?;
-        return visitor
-            .visit(prepared, store)
-            .map_err(RoutedTextDispatchError::Backend);
+        return bind_selected_routed_text(prepared, store, visitor);
     }
     if k2_horizon_args(inspection).is_some() {
         let prepared = prepare_k2_horizon_routed_text_architecture::<B, S>(
@@ -2065,9 +1803,7 @@ where
             context,
         )
         .map_err(RoutedTextDispatchError::Architecture)?;
-        return visitor
-            .visit(prepared, store)
-            .map_err(RoutedTextDispatchError::Backend);
+        return bind_selected_routed_text(prepared, store, visitor);
     }
 
     match (
@@ -2087,11 +1823,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (None, Some(plan))
             if matches!(
@@ -2106,11 +1838,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (Some(plan), None)
             if matches!(
@@ -2125,11 +1853,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (None, Some(plan))
             if matches!(
@@ -2144,11 +1868,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (Some(plan), None)
             if matches!(
@@ -2164,11 +1884,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (None, Some(plan))
             if matches!(
@@ -2184,11 +1900,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (Some(plan), None)
             if matches!(
@@ -2204,11 +1916,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (None, Some(plan))
             if matches!(
@@ -2224,11 +1932,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (Some(plan), None)
             if matches!(
@@ -2246,11 +1950,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (None, Some(plan))
             if matches!(
@@ -2268,11 +1968,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (Some(plan), None)
             if matches!(
@@ -2288,11 +1984,7 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         (None, Some(plan))
             if matches!(
@@ -2308,27 +2000,12 @@ where
                 context,
             )
             .map_err(|error| RoutedTextDispatchError::Architecture(error.to_string()))
-            .and_then(|prepared| {
-                visitor
-                    .visit(prepared, store)
-                    .map_err(RoutedTextDispatchError::Backend)
-            })
+            .and_then(|prepared| bind_selected_routed_text(prepared, store, visitor))
         }
         _ => Err(RoutedTextDispatchError::Architecture(
             RoutedTextPreparationError::Ineligible.to_string(),
         )),
     }
-}
-
-/// Failure while architecture-owned routed dispatch invokes a mechanism visitor.
-#[derive(Debug, thiserror::Error)]
-pub enum RoutedTextDispatchError<E> {
-    /// Architecture admission and selected realization disagreed.
-    #[error("{0}")]
-    Architecture(String),
-    /// Backend mechanism binding failed.
-    #[error("routed text mechanism binding failed: {0}")]
-    Backend(E),
 }
 
 /// Requirements of one independently identified routed bank.
@@ -2580,12 +2257,12 @@ where
         targets.iter().map(String::as_str),
         context,
     )?;
-    Ok(PreparedRoutedTextArchitecture {
-        text: prepared,
+    Ok(PreparedRoutedTextArchitecture::new(
+        prepared,
         bank_residency,
         banks,
         rows,
-    })
+    ))
 }
 
 /// Caller policy for one replicated routed text session.
@@ -3853,38 +3530,7 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
     Ok(())
 }
 
-/// Invalid routed plan or failure from a generic execution mechanism.
-#[derive(Debug, Clone, thiserror::Error)]
-#[non_exhaustive]
-pub enum RoutedTextExecutionError {
-    /// Architecture plan, catalog, unit address, or grouped geometry disagreed.
-    #[error("invalid routed text execution contract: {0}")]
-    Contract(String),
-    /// Indexed movement, bank acquisition, grouped construction, or completion failed.
-    #[error("routed text execution mechanism failed: {0}")]
-    Mechanism(String),
-    /// Original compute, storage, movement or completion failure.
-    #[error("routed text execution mechanism failed: {0}")]
-    Source(#[source] eredu_nn::Error),
-}
-
-impl From<String> for RoutedTextExecutionError {
-    fn from(message: String) -> Self {
-        Self::Contract(message)
-    }
-}
-impl From<&str> for RoutedTextExecutionError {
-    fn from(message: &str) -> Self {
-        Self::Contract(message.into())
-    }
-}
-
-impl RoutedTextExecutionError {
-    /// Retains a mechanism failure without erasing its typed cause.
-    pub fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self::Source(eredu_nn::Error::backend_source(error))
-    }
-}
+pub use eredu_runtime::executable_binding::routed_partition::RoutedTextExecutionError;
 
 fn validate_route_cardinality<T: Tensor>(
     routes: &GroupSelection<T>,
@@ -3909,32 +3555,11 @@ pub struct PlannedResidentGatedProduct {
     owner_group: eredu_runtime::ExecutionGroupId,
     plan: ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     routes_by_unit: BTreeMap<usize, usize>,
-    partition_unit_coordinates:
-        Option<BTreeMap<usize, eredu_core::component::RoutedComponentCoordinateMap>>,
 }
 
 impl PlannedResidentGatedProduct {
-    pub(crate) fn with_partition_unit_coordinates(
-        mut self,
-        coordinates: BTreeMap<usize, eredu_core::component::RoutedComponentCoordinateMap>,
-    ) -> Self {
-        self.partition_unit_coordinates = Some(coordinates);
-        self
-    }
-
     fn unit_global_group_indices(&self, unit: usize) -> Option<&[usize]> {
-        if self.plan.unit_is_replicated(unit)
-            || self
-                .partition_unit_coordinates
-                .as_ref()
-                .and_then(|coordinates| coordinates.get(&unit))
-                .is_some_and(|coordinates| {
-                    let experts = coordinates.experts();
-                    experts.local_count() == experts.global_count()
-                        && (0..experts.local_count())
-                            .all(|index| experts.local_to_global(index) == Some(index))
-                })
-        {
+        if self.plan.unit_is_replicated(unit) {
             // The separately replicated shared bank uses its own global IDs.
             None
         } else {
@@ -3968,7 +3593,6 @@ impl PlannedResidentGatedProduct {
             owner_group,
             plan,
             routes_by_unit,
-            partition_unit_coordinates: None,
         })
     }
 
@@ -4008,7 +3632,6 @@ impl PlannedResidentGatedProduct {
             owner_group,
             plan,
             routes_by_unit,
-            partition_unit_coordinates: None,
         })
     }
 }
@@ -4022,68 +3645,61 @@ impl PlannedResidentGatedProduct {
         route_kind: GroupedRouteKind,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RoutedTextExecutionError> {
-        partition_units::with_optional_coordinates(
-            self.partition_unit_coordinates.as_ref(),
-            request,
-            |mut request| {
-                let routes = match route_kind {
-                    GroupedRouteKind::OwnerLocal => 1,
-                    GroupedRouteKind::Original => self
-                        .routes_by_unit
-                        .get(&request.layer)
-                        .copied()
-                        .ok_or_else(|| {
-                            RoutedTextExecutionError::Contract(format!(
-                                "execution unit {:?}/{} has no route cardinality",
-                                self.owner_group.as_str(),
-                                request.layer
-                            ))
-                        })?,
-                };
-                validate_route_cardinality(request.routes, routes)?;
-                let selected = self
-                    .plan
-                    .unit_spec(self.owner_group.as_str(), request.layer)
-                    .ok_or_else(|| {
-                        RoutedTextExecutionError::Contract(format!(
-                            "execution unit {:?}/{} has no grouped bank specification",
-                            self.owner_group.as_str(),
-                            request.layer
-                        ))
-                    })?;
-                if selected != resident_bank.spec() {
-                    return Err(RoutedTextExecutionError::Contract(format!(
-                        "resident grouped bank for {:?}/{} differs from the architecture plan",
+        let mut request = request;
+        let routes = match route_kind {
+            GroupedRouteKind::OwnerLocal => 1,
+            GroupedRouteKind::Original => self
+                .routes_by_unit
+                .get(&request.layer)
+                .copied()
+                .ok_or_else(|| {
+                    RoutedTextExecutionError::Contract(format!(
+                        "execution unit {:?}/{} has no route cardinality",
                         self.owner_group.as_str(),
                         request.layer
-                    )));
-                }
-                eredu_runtime::with_provider_unit_observer(
-                    &mut request.unit_observer,
-                    request.routes.group_indices(),
-                    self.unit_global_group_indices(request.layer),
-                    0,
-                    |observer| {
-                        let forward = match output_kind {
-                            GroupedOutputKind::Combined => {
-                                B::GatedProductGroups::forward_grouped_with_unit_observer
-                            }
-                            GroupedOutputKind::PerSelection => {
-                                B::GatedProductGroups::forward_uncombined
-                            }
-                        };
-                        forward(
-                            resident_bank,
-                            request.input,
-                            request.routes,
-                            context,
-                            observer,
-                        )
-                    },
+                    ))
+                })?,
+        };
+        validate_route_cardinality(request.routes, routes)?;
+        let selected = self
+            .plan
+            .unit_spec(self.owner_group.as_str(), request.layer)
+            .ok_or_else(|| {
+                RoutedTextExecutionError::Contract(format!(
+                    "execution unit {:?}/{} has no grouped bank specification",
+                    self.owner_group.as_str(),
+                    request.layer
+                ))
+            })?;
+        if selected != resident_bank.spec() {
+            return Err(RoutedTextExecutionError::Contract(format!(
+                "resident grouped bank for {:?}/{} differs from the architecture plan",
+                self.owner_group.as_str(),
+                request.layer
+            )));
+        }
+        eredu_runtime::with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            self.unit_global_group_indices(request.layer),
+            0,
+            |observer| {
+                let forward = match output_kind {
+                    GroupedOutputKind::Combined => {
+                        B::GatedProductGroups::forward_grouped_with_unit_observer
+                    }
+                    GroupedOutputKind::PerSelection => B::GatedProductGroups::forward_uncombined,
+                };
+                forward(
+                    resident_bank,
+                    request.input,
+                    request.routes,
+                    context,
+                    observer,
                 )
-                .map_err(RoutedTextExecutionError::from_error)
             },
         )
+        .map_err(RoutedTextExecutionError::from_error)
     }
 
     fn execute_resident_tensor_parallel<B: eredu_nn::TensorParallelGroupedNeuralBackend>(
@@ -4096,70 +3712,63 @@ impl PlannedResidentGatedProduct {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, RoutedTextExecutionError>
     {
-        partition_units::with_optional_coordinates(
-            self.partition_unit_coordinates.as_ref(),
-            request,
-            |mut request| {
-                let routes = match route_kind {
-                    GroupedRouteKind::OwnerLocal => 1,
-                    GroupedRouteKind::Original => self
-                        .routes_by_unit
-                        .get(&request.layer)
-                        .copied()
-                        .ok_or_else(|| {
-                            RoutedTextExecutionError::Contract(format!(
-                                "execution unit {:?}/{} has no route cardinality",
-                                self.owner_group.as_str(),
-                                request.layer
-                            ))
-                        })?,
-                };
-                validate_route_cardinality(request.routes, routes)?;
-                let selected = self
-                    .plan
-                    .unit_spec(self.owner_group.as_str(), request.layer)
-                    .ok_or_else(|| {
-                        RoutedTextExecutionError::Contract(format!(
-                            "execution unit {:?}/{} has no grouped bank specification",
-                            self.owner_group.as_str(),
-                            request.layer
-                        ))
-                    })?;
-                if selected != resident_bank.spec() {
-                    return Err(RoutedTextExecutionError::Contract(format!(
-                        "resident grouped bank for {:?}/{} differs from the architecture plan",
+        let mut request = request;
+        let routes = match route_kind {
+            GroupedRouteKind::OwnerLocal => 1,
+            GroupedRouteKind::Original => self
+                .routes_by_unit
+                .get(&request.layer)
+                .copied()
+                .ok_or_else(|| {
+                    RoutedTextExecutionError::Contract(format!(
+                        "execution unit {:?}/{} has no route cardinality",
                         self.owner_group.as_str(),
                         request.layer
-                    )));
-                }
-                let forward = match output_kind {
-                    GroupedOutputKind::Combined => {
-                        B::gated_product_groups_tensor_parallel_with_unit_observer
-                    }
-                    GroupedOutputKind::PerSelection => {
-                        B::gated_product_groups_uncombined_tensor_parallel
-                    }
-                };
-                eredu_runtime::with_provider_unit_observer(
-                    &mut request.unit_observer,
-                    request.routes.group_indices(),
-                    self.unit_global_group_indices(request.layer),
-                    0,
-                    |observer| {
-                        forward(
-                            resident_bank,
-                            request.input,
-                            request.routes,
-                            partitions,
-                            context,
-                            observer,
-                        )
-                    },
+                    ))
+                })?,
+        };
+        validate_route_cardinality(request.routes, routes)?;
+        let selected = self
+            .plan
+            .unit_spec(self.owner_group.as_str(), request.layer)
+            .ok_or_else(|| {
+                RoutedTextExecutionError::Contract(format!(
+                    "execution unit {:?}/{} has no grouped bank specification",
+                    self.owner_group.as_str(),
+                    request.layer
+                ))
+            })?;
+        if selected != resident_bank.spec() {
+            return Err(RoutedTextExecutionError::Contract(format!(
+                "resident grouped bank for {:?}/{} differs from the architecture plan",
+                self.owner_group.as_str(),
+                request.layer
+            )));
+        }
+        let forward = match output_kind {
+            GroupedOutputKind::Combined => {
+                B::gated_product_groups_tensor_parallel_with_unit_observer
+            }
+            GroupedOutputKind::PerSelection => B::gated_product_groups_uncombined_tensor_parallel,
+        };
+        eredu_runtime::with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            self.unit_global_group_indices(request.layer),
+            0,
+            |observer| {
+                forward(
+                    resident_bank,
+                    request.input,
+                    request.routes,
+                    partitions,
+                    context,
+                    observer,
                 )
-                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Partial)
-                .map_err(RoutedTextExecutionError::from_error)
             },
         )
+        .map(eredu_runtime::RoutedExpertTensorParallelOutput::Partial)
+        .map_err(RoutedTextExecutionError::from_error)
     }
 }
 
@@ -4222,45 +3831,40 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        partition_units::with_optional_coordinates(
-            self.partition_unit_coordinates.as_ref(),
-            request,
-            |mut request| {
-                let selected = self
-                    .plan
-                    .unit_spec(self.owner_group.as_str(), request.layer)
-                    .ok_or_else(|| {
-                        RoutedTextExecutionError::Contract(format!(
-                            "execution unit {:?}/{} has no grouped bank specification",
-                            self.owner_group.as_str(),
-                            request.layer
-                        ))
-                    })?;
-                if selected != resident_bank.spec() {
-                    return Err(RoutedTextExecutionError::Contract(format!(
-                        "resident grouped bank for {:?}/{} differs from the architecture plan",
-                        self.owner_group.as_str(),
-                        request.layer
-                    )));
-                }
-                validate_route_cardinality(request.routes, 1)?;
-                eredu_runtime::with_provider_unit_observer(
-                    &mut request.unit_observer,
-                    request.routes.group_indices(),
-                    self.unit_global_group_indices(request.layer),
-                    0,
-                    |observer| {
-                        resident_bank.forward_grouped_with_unit_observer(
-                            request.input,
-                            request.routes,
-                            context,
-                            observer,
-                        )
-                    },
+        let mut request = request;
+        let selected = self
+            .plan
+            .unit_spec(self.owner_group.as_str(), request.layer)
+            .ok_or_else(|| {
+                RoutedTextExecutionError::Contract(format!(
+                    "execution unit {:?}/{} has no grouped bank specification",
+                    self.owner_group.as_str(),
+                    request.layer
+                ))
+            })?;
+        if selected != resident_bank.spec() {
+            return Err(RoutedTextExecutionError::Contract(format!(
+                "resident grouped bank for {:?}/{} differs from the architecture plan",
+                self.owner_group.as_str(),
+                request.layer
+            )));
+        }
+        validate_route_cardinality(request.routes, 1)?;
+        eredu_runtime::with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            self.unit_global_group_indices(request.layer),
+            0,
+            |observer| {
+                resident_bank.forward_grouped_with_unit_observer(
+                    request.input,
+                    request.routes,
+                    context,
+                    observer,
                 )
-                .map_err(RoutedTextExecutionError::from_error)
             },
         )
+        .map_err(RoutedTextExecutionError::from_error)
     }
 
     /// Executes an activated selected-linear bank with owned output rows.
@@ -4351,48 +3955,43 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        partition_units::with_optional_coordinates(
-            self.partition_unit_coordinates.as_ref(),
-            request,
-            |mut request| {
-                let selected = self
-                    .plan
-                    .unit_spec(self.owner_group.as_str(), request.layer)
-                    .ok_or_else(|| {
-                        RoutedTextExecutionError::Contract(format!(
-                            "execution unit {:?}/{} has no grouped bank specification",
-                            self.owner_group.as_str(),
-                            request.layer
-                        ))
-                    })?;
-                if selected != resident_bank.spec() {
-                    return Err(RoutedTextExecutionError::Contract(format!(
-                        "resident grouped bank for {:?}/{} differs from the architecture plan",
-                        self.owner_group.as_str(),
-                        request.layer
-                    )));
-                }
-                validate_route_cardinality(request.routes, 1)?;
-                eredu_runtime::with_provider_unit_observer(
-                    &mut request.unit_observer,
-                    request.routes.group_indices(),
-                    self.unit_global_group_indices(request.layer),
-                    0,
-                    |observer| {
-                        B::gated_product_groups_tensor_parallel_with_unit_observer(
-                            resident_bank,
-                            request.input,
-                            request.routes,
-                            partitions,
-                            context,
-                            observer,
-                        )
-                    },
+        let mut request = request;
+        let selected = self
+            .plan
+            .unit_spec(self.owner_group.as_str(), request.layer)
+            .ok_or_else(|| {
+                RoutedTextExecutionError::Contract(format!(
+                    "execution unit {:?}/{} has no grouped bank specification",
+                    self.owner_group.as_str(),
+                    request.layer
+                ))
+            })?;
+        if selected != resident_bank.spec() {
+            return Err(RoutedTextExecutionError::Contract(format!(
+                "resident grouped bank for {:?}/{} differs from the architecture plan",
+                self.owner_group.as_str(),
+                request.layer
+            )));
+        }
+        validate_route_cardinality(request.routes, 1)?;
+        eredu_runtime::with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            self.unit_global_group_indices(request.layer),
+            0,
+            |observer| {
+                B::gated_product_groups_tensor_parallel_with_unit_observer(
+                    resident_bank,
+                    request.input,
+                    request.routes,
+                    partitions,
+                    context,
+                    observer,
                 )
-                .map(eredu_runtime::RoutedExpertTensorParallelOutput::Partial)
-                .map_err(RoutedTextExecutionError::from_error)
             },
         )
+        .map(eredu_runtime::RoutedExpertTensorParallelOutput::Partial)
+        .map_err(RoutedTextExecutionError::from_error)
     }
 
     fn forward_relu2_routed_tensor_parallel(
@@ -4415,79 +4014,7 @@ pub struct PlannedResidentRelu2 {
     routes_per_token: usize,
 }
 
-/// Provider installed on a pipeline rank whose exact local routed catalog is empty.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EmptyPartitionParameterProvider;
-
-impl<B> ParameterProvider<B> for EmptyPartitionParameterProvider
-where
-    B: GroupedNeuralBackend,
-{
-    type Error = RoutedTextExecutionError;
-
-    fn forward_grouped(
-        &mut self,
-        _: &mut B::GatedProductGroups,
-        _: RoutedExpertRequest<'_, '_, B::Tensor>,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        Err(RoutedTextExecutionError::Contract(
-            "pipeline rank with no routed units received gated-product work".into(),
-        ))
-    }
-
-    /// Executes an activated selected-linear bank with owned output rows.
-    fn forward_linear_routed(
-        &mut self,
-        _: &mut B::LinearGroups,
-        _: RoutedExpertRequest<'_, '_, B::Tensor>,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        Err(RoutedTextExecutionError::Contract(
-            "selected provider equation is not a linear bank".into(),
-        ))
-    }
-
-    fn forward_relu2_routed(
-        &mut self,
-        _: &mut B::Relu2Groups,
-        _: RoutedExpertRequest<'_, '_, B::Tensor>,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error> {
-        Err(RoutedTextExecutionError::Contract(
-            "pipeline rank with no routed units received ReLU-squared work".into(),
-        ))
-    }
-}
-
-impl<B> eredu_runtime::TensorParallelParameterProvider<B> for EmptyPartitionParameterProvider
-where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend,
-{
-    fn forward_grouped_tensor_parallel(
-        &mut self,
-        _: &mut B::GatedProductGroups,
-        _: RoutedExpertRequest<'_, '_, B::Tensor>,
-        _: usize,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        Err(RoutedTextExecutionError::Contract(
-            "pipeline rank with no routed units received tensor-parallel gated-product work".into(),
-        ))
-    }
-
-    fn forward_relu2_routed_tensor_parallel(
-        &mut self,
-        _: &mut B::Relu2Groups,
-        _: RoutedExpertRequest<'_, '_, B::Tensor>,
-        _: usize,
-        _: &<B::Tensor as Tensor>::Context,
-    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        Err(RoutedTextExecutionError::Contract(
-            "pipeline rank with no routed units received tensor-parallel ReLU-squared work".into(),
-        ))
-    }
-}
+pub use eredu_runtime::executable_binding::routed_partition::EmptyPartitionParameterProvider;
 
 impl PlannedResidentRelu2 {
     /// Validates and retains one replicated routed-unit plan.
@@ -5062,76 +4589,16 @@ pub(crate) fn unowned_expert_sources(
         .collect()
 }
 
-impl<B, A, G, W> crate::partitioned_execution::PreparedRoutedPartitionedArchitecture<B, A, G, W>
+impl<B, A, G, W> crate::partitioned_execution::AdmittedRoutedPartition<B, A, G, W>
 where
     B: GroupedNeuralBackend,
 {
-    /// Constructs the complete resident collection from retained rank-local plans.
-    pub fn resident_partition_providers(
-        &self,
-    ) -> Result<crate::prepared_execution::PartitionBankProviders<B>, RoutedTextExecutionError>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + 'static,
-    {
-        let exchange = self.prepared().selected().expert_group().is_some();
-        let providers = self
-            .banks()
-            .iter()
-            .map(|(id, bank)| {
-                let provider: Box<
-                    dyn eredu_runtime::TensorParallelParameterProvider<
-                        B,
-                        Error = RoutedTextExecutionError,
-                    >,
-                > = if bank.plan().local_global_group_indices().is_empty() {
-                    Box::new(EmptyPartitionParameterProvider)
-                } else {
-                    Box::new(PartitionUnitProvider::new(
-                        bank,
-                        PlannedResidentBank::from_partitioned(bank, exchange)?,
-                    ))
-                };
-                Ok((*id, provider))
-            })
-            .collect::<Result<BTreeMap<_, _>, RoutedTextExecutionError>>()?;
-        eredu_runtime::RoutedBankProviders::new(providers)
-            .map_err(|e| RoutedTextExecutionError::Contract(e.to_string()))
-    }
-
     /// Sources excluded by each bank's independent expert ownership map.
     pub fn unowned_expert_checkpoint_sources(&self) -> BTreeSet<String> {
         self.banks()
             .values()
             .flat_map(|bank| {
                 unowned_expert_sources(bank.catalog(), bank.plan().local_global_group_indices())
-            })
-            .collect()
-    }
-    /// Logical targets materialized exclusively by independently addressable banks.
-    pub fn addressable_logical_targets(&self) -> BTreeSet<String> {
-        if !matches!(
-            self.bank_residency(),
-            eredu_runtime::ParameterBankResidency::IndependentCache(_)
-        ) {
-            return BTreeSet::new();
-        }
-        self.banks()
-            .values()
-            .flat_map(|bank| {
-                bank.catalog()
-                    .logical_targets()
-                    .into_iter()
-                    // Load-time transforms generate companions absent from the
-                    // source catalog. Their retained member tasks own those
-                    // destinations alongside the primary expert weights.
-                    .chain(
-                        bank.addressable_members()
-                            .iter()
-                            .flat_map(|member| member.parameters())
-                            .flat_map(|parameter| parameter.task().output_companions())
-                            .map(|companion| companion.name()),
-                    )
-                    .map(str::to_owned)
             })
             .collect()
     }
@@ -5402,10 +4869,12 @@ where
         })?;
         let compact_spec = O::compact_spec(spec, compact_count)
             .map_err(|error| RoutedTextExecutionError::Contract(error.to_string()))?;
-        let acquisition = self
-            .bank
-            .acquire(ParameterBankAcquisition::new(&entries, access), context)
-            .map_err(RoutedTextExecutionError::from_error)?;
+        let acquisition = eredu_runtime::expert::acquire_grouped_bank::<B, _>(
+            &self.bank,
+            ParameterBankAcquisition::new(&entries, access),
+            context,
+        )
+        .map_err(RoutedTextExecutionError::from_error)?;
         Ok((acquisition, compact_spec, compact_routes))
     }
 

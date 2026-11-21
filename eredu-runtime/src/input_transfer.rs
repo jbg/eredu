@@ -174,6 +174,73 @@ impl InputTransferBudget {
     }
 }
 
+/// Reports the portable wire and native staging costs for one prepared input.
+pub fn prepared_input_transfer_resources<M: eredu_core::input::InputTensorTransfer>(
+    input: &eredu_core::PreparedModelInput<M::Tensor>,
+    mechanisms: &M,
+) -> Result<InputTransferResources, InputTransferError> {
+    InputTransferResources::from_identity_with_staging(input.identity(), |tensor| {
+        let bytes = InputTransferResources::tensor_payload_bytes(tensor)?;
+        mechanisms.host_staging_capacity(bytes).map_err(|error| {
+            InputTransferError::StagingUnavailable {
+                detail: error.to_string(),
+            }
+        })
+    })
+}
+
+/// Failure of portable transfer admission, native copy, or destination validation.
+#[derive(Debug, thiserror::Error)]
+pub enum PreparedInputTransferError {
+    /// The supplied semantic identity describes a different prepared input.
+    #[error("prepared input cache identity does not match the source")]
+    CacheIdentityMismatch,
+    /// The complete transfer request could not be admitted.
+    #[error(transparent)]
+    Admission(#[from] InputTransferError),
+    /// Native transfer could not complete.
+    #[error(transparent)]
+    Copy(#[from] eredu_core::BackendFailure),
+    /// Returned values do not describe the original wire input.
+    #[error(transparent)]
+    Destination(#[from] eredu_core::PreparedInputError),
+}
+
+/// Admits the copy, reconstructs the destination, and preserves semantic identity.
+pub fn transfer_prepared_input<M: eredu_core::input::InputTensorTransfer>(
+    input: &eredu_core::PreparedModelInput<M::Tensor>,
+    cache_identity: Option<&crate::PreparedInputCacheIdentity>,
+    mechanisms: &M,
+    context: &M::Context,
+    budget: InputTransferBudget,
+) -> Result<
+    (
+        eredu_core::PreparedModelInput<M::Tensor>,
+        Option<crate::PreparedInputCacheIdentity>,
+        InputTransferResources,
+    ),
+    PreparedInputTransferError,
+> {
+    if cache_identity.is_some_and(|identity| identity.prepared() != input.identity()) {
+        return Err(PreparedInputTransferError::CacheIdentityMismatch);
+    }
+    let resources = prepared_input_transfer_resources(input, mechanisms)?;
+    budget.admit(resources)?;
+    let copied = mechanisms
+        .copy_input_tensors(
+            input.wire_values(),
+            context,
+            resources.staging_capacity_bytes,
+        )
+        .map_err(eredu_core::BackendFailure::from_error)?;
+    let copied = eredu_core::PreparedModelInput::from_identity_wire_values(
+        input.identity().clone(),
+        copied,
+        |value| mechanisms.identity(value),
+    )?;
+    Ok((copied, cache_identity.cloned(), resources))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

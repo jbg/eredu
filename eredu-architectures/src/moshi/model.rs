@@ -1,6 +1,7 @@
 //! Portable temporal-plus-depth Moshi-family execution graph.
 
 use crate::decoder::{self, Config as DecoderConfig, MultiTableEmbedding, NamedEmbeddingSpec};
+use eredu_core::sampling::{SamplingBackend, TokenDomain};
 use eredu_core::LayerSchedule;
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingSpec, Error, LinearOperator, LinearSpec,
@@ -11,9 +12,8 @@ use eredu_runtime::{
     ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel,
     ComponentPinnedResources, ComponentUnit, ExecutionUnitAddress, KernelParameterModules,
     LayerRuntimeState, LayeredForwardState, LayeredTraversalPoint, ParallelComponentKernel,
-    ResettableRuntimeState, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionError,
-    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, TokenDomain,
-    VocabularyModulePlacement,
+    ResettableRuntimeState, SequentialDecisionBoundary, SequentialDecisionError, StateLayout,
+    StateSegmentId, StateSegmentLifetime, StateSegmentSpec, VocabularyModulePlacement,
 };
 use std::sync::Arc;
 

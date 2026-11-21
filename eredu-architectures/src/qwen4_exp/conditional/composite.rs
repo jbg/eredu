@@ -1,12 +1,15 @@
 //! Prepared processor requests enter the same conditional graph and transactions.
 use super::*;
 use crate::{
-    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
+    composite_execution::PreparedCompositeInput,
     media_plan::{AdmittedCompositeInput, QwenInputPartPlan},
     qwen4_exp::media::{MediaAdmissionConfig, MediaInputPartPlan},
 };
+use eredu_core::input::PreparedInputInspector;
+use eredu_core::PreparedModelInput;
 
-impl<B, S> CompositeArchitecture<B, S> for ConditionalModel<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S>
+    for ConditionalKernel<B>
 where
     B: GroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -58,7 +61,7 @@ where
     }
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        let this = self.kernel();
+        let this = self;
         this.ingress.admission_config().clone()
     }
     fn admit_prepared_input(
@@ -130,7 +133,7 @@ where
         })()?;
         let continuation = if active {
             (|| -> Result<Option<CompositeContinuationGeometry>, String> {
-                let this = self.kernel();
+                let this = self;
                 if group != VISION_INDEX {
                     return Ok(None);
                 }
@@ -161,7 +164,7 @@ where
         };
         let collective_waves =
             (|| -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
-                let this = self.kernel();
+                let this = self;
                 let pipeline_stages = stage_units.len();
                 if group != VISION_INDEX || tensor_partitions <= 1 || pipeline_stages <= 1 {
                     return Ok(None);
@@ -212,7 +215,7 @@ where
         unit: usize,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
-        let this = self.kernel();
+        let this = self;
         this.modules.target.routed_tensor_reductions(unit, routed)
     }
     fn routed_tensor_vocabulary_sharded(&self) -> bool {
@@ -229,7 +232,7 @@ where
         _: &[crate::composite_execution::CompositeGroupInvocation],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<ResolvedBoundaryWireSchema>, Error> {
-        let this = self.kernel();
+        let this = self;
         if source_group == TARGET_INDEX && destination_group == TARGET_INDEX {
             return this
                 .modules
@@ -245,7 +248,8 @@ where
         {
             return Ok(None);
         }
-        use eredu_runtime::{BoundaryTensorDimension as D, BoundaryTensorDtype as K};
+        use eredu_core::communication::BoundaryTensorDtype as K;
+        use eredu_runtime::BoundaryTensorDimension as D;
         let (name, primary, sequence) = if destination_group == VISION_INDEX {
             let (patches, width) = continuation
                 .ok_or_else(|| Error::backend("missing vision continuation geometry"))?;
@@ -279,7 +283,7 @@ where
         forward: &Self::ForwardContext,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<Vec<ArchitectureBoundaryValue<B::Tensor>>>, Error> {
-        let this = self.kernel();
+        let this = self;
         let mut values =
             vec![
                 ArchitectureBoundaryValue::new(schema.primary().role(), hidden.clone())
@@ -315,7 +319,7 @@ where
         forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
-        let this = self.kernel_mut();
+        let this = self;
         if source_group != VISION_INDEX
             && !(source_group == TARGET_INDEX && destination_group == TARGET_INDEX)
         {

@@ -16,9 +16,7 @@ use eredu_codec::ear::AudioDecoderExecution;
 use eredu_codec::ear_decoder::DecoderState;
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_nn::RetainedTensorRoots;
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use std::sync::Arc;
 
@@ -62,7 +60,7 @@ impl<T: Tensor + SnapshotValue, K: SnapshotValue> SnapshotValue for SpeechState<
             self.codec.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             policy: Arc::clone(&self.policy),
             feedback: self.feedback.copy_snapshot_value(retention)?,

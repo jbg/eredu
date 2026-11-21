@@ -102,7 +102,8 @@ pub(crate) fn native_recipe_workspace<C: RecipeCatalog + ?Sized>(
 }
 
 /// A byte-preserving recipe admitted for direct initialization of native storage.
-pub(crate) struct DirectRecipeRead {
+#[doc(hidden)]
+pub struct DirectRecipeRead {
     shape: Vec<i32>,
     dtype: Dtype,
     read: eredu_checkpoint::recipe::EncodedRecipeRead,
@@ -111,6 +112,13 @@ pub(crate) struct DirectRecipeRead {
 }
 
 impl DirectRecipeRead {
+    pub(crate) fn for_binding(
+        source: &dyn CheckpointSource,
+        binding: &eredu_core::residency::parameter_binding::WeightBinding,
+    ) -> Result<Option<Self>, WeightRecipeError> {
+        Self::prepare_with_layout(&binding.recipe_view(), source, binding.storage_layout())
+    }
+
     pub(crate) fn prepare(
         recipe: &DerivedWeightRecipe,
         source: &dyn CheckpointSource,
@@ -214,62 +222,6 @@ impl DirectRecipeRead {
             })
             .collect()
     }
-}
-
-/// One compatible group, or one binding requiring the ordinary materializer.
-pub(crate) enum BindingReadBatch<'a> {
-    Direct {
-        bindings: Vec<&'a eredu_runtime::WeightBinding>,
-        reads: Vec<DirectRecipeRead>,
-    },
-    Ordinary(&'a eredu_runtime::WeightBinding),
-}
-
-/// Plans all reads without allocating weights; allocation is bounded per group.
-pub(crate) fn plan_binding_reads<'a>(
-    source: &dyn CheckpointSource,
-    bindings: impl IntoIterator<Item = &'a eredu_runtime::WeightBinding>,
-) -> Result<Vec<BindingReadBatch<'a>>, WeightRecipeError> {
-    let mut batches = Vec::new();
-    let mut group = Vec::new();
-    let mut reads = Vec::new();
-    let mut budget = eredu_runtime::ParameterBatchBudget::default();
-    for binding in bindings {
-        let direct_source;
-        let recipe = if let Some(recipe) = binding.recipe() {
-            recipe
-        } else {
-            direct_source = binding.source_recipe();
-            &direct_source
-        };
-        let read = DirectRecipeRead::prepare_with_layout(recipe, source, binding.storage_layout())?;
-        if read.is_none() || !budget.try_push(binding.expected_bytes()) {
-            if !group.is_empty() {
-                batches.push(BindingReadBatch::Direct {
-                    bindings: std::mem::take(&mut group),
-                    reads: std::mem::take(&mut reads),
-                });
-            }
-            budget = Default::default();
-            if read.is_some() {
-                let admitted = budget.try_push(binding.expected_bytes());
-                debug_assert!(admitted);
-            }
-        }
-        if let Some(read) = read {
-            group.push(binding);
-            reads.push(read);
-        } else {
-            batches.push(BindingReadBatch::Ordinary(binding));
-        }
-    }
-    if !group.is_empty() {
-        batches.push(BindingReadBatch::Direct {
-            bindings: group,
-            reads,
-        });
-    }
-    Ok(batches)
 }
 
 /// Materializes a recipe already classified as requiring the ordinary path.
@@ -545,13 +497,6 @@ pub fn lower_mxfp4_recipe(
 
 /// MLX lowering operations for a backend-neutral recipe.
 pub trait MlxWeightRecipeExt {
-    #[cfg(test)]
-    /// Materializes the recipe synchronously for tests.
-    fn materialize(
-        &self,
-        store: &dyn CheckpointSource,
-        source_stream: &Stream,
-    ) -> Result<Array, WeightRecipeError>;
     /// Prepares owned checkpoint sources and submits the recipe transformations.
     fn prepare_materialization(
         &self,
@@ -583,21 +528,6 @@ pub trait MlxWeightRecipeExt {
 }
 
 impl MlxWeightRecipeExt for DerivedWeightRecipe {
-    ///
-    /// Source leases remain live until their dependent output has been
-    /// evaluated. If a multi-input join reaches the shard-cache bound, completed
-    /// children are detached before retrying so cross-shard recipes can honor
-    /// a one-shard cache limit without serializing the normal batched path.
-    #[cfg(test)]
-    fn materialize(
-        &self,
-        store: &dyn CheckpointSource,
-        source_stream: &Stream,
-    ) -> Result<Array, WeightRecipeError> {
-        let context = MlxParameterMaterializationContext::new(source_stream, source_stream);
-        self.prepare_materialization(store, &context)?.finish()
-    }
-
     /// Schedules a recipe while retaining all mmap-backed source selections.
     fn prepare_materialization(
         &self,
@@ -842,11 +772,6 @@ impl PendingWeightRecipe {
     pub fn into_parts(self) -> (Array, Vec<PendingWeightMaterialization>) {
         (self.output, self.sources)
     }
-
-    #[cfg(test)]
-    fn finish(self) -> Result<Array, WeightRecipeError> {
-        Ok(WeightMaterialization::submit_retained(self.output, self.sources)?.synchronize()?)
-    }
 }
 
 fn materialize_inputs(
@@ -1057,9 +982,6 @@ pub enum WeightRecipeError {
     #[error(transparent)]
     Mlx(#[from] safemlx::error::Exception),
 }
-
-#[cfg(test)]
-mod tests;
 
 /// Copies final storage on the destination stream while preserving a selected
 /// physical matrix layout. Only the returned logical view survives publication.

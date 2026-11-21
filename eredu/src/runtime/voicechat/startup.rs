@@ -12,13 +12,12 @@ use eredu_architectures::voicechat::{
     state::NeuralStateGeometryError,
     tts_prompt::PreparedTtsPrompt,
 };
-use eredu_core::{
-    scheduler::SemanticStateTransaction, BackendFailure, RealtimeDecisionDiagnostics,
-};
+use eredu_core::realtime_mechanisms::{RealtimeQueue, RealtimeStartupMechanisms};
+use eredu_core::{BackendFailure, RealtimeDecisionDiagnostics};
 use eredu_nn::{RetainedTensorRoots, Tensor, TensorElementType};
 use eredu_runtime::{
-    RealtimeCopyLimits, RealtimeStartupMechanisms, RealtimeStartupPreparation, RealtimeStateGroup,
-    RealtimeStateMaterializer, SelectedStateRealization,
+    JointRealtimeState, JointStateError, RealtimeCopyLimits, SelectedStateRealization,
+    SharedRealtimeExecution, SpeechRealtimeMechanisms, SpeechRealtimeState,
 };
 
 use super::{
@@ -54,6 +53,9 @@ pub enum VoiceChatStartError {
     /// Session registration or bounded queue admission failed.
     #[error(transparent)]
     Session(#[from] VoiceChatSessionError),
+    /// Coupled state transaction could not adopt the selected caches.
+    #[error(transparent)]
+    State(#[from] JointStateError),
     /// Native preparation failure, preserving its original source.
     #[error("VoiceChat native startup failed: {0}")]
     Backend(#[source] BackendFailure),
@@ -82,16 +84,16 @@ impl<T> RetainedTensorRoots<T> for Silence<T> {
     }
 }
 
-type SessionGeneration<T, H, K, M> = Generation<
+type SessionGeneration<T, M> = Generation<
     T,
-    <M as RealtimeStateGroup<H, K>>::State,
+    SpeechRealtimeState<M>,
     <M as RealtimeStartupMechanisms>::Random,
     <M as RealtimeStartupMechanisms>::Completion,
 >;
 
 impl PreparedVoiceChatSession<'_> {
     /// Binds selected resources and queues portable prefill on the ordinary session.
-    pub fn start<T, H, K, M, C, P, E>(
+    pub fn start<T, M, C, Q, E>(
         self,
         residency: &VoiceChatResidencyPolicy,
         selection: VoiceChatLoadSelection<'_>,
@@ -100,30 +102,35 @@ impl PreparedVoiceChatSession<'_> {
             PreparedVoiceChatConstruction<'_>,
             FrontendOptions,
             &VoiceChatResidencyPolicy,
-        ) -> Result<(P, InputState<T>), VoiceChatConstructionError>,
-        executor: impl FnOnce(P, VoiceChatStartupInputs<T>) -> E,
+        ) -> Result<
+            (SharedRealtimeExecution<C, Q>, InputState<T>),
+            VoiceChatConstructionError,
+        >,
+        executor: impl FnOnce(SharedRealtimeExecution<C, Q>, VoiceChatStartupInputs<T>) -> E,
     ) -> Result<
-        BoundVoiceChatSession<SessionGeneration<T, H, K, M>, RealtimeDecisionDiagnostics, E>,
+        BoundVoiceChatSession<SessionGeneration<T, M>, RealtimeDecisionDiagnostics, E>,
         VoiceChatStartError,
     >
     where
         T: Tensor,
-        M: RealtimeStartupMechanisms
-            + RealtimeStateMaterializer<SelectedStateRealization, H>
-            + RealtimeStateMaterializer<SelectedStateRealization, K>
-            + RealtimeStateGroup<H, K>,
-        M::Random: Clone,
-        M::State: SemanticStateTransaction,
-        <M::State as SemanticStateTransaction>::Error: Send + Sync + 'static,
-        C: VoiceChatStartupComponents<T>,
-        P: RealtimeStartupPreparation<C, T>,
-        E: VoiceChatExecutor<SessionGeneration<T, H, K, M>, RealtimeDecisionDiagnostics>,
+        M: SpeechRealtimeMechanisms,
+        C: VoiceChatStartupComponents<T> + 'static,
+        Q: RealtimeQueue<Tensor = T>,
+        E: VoiceChatExecutor<SessionGeneration<T, M>, RealtimeDecisionDiagnostics>,
     {
         let parts = self.into_parts();
         parts
             .construction
             .neural_state_geometry()
             .validate_layouts(selection.backbone.layout(), selection.tts.layout())?;
+        let backbone_plan = selection
+            .backbone
+            .allocation()
+            .map_err(VoiceChatStartError::Backend)?;
+        let tts_plan = selection
+            .tts
+            .allocation()
+            .map_err(VoiceChatStartError::Backend)?;
         let (execution, input) = bind(parts.construction, parts.frontend, residency)?;
         let speaker = execution
             .prepare_startup(|components, context| {
@@ -142,15 +149,32 @@ impl PreparedVoiceChatSession<'_> {
             })
             .map_err(VoiceChatStartError::Backend)?
             .0;
-        let backbone: H = mechanisms
-            .realize_state(selection.backbone)
+        let backbone_cache = selection
+            .backbone
+            .create_live_cache::<M::CacheBackend>()
             .map_err(VoiceChatStartError::Backend)?;
-        let tts: K = mechanisms
-            .realize_state(selection.tts)
+        let backbone = eredu_runtime::state::HybridState::allocate_layers(
+            &backbone_plan,
+            backbone_cache,
+            None,
+            0,
+        )
+        .map_err(BackendFailure::from_error)
+        .map_err(VoiceChatStartError::Backend)?;
+        let tts_cache = selection
+            .tts
+            .create_live_cache::<M::CacheBackend>()
             .map_err(VoiceChatStartError::Backend)?;
-        let neural = mechanisms
-            .group_state(backbone, tts, selection.copy_limits)
-            .map_err(VoiceChatStartError::Backend)?;
+        let tts =
+            eredu_runtime::state::KeyValueState::allocate_layers(&tts_plan, tts_cache, None, 0)
+                .map_err(BackendFailure::from_error)
+                .map_err(VoiceChatStartError::Backend)?;
+        let neural = JointRealtimeState::new(
+            backbone,
+            tts,
+            mechanisms.state_copy_queue(),
+            selection.copy_limits,
+        )?;
         let random = mechanisms
             .realize_random(selection.seed)
             .map_err(VoiceChatStartError::Backend)?;

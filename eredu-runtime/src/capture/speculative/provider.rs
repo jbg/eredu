@@ -7,7 +7,7 @@ use std::sync::Arc;
 /// Composes native primitives with exact retained layout and transport owners.
 /// This provider does not select architecture membership or allocate native
 /// values. Its observer retains prepaid source/receipt work for a whole phase.
-pub struct PartitionCaptureBackendProvider<P, T, L, N, F> {
+pub struct PartitionCaptureBackendProvider<P, T, L: ?Sized, N, F> {
     provider: P,
     transport: Arc<T>,
     layout: Arc<L>,
@@ -17,7 +17,7 @@ pub struct PartitionCaptureBackendProvider<P, T, L, N, F> {
     map_partition_error: F,
 }
 
-impl<P, T, L, N, F> PartitionCaptureBackendProvider<P, T, L, N, F> {
+impl<P, T, L: ?Sized, N, F> PartitionCaptureBackendProvider<P, T, L, N, F> {
     /// Retains already selected resources. `identity` must describe their loaded
     /// setup and parameter version. It binds before the first invocation, while
     /// the first actual forward epoch is claimed by shared preparation.
@@ -43,7 +43,8 @@ impl<P, T, L, N, F> PartitionCaptureBackendProvider<P, T, L, N, F> {
     }
 }
 
-impl<P, T, L, N, F> CaptureBackendProvider for PartitionCaptureBackendProvider<P, T, L, N, F>
+impl<P, T, L: ?Sized, N, F> CaptureBackendProvider
+    for PartitionCaptureBackendProvider<P, T, L, N, F>
 where
     P: CaptureBackendProvider,
     T: PartitionCaptureHookTransport,

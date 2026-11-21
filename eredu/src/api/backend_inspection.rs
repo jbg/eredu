@@ -6,15 +6,17 @@ use eredu_core::{BackendFailure, DevicePlan, ExecutionPlan, InputTokenCount};
 
 use super::{ForecastCalibration, GenerationForecastError, GenerationMemoryOptions, MemoryBytes};
 
-pub use eredu_architectures::BackendInspection;
+pub use eredu_runtime::BackendInspection;
 
 /// Inspects an artifact against the selected backend and plan without loading it.
+/// A distributed plan uses the same per-rank request as target selection.
 pub fn inspect_execution(
     backend: &impl BackendInspection,
     path: impl AsRef<Path>,
     plan: &ExecutionPlan,
+    parallel: Option<eredu_runtime::ParallelLoadRequest>,
 ) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure> {
-    backend.inspect_execution(path.as_ref(), plan)
+    crate::runtime::model_loading::inspect_execution(backend, path.as_ref(), plan, parallel)
 }
 
 impl GenerationMemoryOptions {

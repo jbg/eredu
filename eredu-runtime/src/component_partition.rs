@@ -446,6 +446,7 @@ where
         unit: usize,
         routed: bool,
     ) -> Result<RoutedTensorReductions, K::Error> {
+        // Collective planning describes every stage, including units absent on this rank.
         let group = self
             .definition()
             .parameters()
@@ -453,7 +454,7 @@ where
             .group_index(self.primary_execution_group())
             .expect("declared primary group");
         self.kernel()
-            .routed_tensor_reductions(self.address(group, unit)?, routed)
+            .routed_tensor_reductions(self.definition().unit_address(group, unit)?, routed)
     }
     fn partition_routed_bank_order(&self, unit: usize) -> Vec<RoutedBankId> {
         let group = self
@@ -463,8 +464,9 @@ where
             .group_index(self.primary_execution_group())
             .expect("declared primary group");
         self.kernel().routed_bank_order(
-            self.address(group, unit)
-                .expect("validated routed traversal"),
+            self.definition()
+                .unit_address(group, unit)
+                .expect("declared routed invocation"),
         )
     }
     fn partition_routed_bank_tensor_reductions(
@@ -479,7 +481,7 @@ where
             .group_index(self.primary_execution_group())
             .expect("declared primary group");
         self.kernel()
-            .routed_bank_tensor_reductions(self.address(group, unit)?, bank)
+            .routed_bank_tensor_reductions(self.definition().unit_address(group, unit)?, bank)
     }
     fn partition_tensor_vocabulary_sharded(&self) -> bool {
         self.kernel().tensor_vocabulary_sharded()

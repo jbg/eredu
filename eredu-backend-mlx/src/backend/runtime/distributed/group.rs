@@ -1,10 +1,11 @@
 //! Backend-owned logical groups layered over native MLX communication groups.
 
-use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId};
-use eredu_runtime::{
+use eredu_core::communication::CommunicationOperation;
+use eredu_core::communication::{
     CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,
-    CommunicationOperation, CommunicationOperationRequirement,
+    CommunicationOperationRequirement,
 };
+use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId};
 use safemlx::{
     distributed as native,
     error::{Exception, Result},
@@ -28,9 +29,3 @@ pub(crate) use collectives::{
 pub use handle::Group;
 pub(crate) use point_to_point::{broadcast_boundary_frame, recv_like};
 pub use point_to_point::{recv, send};
-
-#[cfg(test)]
-pub(crate) use handle::{
-    contracted_collective_submissions, native_collective_submissions,
-    reset_native_collective_submissions,
-};

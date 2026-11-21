@@ -143,7 +143,7 @@ pub(crate) enum MechanismObservation {
         eredu_runtime::StateMechanismCapabilities,
     ),
     Speculative(eredu_runtime::SpeculativeMechanismCapabilities),
-    Communication(eredu_runtime::CommunicationCapabilities),
+    Communication(eredu_core::communication::CommunicationCapabilities),
 }
 
 impl MechanismObservation {
@@ -341,7 +341,7 @@ impl<P: crate::PreparationMechanismProvider> crate::PreparationMechanismProvider
         facts
     }
 
-    fn communication_capabilities(&self) -> eredu_runtime::CommunicationCapabilities {
+    fn communication_capabilities(&self) -> eredu_core::communication::CommunicationCapabilities {
         let facts = self.provider.communication_capabilities();
         self.observations
             .borrow_mut()

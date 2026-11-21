@@ -29,7 +29,7 @@ pub(super) fn report(
     input_tokens: u64,
     output_tokens: Option<u64>,
 ) -> Result<Report> {
-    let inspection = eredu::api::inspect_execution(factory, path, plan)?;
+    let inspection = eredu::api::inspect_execution(factory, path, plan, None)?;
     let input = eredu_core::InputTokenCount::text(input_tokens);
     let mut options = GenerationMemoryOptions::for_backend_device(factory, input, plan.device())?;
     if let Some(cache_limit) = args.common.allocator_cache_limit_bytes {

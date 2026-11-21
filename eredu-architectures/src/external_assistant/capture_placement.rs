@@ -11,7 +11,7 @@ pub struct PreparedTargetCapturePlacement {
     execution_identity: String,
     prototype: ForwardCaptureBundle,
     invocation_limits: (i32, i32),
-    publication: eredu_runtime::CommunicationGroupRequirements,
+    publication: eredu_core::communication::CommunicationGroupRequirements,
 }
 
 impl PreparedTargetCapturePlacement {
@@ -34,9 +34,15 @@ impl PreparedTargetCapturePlacement {
         let element = match selected.partitioned_activation_dtype().ok_or_else(|| {
             CaptureError::Invalid("capture selection has no transport precision".into())
         })? {
-            eredu_runtime::PipelineActivationDtype::Float16 => eredu_nn::TensorElementType::F16,
-            eredu_runtime::PipelineActivationDtype::Bfloat16 => eredu_nn::TensorElementType::Bf16,
-            eredu_runtime::PipelineActivationDtype::Float32 => eredu_nn::TensorElementType::F32,
+            eredu_core::communication::PipelineActivationDtype::Float16 => {
+                eredu_nn::TensorElementType::F16
+            }
+            eredu_core::communication::PipelineActivationDtype::Bfloat16 => {
+                eredu_nn::TensorElementType::Bf16
+            }
+            eredu_core::communication::PipelineActivationDtype::Float32 => {
+                eredu_nn::TensorElementType::F32
+            }
             _ => {
                 return Err(CaptureError::Unsupported(
                     "capture transport precision is unsupported".into(),
@@ -186,7 +192,9 @@ impl PreparedTargetCapturePlacement {
         let bundle = ForwardCaptureBundle::new(slots).map_err(CaptureError::Invalid)?;
         self.publication
             .validate_requirement(
-                &eredu_runtime::CommunicationOperationRequirement::failure_agreement(true),
+                &eredu_core::communication::CommunicationOperationRequirement::failure_agreement(
+                    true,
+                ),
             )
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
         for slot in bundle.slots() {
@@ -229,24 +237,37 @@ impl PreparedTargetCapturePlacement {
                 .ok_or_else(|| {
                     CaptureError::Invalid("capture publication extent overflows".into())
                 })?;
-            let limits = eredu_runtime::CommunicationTensorLimits::new(
+            let limits = eredu_core::communication::CommunicationTensorLimits::new(
                 1,
                 slot.shape().len(),
                 elements,
                 None,
             )
             .map_err(|error| CaptureError::Invalid(error.to_string()))?;
-            let requirement = eredu_runtime::CommunicationOperationRequirement::tensors(
-                eredu_runtime::CommunicationOperation::Broadcast,
-                dtypes,
-                limits,
-                true,
-            )
-            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
+            let requirement =
+                eredu_core::communication::CommunicationOperationRequirement::tensors(
+                    eredu_core::communication::CommunicationOperation::Broadcast,
+                    dtypes,
+                    limits,
+                    true,
+                )
+                .map_err(|error| CaptureError::Invalid(error.to_string()))?;
             self.publication
                 .validate_requirement(&requirement)
                 .map_err(|error| CaptureError::Invalid(error.to_string()))?;
         }
         Ok(bundle)
+    }
+}
+
+impl eredu_runtime::executable_binding::discovery::ExternalTargetCapturePlacement
+    for PreparedTargetCapturePlacement
+{
+    fn resolve(&self, decoder_shape: [u64; 2]) -> Result<ForwardCaptureBundle, CaptureError> {
+        self.resolve(decoder_shape)
+    }
+
+    fn rank(&self) -> usize {
+        self.topology().global_rank()
     }
 }

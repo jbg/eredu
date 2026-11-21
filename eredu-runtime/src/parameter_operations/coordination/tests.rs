@@ -2,8 +2,11 @@
 #![allow(clippy::drop_non_drop)]
 
 use super::*;
+use eredu_core::communication::CommunicationSessionIdentity;
+use eredu_core::parameters::ParameterOperationTransport;
 use eredu_core::{
-    consensus::ConsensusTransport, BoundedCompletionOutcome, CompletionCancellationMode, Submission,
+    consensus::{BoundedConsensusTransport, ConsensusTransport},
+    BoundedCompletionOutcome, CompletionCancellationMode, Submission,
 };
 use std::{
     cell::RefCell,
@@ -212,7 +215,9 @@ fn ranks(fault: Fault, run: impl Fn(usize, &Transport, &ParameterOperationCoordi
                     fault: if rank == 1 { fault } else { Fault::None },
                     setup: RefCell::new(None),
                 };
-                let manifest = crate::CommunicationManifest::new(3, rank, vec![], vec![]).unwrap();
+                let manifest =
+                    eredu_core::communication::CommunicationManifest::new(3, rank, vec![], vec![])
+                        .unwrap();
                 let setup = crate::establish_communication_session(
                     &transport,
                     &manifest,

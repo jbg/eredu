@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPrefillTensorRole {
     /// Original processor payload or metadata, still owned by the admission proof.
-    Original(eredu_runtime::input::PreparedInputTensorRole),
+    Original(eredu_core::input::PreparedInputTensorRole),
     /// Prepared ingress and whole-request ID/rotary products.
     Prepared(crate::qwen4_exp::media::PreparedMediaTensorRole),
     /// Encoder output reused across decoder chunks.
@@ -120,9 +120,7 @@ where
             MediaInputPartPlan::request(admitted.parts()).map_err(Error::backend_source)?;
         let paired =
             PreparedCompositeInput::new(request.input(), &admitted).map_err(Error::backend)?;
-        Ok(operation(
-            <ConditionalModel<B> as crate::composite_execution::CompositeArchitecture<B, S>>::prepared_input(paired),
-        ))
+        Ok(operation(ConditionalInput::Prepared(paired)))
     }
     fn request_values(&self) -> Vec<&B::Tensor> {
         let request = MediaInputPartPlan::request(self.admitted.parts())

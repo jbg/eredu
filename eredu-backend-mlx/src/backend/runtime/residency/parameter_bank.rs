@@ -4,23 +4,10 @@
 //! inspected once per grouped block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
-#[cfg(test)]
-use eredu_checkpoint::store::TensorSelection;
-use eredu_checkpoint::WeightQuantization;
+use eredu_nn::tensor_movement::IndexedMovement;
 use eredu_nn::GroupedNeuralBackend;
-#[cfg(test)]
-use eredu_runtime::OffloadUnit;
-pub use eredu_runtime::{AddressableBankCatalog, AddressableBankEntry};
-use eredu_runtime::{
-    AddressableGroupedBank, IndexedMovement, ParameterBankAccess, ParameterBankAcquisition,
-    ResidencyReport, WeightBinding, WeightMaterializationReport,
-};
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
 
 use safemlx::{
     ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum},
@@ -28,43 +15,15 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-#[cfg(test)]
-use crate::backend::runtime::residency::manager::ResidentUnitLease;
 use crate::MlxTensor;
 use crate::{
     backend::error::Error,
     backend::nn::shared::MlxNeuralBackend,
-    backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source,
-    backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
+    backend::runtime::residency::manager::{ResidencyError, ResidentTransfer},
 };
-use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitId, ResidencyLedgerError};
-#[cfg(test)]
-use eredu_core::residency::{OffloadPlan, ResidencyPolicy};
+use eredu_core::residency::{MemoryTier, ResidencyLedgerError};
 
-mod catalog;
-#[cfg(test)]
-pub(crate) use catalog::quantize_entry_catalog;
-use catalog::quantize_selected_entry_catalog;
-#[allow(unused_imports)]
-pub(crate) use catalog::QuantizedParameterBankCatalog;
-pub use catalog::{
-    entries_from_selected_members, BankAccessClass, ParameterBankKey, ParameterBankOptions,
-    ParameterBankOptionsError,
-};
-
-mod telemetry;
-use telemetry::ParameterBankStatistics;
-pub use telemetry::{
-    BankPassStatistics, BankTierStatistics, ParameterBankResidencyReport,
-    ParameterBanksResidencyReport, RowLookupPoolReport,
-};
-
-mod acquisition;
 mod parameters;
-pub use acquisition::{
-    AcquiredParameters, AddressableParameterBank, SharedAddressableParameterBank,
-};
-pub(crate) use parameters::publish_bank_parameter_replacements;
 
 mod movement;
 pub use movement::MlxIndexedMovement;
@@ -73,22 +32,6 @@ pub use movement::MlxIndexedMovement;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AddressableParameterBankError {
-    /// Portable demand ownership, use counts or compact resource admission failed.
-    #[error(transparent)]
-    Demand(#[from] eredu_runtime::AddressableBankDemandError),
-    /// Grouped-entry placement controls were invalid.
-    #[error(transparent)]
-    Policy(#[from] ParameterBankOptionsError),
-    /// Bounded entry materialisation failed before cache construction.
-    #[error("bounded entry materialisation failed: {source}")]
-    Transformation {
-        /// Shared checkpoint transformation failure.
-        #[source]
-        source: Box<Error>,
-    },
-    /// Independent member ownership or combined residency budgets are invalid.
-    #[error(transparent)]
-    Preparation(#[from] eredu_runtime::AddressableBankResidencyError),
     /// No owned entry catalog exists for this namespace.
     #[error("sparse entry cache has no catalog for namespace {namespace}")]
     UnknownNamespace {
@@ -102,14 +45,6 @@ pub enum AddressableParameterBankError {
         namespace: usize,
         /// Required global entry span.
         global_span: usize,
-    },
-    /// A dense replacement row cannot be represented by the native indexing mechanism.
-    #[error("replacement row {row} for bank member {identity:?} exceeds MLX i32 indexing")]
-    ReplacementRowOverflow {
-        /// Original global physical storage identity.
-        identity: ParameterBankKey,
-        /// Dense row within the canonical replacement parameter.
-        row: usize,
     },
     /// Device-side validation found one or more out-of-range selections.
     #[error("namespace {namespace} contains {invalid_count} grouped ids outside 0..{global_span}")]
@@ -166,9 +101,6 @@ pub enum AddressableParameterBankError {
         /// Returned output shape.
         actual: Vec<i32>,
     },
-    /// Cache statistics mutex was poisoned by a panic.
-    #[error("sparse entry cache statistics are unavailable after a panic")]
-    StatisticsPoisoned,
     /// A required compact binding had no selected source entries.
     #[error("compact entry binding {name:?} has no source arrays")]
     EmptyCompactBinding {
@@ -192,11 +124,6 @@ pub enum AddressableParameterBankError {
     Mlx(#[from] safemlx::error::Exception),
 }
 
-#[cfg(test)]
-#[path = "parameter_bank/tests.rs"]
-mod tests;
-
 mod rows;
-pub use rows::{MlxRowBank, MlxRowLookupSupport, MlxRowLookups};
-#[cfg(test)]
-mod rows_tests;
+pub use rows::MlxRowLookupSupport;
+pub(crate) use rows::{MlxRowDecodeBinding, MlxRowDecoder};

@@ -118,6 +118,7 @@ impl CaptureBackend for ReducedBackend {
         _: &Vec<u64>,
         selection: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         self.calls += 1;
         Ok(payload(&selection.transform))

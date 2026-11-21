@@ -16,6 +16,7 @@ include = [
     "src/**",
     "tests/**",
     "examples/*.rs",
+    "examples/support/**",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -141,6 +142,156 @@ name = "native_tool_checkpoints"
 path = "tests/native_tool_checkpoints.rs"
 required-features = ["mlx", "tensor-capture"]
 
+[[example]]
+name = "capture_discovery"
+path = "examples/capture_discovery.rs"
+required-features = ["mlx", "tensor-capture"]
+
+[[example]]
+name = "checkpoint_probe"
+path = "examples/checkpoint_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "diffusion_gemma_reference"
+path = "examples/diffusion_gemma_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "execution_plan_reference"
+path = "examples/execution_plan_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "expert_parallel_generate"
+path = "examples/expert_parallel_generate.rs"
+required-features = ["mlx", "distributed"]
+
+[[example]]
+name = "k2_checkpoint_parity"
+path = "examples/k2_checkpoint_parity.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "lfm3_audio_reference"
+path = "examples/lfm3_audio_reference.rs"
+required-features = ["mlx", "audio"]
+
+[[example]]
+name = "lfm3_liquid_gguf_reference"
+path = "examples/lfm3_liquid_gguf_reference.rs"
+required-features = ["mlx", "audio"]
+
+[[example]]
+name = "lfm3_liquid_reference"
+path = "examples/lfm3_liquid_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "lfm3_vision_reference"
+path = "examples/lfm3_vision_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "llama_residency"
+path = "examples/llama_residency.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "mimi_realtime_bench"
+path = "examples/mimi_realtime_bench.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "moshi_token_parity"
+path = "examples/moshi_token_parity.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "muse_spark_assistant_reference"
+path = "examples/muse_spark_assistant_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "muse_spark_reference"
+path = "examples/muse_spark_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "nemotron_diffusion_reference"
+path = "examples/nemotron_diffusion_reference.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "nemotron_generation_modes"
+path = "examples/nemotron_generation_modes.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "paged_prompt_cache"
+path = "examples/paged_prompt_cache.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "personaplex_full_path_bench"
+path = "examples/personaplex_full_path_bench.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "personaplex_quantization_eval"
+path = "examples/personaplex_quantization_eval.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "personaplex_step_bench"
+path = "examples/personaplex_step_bench.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "personaplex_torch_parity"
+path = "examples/personaplex_torch_parity.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "pipeline_generate"
+path = "examples/pipeline_generate.rs"
+required-features = ["mlx", "distributed"]
+
+[[example]]
+name = "quantize_checkpoint"
+path = "examples/quantize_checkpoint.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "tensor_parallel_generate"
+path = "examples/tensor_parallel_generate.rs"
+required-features = ["mlx", "distributed"]
+
+[[test]]
+name = "chunked_prefill"
+path = "tests/chunked_prefill.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "input_transfer"
+path = "tests/input_transfer.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "realtime_observation"
+path = "tests/realtime_observation.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "released_reference_acceptance"
+path = "tests/released_reference_acceptance.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "native_ring"
+path = "tests/native_ring.rs"
+required-features = ["mlx", "distributed"]
+
 [package.metadata.docs.rs]
 targets = [
     "aarch64-apple-darwin",
@@ -162,10 +313,11 @@ default = ["mlx", "metal", "distributed", "onig", "esaxx_fast"]
 
 distributed = ["eredu-backend-mlx?/distributed"]
 
-mlx = ["dep:eredu-backend-mlx"]
+mlx = ["dep:eredu-backend-mlx", "dep:safemlx"]
+accelerate = ["eredu-backend-mlx?/accelerate"]
 projection-profiling = ["mlx", "eredu-backend-mlx/projection-profiling"]
 metal = [
-    "eredu-backend-mlx?/accelerate",
+    "accelerate",
     "eredu-backend-mlx?/metal",
 ]
 cuda = ["eredu-backend-mlx?/cuda"]
@@ -181,6 +333,7 @@ workspace = true
 [dependencies]
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }
+safemlx = { workspace = true, optional = true, features = ["safetensors"] }
 eredu-core.workspace = true
 eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
@@ -204,3 +357,6 @@ anyhow = "1"
 [dev-dependencies]
 tempfile.workspace = true
 eredu-evaluation.workspace = true
+eredu-codec.workspace = true
+clap = { version = "4", features = ["derive"] }
+safetensors = "0.8"

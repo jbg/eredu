@@ -1,11 +1,11 @@
 //! Shared-stack invocation and vision-span transport across composite cuts.
 use super::*;
-use crate::composite_execution::ParallelCompositeArchitecture;
+use eredu_core::communication::BoundaryTensorDtype as Dtype;
 use eredu_nn::TensorParallelGroupedNeuralBackend;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
-    BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype, BoundaryTensorSpec,
-    LayeredPartitionInput, LayeredPartitionOutput,
+    BoundaryTensorDimension as Dim, BoundaryTensorSpec, LayeredPartitionInput,
+    LayeredPartitionOutput,
 };
 
 use eredu_runtime::PartitionComponentKernel as _;
@@ -140,7 +140,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> CompositeKernel<B> {
     }
 }
 
-impl<B, S> ParallelCompositeArchitecture<B, S> for Model<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for CompositeKernel<B>
 where
     B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,

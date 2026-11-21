@@ -1,11 +1,13 @@
 //! Loaded-model facade and prepared generation entry points.
 
+use crate::runtime::speculative::SpeculativeBatchBackend;
+use eredu_runtime::speculative::autoregressive::SpeculativeGenerationBackend;
 use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
-    SpeculativeCapability, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
-    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
+    SpeculativeCapability, SpeculativeGenerationBatchOutput, SpeculativeGenerationLane,
+    SpeculativeGenerationOutput,
 };
 use eredu_text::{
     gguf::GgufTokenizer,
@@ -53,6 +55,12 @@ pub enum LoadedModelLoadError {
     /// Portable artifact inspection or preparation planning failed.
     #[error(transparent)]
     Artifact(#[from] eredu_core::artifact::ArtifactError),
+    /// Portable cold selection failed.
+    #[error("failed to select model preparation: {0}")]
+    Selection(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The portable source preparation failed.
+    #[error("failed to prepare checkpoint sources: {0}")]
+    SourcePreparation(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Backend materialization or session creation failed.
     #[error("selected backend failed to load the model: {0}")]
     Backend(#[source] eredu_core::BackendFailure),
@@ -76,6 +84,18 @@ pub enum PlannedModelLoadError {
     /// Artifact, metadata, materialization, or session creation failed.
     #[error(transparent)]
     Loading(#[from] LoadedModelLoadError),
+}
+
+fn map_speculative_batch_error<E: std::error::Error + Send + Sync + 'static>(
+    error: crate::runtime::speculative::SpeculativeBatchExecutionError<E>,
+) -> PreparedChatError {
+    use crate::runtime::speculative::SpeculativeBatchExecutionError;
+    match error {
+        SpeculativeBatchExecutionError::Generation(error) => PreparedChatError::Generation(error),
+        SpeculativeBatchExecutionError::Backend(error) => {
+            PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+        }
+    }
 }
 
 pub(super) fn map_prepared_chat_setup_error(error: PreparedChatSetupError) -> PreparedChatError {
@@ -130,24 +150,23 @@ where
     }
 }
 
-pub(super) struct GenerationStepDelivery<'a> {
-    #[cfg(feature = "tensor-capture")]
-    pub plan: eredu_core::capture::AdmittedCapturePlan,
-    #[cfg(feature = "tensor-capture")]
-    pub intervention: Option<eredu_core::intervention::AdmittedInterventionPlan>,
-    pub on_step: &'a mut super::request::GenerationStepCallback<'a>,
-    pub failure: &'a dyn Fn() -> Option<eredu_core::capture::CaptureError>,
-}
-
-impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
+impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
+    LoadedModel<B, S>
+{
     pub(super) fn validate_refinement_canvas(
         &self,
         canvas: Option<&eredu_core::refinement::RefinementCanvas>,
     ) -> Result<(), eredu_core::generation::GenerationError> {
         if let Some(canvas) = canvas {
-            let length = B::refinement_canvas_length(&self.runtime)
+            let length = self
+                .runtime
+                .session()
+                .refinement_canvas_length()
                 .ok_or(eredu_core::generation::GenerationError::RefinementUnavailable)?;
-            let vocabulary = B::refinement_vocabulary_size(&self.runtime)
+            let vocabulary = self
+                .runtime
+                .session()
+                .refinement_vocabulary_size()
                 .ok_or(eredu_core::generation::GenerationError::RefinementUnavailable)?;
             canvas.validate(length.get(), vocabulary.get() as usize)?;
             if canvas
@@ -171,9 +190,13 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     > {
         let mode = settings
             .decoding_mode
-            .unwrap_or_else(|| B::default_decoding_mode(&self.runtime));
+            .unwrap_or_else(|| self.runtime.session().default_decoding_mode());
         if matches!(mode, eredu_core::decoding::DecodingMode::Diffusion { .. })
-            && ((!B::decoding_capabilities(&self.runtime).autoregressive
+            && ((!self
+                .runtime
+                .session()
+                .decoding_capabilities()
+                .autoregressive
                 && settings.overrides.has_sampling_overrides())
                 || !matches!(
                     settings.strategy,
@@ -206,11 +229,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 
     pub(super) fn generate_request<F>(
         &mut self,
-        request: GenerationRequest<'_, B, F>,
+        request: GenerationRequest<'_, S::Prompt, F>,
         started: std::time::Instant,
     ) -> Result<GenerationOutput, PreparedChatError>
     where
         F: FnMut(SemanticEvent),
+        S: eredu_core::AutomaticPromptCacheSession<B>,
     {
         if self.prompt_cache_store.is_some() {
             return self.generate_with_store(request, started);
@@ -221,7 +245,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 
     pub(super) fn generate_prepared<'a, F>(
         &'a mut self,
-        request: GenerationRequest<'_, B, F>,
+        request: GenerationRequest<'_, S::Prompt, F>,
         delivery: Option<GenerationStepDelivery<'a>>,
         generation_started: std::time::Instant,
         mode: OutputMode,
@@ -297,11 +321,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         let mut pipeline = CommittedTokenPipeline::new(raw_decoder, control.parser);
         let prompt = match input {
             PreparedChatInput::TokenIds { token_ids, .. } => {
-                B::prepare_text_prompt(self.runtime.backend(), token_ids).map_err(|error| {
+                S::prepare_text_prompt(self.runtime.backend(), token_ids).map_err(|error| {
                     PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
                 })
             }
-            PreparedChatInput::PreparedBackendInput { prompt, .. } => Ok(prompt),
+            PreparedChatInput::PreparedInput { prompt, .. } => Ok(prompt),
             PreparedChatInput::RenderedPrompt(_) => {
                 unreachable!("host preparation tokenized the prompt")
             }
@@ -387,19 +411,20 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Reports fail-closed speculative support for this backend model session.
-    pub fn speculative_capability(&self) -> SpeculativeCapability
-    where
-        B: SpeculativeGenerationBackend,
-    {
-        B::speculative_capability(&self.runtime)
+    pub fn speculative_capability(&self) -> SpeculativeCapability {
+        self.runtime.session().speculative_capability()
     }
+}
 
+impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
+    LoadedModel<B, S>
+{
     pub(super) fn generate_speculative_request<'a, F>(
         &mut self,
-        request: SourceRequest<'a, B, B::Drafter, F>,
+        request: SourceRequest<'a, S::Prompt, B::Drafter, F>,
     ) -> Result<SpeculativeGenerationOutput, PreparedChatError>
     where
-        B: SpeculativeGenerationBackend,
+        B: SpeculativeBatchBackend<S>,
         F: FnMut(SemanticEvent),
     {
         let mode = request.request.output_mode;
@@ -413,12 +438,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 
     pub(super) fn generate_prepared_speculative_with<'a, F, V>(
         &mut self,
-        request: SourceRequest<'a, B, <B as SpeculativeGenerationBackend>::Drafter, F>,
+        request: SourceRequest<'a, S::Prompt, <B as SpeculativeGenerationBackend<S>>::Drafter, F>,
         mode: OutputMode,
         driver: V,
     ) -> Result<SpeculativeGenerationOutput, PreparedChatError>
     where
-        B: SpeculativeGenerationBackend,
+        B: SpeculativeBatchBackend<S>,
         F: FnMut(SemanticEvent),
         V: eredu_core::SpeculativeGenerationVisitor,
     {
@@ -456,18 +481,17 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             limits,
             matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone)
                 || matches!(drafting, eredu_core::SpeculativeDraft::Target)
-                    && B::decoding_capabilities(&self.runtime).speculation,
+                    && self.runtime.session().decoding_capabilities().speculation,
             matches!(drafting, eredu_core::SpeculativeDraft::Target),
             mode,
         )?;
-        let output = B::with_speculative_execution(
+        let output = crate::runtime::speculative::execute_speculative_batch(
             &mut self.runtime,
-            SpeculativeGenerationBatchRequest::new(drafting, lanes, self.tokenizer_fingerprint),
+            drafting,
+            lanes,
             driver,
         )
-        .map_err(|error| {
-            PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
-        })?;
+        .map_err(map_speculative_batch_error)?;
         let request: Result<[SpeculativeGenerationOutput; 1], _> =
             output.into_requests().try_into();
         match request {
@@ -484,12 +508,12 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         &mut self,
         request: PreparedChatSpeculativeBatchRequest<
             'a,
-            B,
-            <B as SpeculativeGenerationBackend>::Drafter,
+            S::Prompt,
+            <B as SpeculativeGenerationBackend<S>>::Drafter,
         >,
     ) -> Result<SpeculativeGenerationBatchOutput, PreparedChatError>
     where
-        B: SpeculativeGenerationBackend,
+        B: SpeculativeBatchBackend<S>,
     {
         let mode = request.output_mode;
         let scheduler = request
@@ -503,7 +527,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         } = request;
         let shared = matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone)
             || matches!(drafting, eredu_core::SpeculativeDraft::Target)
-                && B::decoding_capabilities(&self.runtime).speculation;
+                && self.runtime.session().decoding_capabilities().speculation;
         let prepared_lanes = self.prepare_speculative_lanes(
             lanes,
             scheduler,
@@ -512,28 +536,25 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             matches!(drafting, eredu_core::SpeculativeDraft::Target),
             mode,
         )?;
-        B::with_speculative_execution(
+        crate::runtime::speculative::execute_speculative_batch(
             &mut self.runtime,
-            SpeculativeGenerationBatchRequest::new(
-                drafting,
-                prepared_lanes,
-                self.tokenizer_fingerprint,
-            ),
+            drafting,
+            prepared_lanes,
             driver,
         )
-        .map_err(|error| PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error)))
+        .map_err(map_speculative_batch_error)
     }
 
     fn prepare_speculative_lanes<'a>(
         &self,
-        lanes: Vec<PreparedChatSpeculativeBatchLane<'a, B>>,
+        lanes: Vec<PreparedChatSpeculativeBatchLane<'a, S::Prompt>>,
         scheduler: eredu_core::SpeculativeSchedulerOptions,
         limits: Option<super::SpeculationOptions>,
         shared_backbone: bool,
         target_only: bool,
         mode: OutputMode,
     ) -> Result<
-        Vec<SpeculativeGenerationLane<'a, B, PreparedChatSpeculativeConstraint>>,
+        Vec<SpeculativeGenerationLane<'a, S::Prompt, PreparedChatSpeculativeConstraint>>,
         PreparedChatError,
     > {
         use eredu_core::run_preparation::TextPreparationStage as Stage;
@@ -541,7 +562,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         // peers waiting for a per-lane vote or executing an earlier lane.
         let host = (|| {
             if !target_only
-                && B::generation_score_kind(&self.runtime)
+                && self.runtime.session().generation_score_kind()
                     != eredu_core::refinement::PredictionScoreKind::CausalConditional
             {
                 return Err(PreparedChatError::Generation(
@@ -596,7 +617,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 )| {
                     let prompt = match input {
                         PreparedChatInput::TokenIds { token_ids, .. } => {
-                            B::prepare_text_prompt(self.runtime.backend(), token_ids).map_err(
+                            S::prepare_text_prompt(self.runtime.backend(), token_ids).map_err(
                                 |error| {
                                     PreparedChatError::Backend(
                                         eredu_core::BackendFailure::from_error(error),
@@ -604,7 +625,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                                 },
                             )?
                         }
-                        PreparedChatInput::PreparedBackendInput { prompt, .. } => prompt,
+                        PreparedChatInput::PreparedInput { prompt, .. } => prompt,
                         PreparedChatInput::RenderedPrompt(_) => {
                             unreachable!("host preparation tokenized the prompt")
                         }
@@ -632,13 +653,13 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     #[allow(clippy::type_complexity)]
     fn prepare_speculative_generation<'a>(
         &self,
-        input: PreparedChatInput<'a, B>,
+        input: PreparedChatInput<'a, S::Prompt>,
         generation: (eredu_core::TextGenerationConfig, NonZeroUsize),
         caller_stop_sequences: &[String],
         mode: OutputMode,
     ) -> Result<
         (
-            PreparedChatInput<'a, B>,
+            PreparedChatInput<'a, S::Prompt>,
             eredu_core::TextGenerationConfig,
             eredu_core::generation::GenerationRequestConfig,
             PreparedChatSpeculativeConstraint,
@@ -693,7 +714,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             Box::new(semantic),
         ))
     }
+}
 
+impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
+    LoadedModel<B, S>
+{
     /// Returns the stable identity of the template selected for `tools`.
     pub fn selected_chat_template_identity(
         &self,
@@ -755,18 +780,14 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
     }
 }
 
-impl<B> LoadedModel<B>
+impl<B> LoadedModel<B, B::Installed>
 where
-    B: eredu_core::TextGenerationBackend + eredu_core::ModelLoadingBackend,
-    B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-        ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
+    B: eredu_core::ModelLoadingBackend + super::TextSessionComposition,
 {
     /// Realizes a complete portable execution plan through the selected factory.
     ///
-    /// The factory first translates and selects the backend preparation, then
-    /// owns device and queue construction. Generic callers never construct
-    /// backend streams, assistants, or backend-specific load options. The
+    /// Portable composition selects preparation from the plan and per-rank
+    /// options. The factory supplies device and queue construction. The
     /// returned [`PlannedModel`] owns the target and complete drafting mode.
     /// Use [`Self::load_execution_plan_with_text_options`] to override the
     /// checkpoint chat template.
@@ -774,17 +795,31 @@ where
         factory: &F,
         artifact: impl AsRef<Path>,
         plan: &eredu_core::ExecutionPlan,
-    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
+        parallel: F::TargetOptions,
+    ) -> Result<
+        PlannedModel<B, B::Installed, eredu_core::RealizedDrafting<F::Drafter>>,
+        PlannedModelLoadError,
+    >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+            SourcePreparation: eredu_core::ModelSourcePreparation<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+            >,
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         >,
     {
         Self::load_execution_plan_with_text_options(
             factory,
             artifact,
             plan,
+            parallel,
             TextModelOptions::default(),
         )
     }
@@ -797,21 +832,35 @@ where
         factory: &F,
         artifact: impl AsRef<Path>,
         plan: &eredu_core::ExecutionPlan,
+        parallel: F::TargetOptions,
         text_options: TextModelOptions,
-    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
+    ) -> Result<
+        PlannedModel<B, B::Installed, eredu_core::RealizedDrafting<F::Drafter>>,
+        PlannedModelLoadError,
+    >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+            SourcePreparation: eredu_core::ModelSourcePreparation<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+            >,
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         >,
     {
         let artifact = artifact.as_ref();
-        let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
+        let inspection = crate::runtime::model_loading::inspect_path(artifact)
             .map_err(LoadedModelLoadError::Artifact)?;
         Self::load_inspected_execution_plan_with_text_options(
             factory,
             inspection,
             plan,
+            parallel,
             text_options,
         )
     }
@@ -825,17 +874,31 @@ where
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         plan: &eredu_core::ExecutionPlan,
-    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
+        parallel: F::TargetOptions,
+    ) -> Result<
+        PlannedModel<B, B::Installed, eredu_core::RealizedDrafting<F::Drafter>>,
+        PlannedModelLoadError,
+    >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+            SourcePreparation: eredu_core::ModelSourcePreparation<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+            >,
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         >,
     {
         Self::load_inspected_execution_plan_with_text_options(
             factory,
             inspection,
             plan,
+            parallel,
             TextModelOptions::default(),
         )
     }
@@ -847,16 +910,29 @@ where
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         plan: &eredu_core::ExecutionPlan,
+        parallel: F::TargetOptions,
         text_options: TextModelOptions,
-    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
+    ) -> Result<
+        PlannedModel<B, B::Installed, eredu_core::RealizedDrafting<F::Drafter>>,
+        PlannedModelLoadError,
+    >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
             Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+            SourcePreparation: eredu_core::ModelSourcePreparation<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+            >,
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         >,
     {
         super::PreparedTextModel::from_artifact(inspection, text_options)?
-            .select_execution_plan(factory, plan)?
+            .select_execution_plan(factory, plan, parallel)?
             .load()
     }
 
@@ -873,16 +949,26 @@ where
         request: &eredu_core::AutomaticPlanRequest,
     ) -> Result<
         (
-            PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>,
+            PlannedModel<B, B::Installed, eredu_core::RealizedDrafting<F::Drafter>>,
             eredu_core::ExecutionPlanReport,
         ),
         PlannedModelLoadError,
     >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
                 Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+                SourcePreparation: eredu_core::ModelSourcePreparation<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+                >,
+                DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    F::Backend,
+                    Inspection = eredu_architectures::ExternalDraftPreparation,
+                >,
             > + eredu_core::AutomaticPlanningBackend<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
                 Inspection = eredu_core::ArtifactInspection<
                     eredu_architectures::processor_plan::ArtifactArchitecturePlan,
                 >,
@@ -908,16 +994,26 @@ where
         text_options: TextModelOptions,
     ) -> Result<
         (
-            PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>,
+            PlannedModel<B, B::Installed, eredu_core::RealizedDrafting<F::Drafter>>,
             eredu_core::ExecutionPlanReport,
         ),
         PlannedModelLoadError,
     >
     where
         F: eredu_core::ExecutionPlanBackendFactory<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
                 Backend = B,
-                DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+                SourcePreparation: eredu_core::ModelSourcePreparation<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+                >,
+                DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    F::Backend,
+                    Inspection = eredu_architectures::ExternalDraftPreparation,
+                >,
             > + eredu_core::AutomaticPlanningBackend<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
                 Inspection = eredu_core::ArtifactInspection<
                     eredu_architectures::processor_plan::ArtifactArchitecturePlan,
                 >,
@@ -926,7 +1022,7 @@ where
         let retained = planner.plan_retained(factory, request)?;
         let (report, inspection) = retained.into_parts();
         let model = super::PreparedTextModel::from_artifact(inspection, text_options)?
-            .select_execution_plan(factory, &report.plan)?
+            .select_execution_plan(factory, &report.plan, F::TargetOptions::default())?
             .load()?;
         Ok((model, report))
     }
@@ -937,63 +1033,45 @@ where
     /// queues, and optional communication. Artifact inspection occurs exactly
     /// once and is shared by portable metadata assembly and backend planning.
     /// Use [`Self::load_with_text_options`] to override the checkpoint chat template.
-    pub fn load(
+    pub fn load<A>(
         backend: B,
         artifact: impl AsRef<Path>,
-        options: B::LoadOptions,
-    ) -> Result<Self, LoadedModelLoadError> {
-        Self::load_with_text_options(backend, artifact, options, TextModelOptions::default())
+        options: eredu_core::ModelLoadOptions<A::Request, B::LoadPlacement>,
+    ) -> Result<Self, LoadedModelLoadError>
+    where
+        A: eredu_core::backend::DirectLoadFacts<Mechanisms = B::LoadMechanisms>
+            + eredu_core::ModelLoadAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                SourcePreparation: eredu_core::ModelSourcePreparation<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+                >,
+            >,
+    {
+        Self::load_with_text_options::<A>(backend, artifact, options, TextModelOptions::default())
     }
 
     /// Loads an artifact on an existing backend with facade-owned text overrides.
-    pub fn load_with_text_options(
+    pub fn load_with_text_options<A>(
         backend: B,
         artifact: impl AsRef<Path>,
-        options: B::LoadOptions,
+        options: eredu_core::ModelLoadOptions<A::Request, B::LoadPlacement>,
         text_options: TextModelOptions,
-    ) -> Result<Self, LoadedModelLoadError> {
+    ) -> Result<Self, LoadedModelLoadError>
+    where
+        A: eredu_core::backend::DirectLoadFacts<Mechanisms = B::LoadMechanisms>
+            + eredu_core::ModelLoadAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                SourcePreparation: eredu_core::ModelSourcePreparation<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+                >,
+            >,
+    {
         let artifact = artifact.as_ref();
-        let inspection = eredu_architectures::configuration::inspect_artifact(artifact)?;
-        super::PreparedTextModel::from_artifact(inspection, text_options)?.load_on(backend, options)
-    }
-
-    pub(super) fn from_inspected(
-        backend: B,
-        inspection: eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        options: B::LoadOptions,
-        tokenizer: ChatTokenizer,
-        config: LoadedTextModelConfig,
-    ) -> Result<Self, LoadedModelLoadError> {
-        let prepared = match eredu_core::prepare_inspected_model(&backend, inspection, options) {
-            Ok(prepared) => prepared,
-            Err(error) => return Err(map_model_load_error(error)),
-        };
-        let runtime =
-            eredu_core::ModelRuntime::from_prepared(backend, prepared).map_err(|error| {
-                LoadedModelLoadError::Backend(eredu_core::BackendFailure::from_error(error))
-            })?;
-        Ok(Self::from_runtime(runtime, tokenizer, config))
-    }
-}
-
-pub(super) fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
-    error: eredu_core::ModelLoadError<E>,
-) -> LoadedModelLoadError {
-    match error {
-        eredu_core::ModelLoadError::Artifact(error) => LoadedModelLoadError::Artifact(error),
-        eredu_core::ModelLoadError::Backend(error) => {
-            LoadedModelLoadError::Backend(eredu_core::BackendFailure::from_error(error))
-        }
-        eredu_core::ModelLoadError::SessionCapability(error) => {
-            LoadedModelLoadError::SessionCapability(error)
-        }
-        error => {
-            LoadedModelLoadError::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
-                format!("unsupported model-loading failure: {error}"),
-            ))
-        }
+        let inspection = crate::runtime::model_loading::inspect_path(artifact)?;
+        super::PreparedTextModel::from_artifact(inspection, text_options)?
+            .load_on::<B, A>(backend, options)
     }
 }
 
@@ -1038,8 +1116,8 @@ pub(super) fn bind_gguf_special_token_ids(
         .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
 }
 
-pub(super) fn source_request_scheduler<B: eredu_core::TextGenerationBackend, D, F>(
-    request: &SourceRequest<'_, B, D, F>,
+pub(super) fn source_request_scheduler<P, D, F>(
+    request: &SourceRequest<'_, P, D, F>,
 ) -> eredu_core::SpeculativeSchedulerOptions {
     request
         .limits
@@ -1138,4 +1216,13 @@ pub(super) fn loaded_text_artifact(
             checkpoint_generation_config,
         },
     ))
+}
+
+pub(super) struct GenerationStepDelivery<'a> {
+    #[cfg(feature = "tensor-capture")]
+    pub plan: eredu_core::capture::AdmittedCapturePlan,
+    #[cfg(feature = "tensor-capture")]
+    pub intervention: Option<eredu_core::intervention::AdmittedInterventionPlan>,
+    pub on_step: &'a mut super::request::GenerationStepCallback<'a>,
+    pub failure: &'a dyn Fn() -> Option<eredu_core::capture::CaptureError>,
 }

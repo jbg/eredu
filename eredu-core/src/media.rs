@@ -572,3 +572,104 @@ mod tests {
         assert!(fingerprint.starts_with("sha256:"));
     }
 }
+
+/// One generic host-media or tensor operation required by neutral preparation.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum ProcessorPrimitive {
+    /// Bicubic RGB image resizing.
+    RgbResizeBicubic,
+    /// Three-lobe Lanczos RGB image resizing.
+    RgbResizeLanczos3,
+    /// Channel-wise rescaling and normalization.
+    RgbNormalize,
+    /// Deterministic decoded-video frame selection and timestamps.
+    VideoSampling,
+    /// Windowed mono PCM framing.
+    AudioWindow,
+    /// Real-valued spectrum calculation.
+    AudioSpectrum,
+    /// Mel filter-bank projection.
+    AudioMelFilter,
+    /// Numeric logarithm over audio features.
+    AudioLogarithm,
+    /// Unsigned token tensor construction.
+    TensorU32,
+    /// Floating-point tensor construction.
+    TensorF32,
+    /// Signed metadata tensor construction.
+    TensorI32,
+    /// Boolean metadata tensor construction.
+    TensorBool,
+    /// Tensor padding.
+    Padding,
+    /// Tensor concatenation.
+    Concatenation,
+    /// Tensor slicing.
+    Slicing,
+    /// Indexed tensor movement.
+    Indexing,
+    /// Boolean or causal mask construction.
+    MaskConstruction,
+    /// Scatter or ordered merge into decoder positions.
+    Merge,
+    /// Native encoder module execution.
+    Encoder,
+    /// Native projector module execution.
+    Projector,
+    /// Exact small integer and Boolean metadata evaluation.
+    MetadataInspection,
+}
+
+/// Generic mechanisms and native bounds implemented by one backend.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaPrimitiveCapabilities {
+    raw_modalities: std::collections::BTreeSet<crate::InputModality>,
+    prepared_modalities: std::collections::BTreeSet<crate::InputModality>,
+    projected_modalities: std::collections::BTreeSet<crate::InputModality>,
+    primitives: std::collections::BTreeSet<ProcessorPrimitive>,
+    maximum_dimension: u64,
+}
+
+impl MediaPrimitiveCapabilities {
+    /// Creates a fail-closed mechanism report.
+    pub fn new(
+        raw_modalities: impl IntoIterator<Item = crate::InputModality>,
+        prepared_modalities: impl IntoIterator<Item = crate::InputModality>,
+        projected_modalities: impl IntoIterator<Item = crate::InputModality>,
+        primitives: impl IntoIterator<Item = ProcessorPrimitive>,
+        maximum_dimension: u64,
+    ) -> Self {
+        Self {
+            raw_modalities: raw_modalities.into_iter().collect(),
+            prepared_modalities: prepared_modalities.into_iter().collect(),
+            projected_modalities: projected_modalities.into_iter().collect(),
+            primitives: primitives.into_iter().collect(),
+            maximum_dimension,
+        }
+    }
+
+    /// Operations implemented with their exact neutral semantics.
+    pub const fn primitives(&self) -> &std::collections::BTreeSet<ProcessorPrimitive> {
+        &self.primitives
+    }
+}
+
+impl MediaPrimitiveCapabilities {
+    /// Raw decoded modalities accepted by the implementation.
+    pub const fn raw_modalities(&self) -> &std::collections::BTreeSet<crate::InputModality> {
+        &self.raw_modalities
+    }
+    /// Modalities accepted as prepared tensors.
+    pub const fn prepared_modalities(&self) -> &std::collections::BTreeSet<crate::InputModality> {
+        &self.prepared_modalities
+    }
+    /// Modalities accepted as projected embeddings.
+    pub const fn projected_modalities(&self) -> &std::collections::BTreeSet<crate::InputModality> {
+        &self.projected_modalities
+    }
+    /// Largest supported native tensor dimension.
+    pub const fn maximum_dimension(&self) -> u64 {
+        self.maximum_dimension
+    }
+}

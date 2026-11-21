@@ -83,6 +83,99 @@ pub fn prepare_inspected_model_sources(
         .transpose()
 }
 
+impl<P: PreparationMechanismProvider>
+    eredu_core::ExecutionPlanTargetAdmission<ArtifactArchitecturePlan>
+    for eredu_runtime::AutomaticModelFacts<P>
+{
+    type Preparation = SelectedPreparation;
+
+    fn select(
+        self,
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+        plan: &eredu_core::ExecutionPlan,
+    ) -> Result<
+        eredu_core::ExecutionPlanTargetSelection<Self::Preparation>,
+        eredu_core::AutomaticPlanningError,
+    > {
+        let request = self.preparation.normalize(plan)?;
+        let outcome =
+            inspect_selected_model(inspection.clone(), &request, &self.mechanisms, self.media);
+        let (report, selected) = outcome.into_parts();
+        let selected = selected.ok_or_else(|| {
+            eredu_core::AutomaticPlanningError::Invalid(
+                report
+                    .issues
+                    .iter()
+                    .map(|issue| issue.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+        let (_, selected) = selected.into_parts();
+        let policy = selected.admission().request().policy();
+        let capabilities = selected.session_capabilities();
+        Ok(eredu_core::ExecutionPlanTargetSelection::new(
+            policy,
+            selected,
+            capabilities,
+            report,
+        ))
+    }
+}
+
+impl<M: PreparationMechanismProvider> eredu_core::AutomaticModelPlanning<ArtifactArchitecturePlan>
+    for eredu_runtime::AutomaticModelFacts<M>
+{
+    type Artifact = ArtifactInspection<ArtifactArchitecturePlan>;
+
+    fn inspect(
+        self,
+        path: &Path,
+    ) -> Result<
+        (eredu_core::ModelResourceProfile, Self::Artifact),
+        eredu_core::AutomaticPlanningError,
+    > {
+        let request = NormalizedLoadRequest::default();
+        let inspection = crate::configuration::inspect_artifact(path).map_err(|error| {
+            eredu_core::AutomaticPlanningError::Backend {
+                operation: "inspect_resources",
+                message: error.to_string(),
+            }
+        })?;
+        let report =
+            inspect_selected_model(inspection.clone(), &request, &self.mechanisms, self.media)
+                .into_report();
+        Ok((report.resources, inspection))
+    }
+
+    fn admit(
+        self,
+        artifact: &Self::Artifact,
+        plan: &eredu_core::ExecutionPlan,
+    ) -> Result<eredu_core::CandidateAdmission, eredu_core::AutomaticPlanningError> {
+        let request = self.preparation.normalize(plan)?;
+        Ok(
+            crate::preparation_selection::ArchitectureLoadAdmission::new(request, self.mechanisms)
+                .candidate_admission(artifact),
+        )
+    }
+
+    fn bounded_requirement(
+        self,
+        artifact: &Self::Artifact,
+        plan: &eredu_core::ExecutionPlan,
+    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_core::AutomaticPlanningError> {
+        let request = self.preparation.normalize(plan).map_err(|error| {
+            eredu_core::AutomaticPlanningError::Backend {
+                operation: "bounded_residency_options",
+                message: error.to_string(),
+            }
+        })?;
+        crate::preparation_selection::ArchitectureLoadAdmission::new(request, self.mechanisms)
+            .bounded_residency_requirement(artifact)
+    }
+}
+
 /// Total inspection result for valid, unsupported, missing, and invalid artifacts.
 #[derive(Debug, Clone)]
 pub struct ModelInspectionOutcome {
@@ -760,58 +853,4 @@ fn invalidate_architecture(report: &mut ModelInspectionReport, detail: String) {
     );
 }
 
-/// Backend observations used by facade inspection and memory forecasts.
-pub trait BackendInspection: eredu_core::AutomaticPlanningBackend {
-    /// Inspects and retains the exact artifact admission for this execution plan.
-    fn inspect_execution(
-        &self,
-        path: &std::path::Path,
-        plan: &eredu_core::ExecutionPlan,
-    ) -> Result<crate::ModelInspectionOutcome, eredu_core::BackendFailure>;
-
-    /// Determines placement from a backend device identifier without allocating it.
-    fn device_uses_host_memory(
-        &self,
-        device: &eredu_core::DevicePlan,
-    ) -> Result<bool, eredu_core::BackendFailure>;
-
-    /// Resets the allocator high-water mark when supported.
-    fn reset_allocator_peak(&self) -> Result<bool, eredu_core::BackendFailure> {
-        Ok(false)
-    }
-
-    /// Validates a proposed explicit cache limit without changing allocator state.
-    /// Returns the effective ceiling in bytes for cold forecasts.
-    fn proposed_allocator_cache_limit(
-        &self,
-        _bytes: u64,
-    ) -> Result<u64, eredu_core::BackendFailure> {
-        Err(eredu_core::BackendFailure::from_error(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "the selected backend does not expose an allocator cache limit",
-        ))
-        .with_operation("allocator cache policy"))
-    }
-
-    /// Applies an explicit allocator cache limit at application startup.
-    fn set_allocator_cache_limit(&self, _bytes: u64) -> Result<(), eredu_core::BackendFailure> {
-        Err(eredu_core::BackendFailure::from_error(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "the selected backend does not allow changing its allocator cache limit",
-        ))
-        .with_operation("allocator cache policy"))
-    }
-
-    /// Observes allocator overhead inputs if the backend exposes a retained cache.
-    fn allocator_observation(
-        &self,
-    ) -> Result<
-        Option<(
-            eredu_core::AllocatorCachePolicyReport,
-            eredu_core::AllocatorTelemetry,
-        )>,
-        eredu_core::BackendFailure,
-    > {
-        Ok(None)
-    }
-}
+pub use eredu_runtime::BackendInspection;

@@ -24,7 +24,6 @@ impl CapturePrefillSpan {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl AdmittedCapturePlan {
     /// Projects this ordinary capture authority onto one actual request chunk.
     /// Fixed-width axes keep their meanings; absolute sequence/token slices are

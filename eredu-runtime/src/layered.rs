@@ -2,6 +2,8 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+use eredu_core::SubmissionBackend;
+
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
@@ -11,7 +13,6 @@ use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
     ExecutionScheduleError, ExecutionUnitLayout, ExpertPass, NoAuxiliaryBoundary,
     ObservedExpertProvider, ParameterProvider, RoutedObservationPoints, RuntimeState, StateLayout,
-    SubmissionBackend,
 };
 
 /// Statically dispatched visitor over one immutable pinned parameter module.
@@ -968,7 +969,7 @@ where
     /// Pinned model modules such as embeddings, final normalization, and head.
     type StaticModules: Parameterized<B::Tensor>;
     /// One ordered execution unit.
-    type Unit: Parameterized<B::Tensor>;
+    type Unit: Parameterized<B::Tensor> + 'static;
     /// Architecture-owned state retained for one complete forward pass.
     type ForwardContext;
     /// Allocation-free iterator over transient tensors retained by a unit submission.
@@ -2356,6 +2357,17 @@ where
     }
 }
 
+/// Reporting and retention operations on one installed parameter policy.
+pub trait ParameterPolicyTelemetry:
+    crate::UnitPolicyResidency + crate::LocalParameterRetention
+{
+}
+
+impl<T: crate::UnitPolicyResidency + crate::LocalParameterRetention> ParameterPolicyTelemetry
+    for T
+{
+}
+
 /// Policy controlling acquisition and exact release of one execution unit.
 pub trait LayerwisePolicy<B, U>
 where
@@ -2413,6 +2425,11 @@ where
         _active: bool,
     ) -> Result<bool, Self::Error> {
         Ok(false)
+    }
+
+    /// Borrows telemetry from the installed parameter owner, if exposed.
+    fn parameter_telemetry(&self) -> Option<&dyn ParameterPolicyTelemetry> {
+        None
     }
 
     /// Starts one forward after architecture input preparation.
@@ -2649,6 +2666,10 @@ where
 {
     type Architecture = A;
     type Policy = P;
+    fn parameter_policy(&self) -> Option<&Self::Policy> {
+        Some(&self.policy)
+    }
+
     fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
         Some((&mut self.architecture, &mut self.policy))
     }

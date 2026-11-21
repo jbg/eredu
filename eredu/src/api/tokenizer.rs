@@ -81,7 +81,7 @@ pub(super) fn load_tokenizer_for_kind(
     load_tokenizer_for_model_type(kind.canonical_name(), model_dir)
 }
 
-pub(super) fn load_tokenizer_for_model_type(
+pub(crate) fn load_tokenizer_for_model_type(
     model_type: &str,
     model_dir: &Path,
 ) -> Result<Tokenizer, TextMetadataError> {

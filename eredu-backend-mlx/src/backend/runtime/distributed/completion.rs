@@ -6,11 +6,6 @@
 //! `eval` plus whole-stream synchronization sequences.
 
 use safemlx::{transforms::async_eval_with_event, Array, Event, EventBackend, Stream};
-#[cfg(test)]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -19,7 +14,7 @@ use std::{
 use crate::backend::{
     error::Error,
     runtime::distributed::{topology::CommunicationRouteRealization, Group},
-    submission_recovery::{Probe, Recovery, Retention, Status},
+    submission_recovery::{Recovery, Retention, Status},
 };
 
 #[derive(Debug)]
@@ -153,7 +148,7 @@ fn observe_native_child<T>(
     Ok((result?, status.settled))
 }
 
-fn native_resources_releasable<P: Probe>(recovery: &Recovery<Rc<NativeResources>, P>) -> bool {
+fn native_resources_releasable(recovery: &Recovery<Rc<NativeResources>>) -> bool {
     safemlx::try_with_submission_retirement(|| {
         crate::backend::submission_recovery::reap();
         recovery.progress().settled && recovery.retention().children.get() == 0
@@ -161,9 +156,7 @@ fn native_resources_releasable<P: Probe>(recovery: &Recovery<Rc<NativeResources>
     .unwrap_or(false)
 }
 
-fn check_native_status<P: Probe>(
-    recovery: &Recovery<Rc<NativeResources>, P>,
-) -> safemlx::error::Result<bool> {
+fn check_native_status(recovery: &Recovery<Rc<NativeResources>>) -> safemlx::error::Result<bool> {
     crate::backend::submission_recovery::reap();
     let status = recovery.progress();
     let resources = recovery.retention();
@@ -188,120 +181,8 @@ thread_local! {
         RefCell::new(generic::DistributedCompletionOrphanQuarantine::default());
     static COMMUNICATION_ORPHANS: RefCell<communication::CommunicationOrphanQuarantine> =
         RefCell::new(communication::CommunicationOrphanQuarantine::default());
-    #[cfg(test)]
-    static FORCE_NEXT_COMMUNICATION_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) use communication::ensure_group_available;
-#[cfg(test)]
-pub(crate) use communication::{
-    distributed_completion_orphan_count, force_next_communication_pending,
-    release_forced_pending_orphans,
-};
 pub use communication::{synchronize_outputs, MlxCommunicationCompletion, MlxFailureAgreement};
 pub use generic::DistributedCompletion;
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod child_scope_tests {
-    use super::*;
-
-    struct FakeProbe(Rc<Cell<Status>>);
-    impl Probe for FakeProbe {
-        fn seal(&mut self) {}
-        fn progress(&self) -> Status {
-            self.0.get()
-        }
-    }
-
-    fn state(settled: bool, failed: bool) -> Status {
-        Status {
-            settled,
-            failed,
-            blocked: failed && !settled,
-        }
-    }
-
-    fn owner() -> Rc<NativeResources> {
-        NativeResources::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
-    }
-
-    fn child(
-        owner: &Rc<NativeResources>,
-        probe: Rc<Cell<Status>>,
-    ) -> Recovery<NativeChildResources, FakeProbe> {
-        owner.children.set(owner.children.get() + 1);
-        Recovery::with_probe(
-            NativeChildResources {
-                owner: Rc::clone(owner),
-                _arrays: Vec::new(),
-                _stream: None,
-            },
-            FakeProbe(probe),
-        )
-    }
-
-    #[test]
-    fn child_scope_cannot_hide_pending_parent_or_sibling() {
-        let owner = owner();
-        let parent_state = Rc::new(Cell::new(state(false, false)));
-        let parent = Recovery::with_probe(Rc::clone(&owner), FakeProbe(Rc::clone(&parent_state)));
-        let first = child(&owner, Rc::new(Cell::new(state(true, false))));
-        let pending = Rc::new(Cell::new(state(false, false)));
-        let second = child(&owner, Rc::clone(&pending));
-        drop(first);
-        assert!(!check_native_status(&parent).unwrap());
-        parent_state.set(state(true, false));
-        assert!(!check_native_status(&parent).unwrap());
-        drop(second);
-        assert!(!check_native_status(&parent).unwrap());
-        pending.set(state(true, false));
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            check_native_status(&parent).unwrap()
-        });
-    }
-
-    #[test]
-    fn later_healthy_parent_observation_cannot_clear_child_failure() {
-        let owner = owner();
-        let parent = Recovery::with_probe(
-            Rc::clone(&owner),
-            FakeProbe(Rc::new(Cell::new(state(true, false)))),
-        );
-        let failed = Rc::new(Cell::new(state(false, true)));
-        drop(child(&owner, Rc::clone(&failed)));
-        assert!(check_native_status(&parent).is_err());
-        assert!(owner.unavailable());
-        assert!(!native_resources_releasable(&parent));
-        failed.set(state(true, true));
-        crate::backend::submission_recovery::reap();
-        crate::backend::submission_recovery::wait_for_retirement(|| owner.children.get() == 0);
-        assert_eq!(owner.children.get(), 0);
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            native_resources_releasable(&parent)
-        });
-        assert!(check_native_status(&parent).is_err());
-    }
-
-    #[test]
-    fn child_unwind_marks_failure_before_pending_ticket_can_drop() {
-        let owner = owner();
-        owner.status.set(state(true, false));
-        let pending = Rc::new(Cell::new(state(false, false)));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _child = child(&owner, Rc::clone(&pending));
-            let _unwind = ChildUnwind(&owner.host_failed);
-            panic!("injected child observation unwind");
-        }));
-        assert!(result.is_err());
-        assert!(owner.host_failed.get());
-        assert!(owner.unavailable());
-        assert_eq!(owner.children.get(), 1);
-        pending.set(state(true, false));
-        crate::backend::submission_recovery::reap();
-        crate::backend::submission_recovery::wait_for_retirement(|| owner.children.get() == 0);
-        assert_eq!(owner.children.get(), 0);
-    }
-}

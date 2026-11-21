@@ -18,18 +18,9 @@ pub mod backend;
 mod composition;
 
 pub use adapter::*;
-pub use composition::mlx::{MlxLoadRequest, MlxModelConfig, MlxSelectedPreparation};
 
 pub(crate) use backend::nn::{module, native_quantization, nested, primitives as nn};
 pub(crate) use safemlx::{ops, Array, Dtype, Stream};
-
-#[cfg(test)]
-pub(crate) fn test_stream() -> &'static Stream {
-    Box::leak(Box::new(Stream::new_with_device(&safemlx::Device::new(
-        safemlx::DeviceType::Cpu,
-        0,
-    ))))
-}
 
 /// Composition-owned MLX integrations for backend tooling.
 ///
@@ -37,43 +28,25 @@ pub(crate) fn test_stream() -> &'static Stream {
 /// canonical [`safemlx`] paths and are not re-exported here. Reusable MLX
 /// backend facilities are organized under [`backend`].
 pub mod native {
-    pub use crate::backend::runtime::distributed::coordinator::MlxReplicatedCoordinator;
-    pub use crate::backend::runtime::execution::pipeline::MlxComponentPipeline;
+    pub use crate::backend::runtime::distributed::topology::NativeWorldManifestTransport;
     #[cfg(any(feature = "image", feature = "audio"))]
-    pub use crate::composition::mlx::{MlxMediaInputLowering, ModelProcessor as MlxMediaProcessor};
+    pub use crate::composition::mlx::MlxMediaInputLowering;
 
     pub use crate::composition::mlx::component_binding::MlxComponentBinder;
-    pub use crate::composition::mlx::realtime::MlxRealtimeExecution;
-    pub use crate::composition::mlx::replicated_text::MlxLocalComponent;
     use safemlx::Stream;
 
     pub use crate::backend::distributed::{MlxRealtimeConsensusTransport, MlxRingTransport};
+    pub use crate::backend::runtime::checkpoint::quantization::MlxSafetensorsWeightPacker;
     pub use crate::backend::topology::DeviceAssignment;
     pub use crate::backend::{random::RandomState, ExecutionContext};
     pub use crate::composition::mlx::realtime::{
-        MlxPrepublicationFrame, MlxRealtimeBinding, MlxRealtimeCompletion,
-        MlxRealtimeExecutionContext, MlxRealtimeSupport, SharedRealtimeExecution,
+        MlxRealtimeBinding, MlxRealtimeCompletion, MlxRealtimeExecutionContext, MlxRealtimeQueue,
+        MlxRealtimeSupport,
     };
-    pub use crate::composition::mlx::speculative::MlxDrafter;
+    pub use crate::composition::mlx::speculative::MlxAssistantBinder;
     pub use crate::composition::mlx::{
-        inspect_model, inspect_model_preparation, MlxInspectionOptions, MlxModelInput,
-        MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
-        MlxTextSamplingState,
+        inspection_media_features, MlxModelOutput, MlxSessionCompletion, MlxSessionMechanisms,
     };
-    /// Converts a checkpoint with an explicitly selected native execution stream.
-    pub fn quantize_checkpoint(
-        source_dir: impl AsRef<std::path::Path>,
-        output_dir: impl AsRef<std::path::Path>,
-        options: &crate::backend::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
-        stream: &Stream,
-    ) -> Result<
-        crate::backend::runtime::checkpoint::quantization::CheckpointQuantizationReport,
-        crate::backend::error::Error,
-    > {
-        crate::backend::runtime::checkpoint::quantization::quantize_checkpoint(
-            source_dir, output_dir, options, stream,
-        )
-    }
 
     /// Constructs an MLX backend from explicitly selected native streams.
     pub fn backend(
@@ -91,48 +64,8 @@ pub mod native {
     ) -> crate::backend::MlxBackend<'a> {
         crate::backend::MlxBackend::with_distributed_world(stream, weights_stream, world)
     }
-
-    /// Binds semantic topology, wire dtype, and maximum invocation geometry to model options.
-    ///
-    /// The batch and sequence limits resolve architecture-owned boundary
-    /// schemas during selection and must cover every later invocation.
-    pub fn parallel_load_options(
-        topology: eredu_core::ParallelRankTopology,
-        device: DeviceAssignment,
-        pipeline_wire: eredu_runtime::PipelineWireContract,
-        maximum_batch_size: i32,
-        maximum_sequence_length: i32,
-        completion_policy: eredu_runtime::CommunicationCompletionPolicy,
-    ) -> Result<crate::MlxLoadRequest, crate::backend::error::Error> {
-        crate::MlxLoadRequest::with_parallel(
-            topology,
-            device,
-            pipeline_wire,
-            maximum_batch_size,
-            maximum_sequence_length,
-            completion_policy,
-        )
-    }
 }
 
 mod tensor;
-
-#[cfg(test)]
-pub(crate) fn test_parallel_rank(
-    rank: usize,
-    tensor: usize,
-    pipeline: usize,
-    expert: usize,
-) -> eredu_core::ParallelRankTopology {
-    eredu_core::ParallelRankTopology::new(
-        eredu_core::ParallelTopology::new(tensor, pipeline, expert, 1)
-            .expect("test topology is valid"),
-        rank,
-    )
-    .expect("test rank belongs to topology")
-}
-
-#[cfg(test)]
-mod tests;
 
 pub use tensor::MlxTensor;

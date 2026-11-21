@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eredu_checkpoint::store::{CheckpointSource, SharedCheckpointSource, StoreError};
 use eredu_core::residency::{OffloadError, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy};
 
-use crate::{
-    physical_binding_bytes, ExecutionUnitAddress, LayerWeightResidency, OffloadUnit,
-    ResidencyDeclarationError, WeightBinding,
+use crate::{ExecutionUnitAddress, LayerWeightResidency};
+use eredu_core::residency::parameter_binding::{
+    physical_binding_bytes, OffloadUnit, ResidencyDeclarationError, WeightBinding,
 };
 
 /// Invalid execution-unit resource count or aggregate capacity.
@@ -357,6 +358,9 @@ pub fn execution_unit_resource_requirements(
 /// Failure finalizing the exact parameter resource plan.
 #[derive(Debug, thiserror::Error)]
 pub enum ParameterResourcePreparationError {
+    /// A native capacity estimate failed.
+    #[error(transparent)]
+    Backend(#[from] eredu_core::BackendFailure),
     /// The selected residency policy is invalid.
     #[error(transparent)]
     Policy(#[from] crate::WeightResidencyPolicyError),
@@ -366,6 +370,21 @@ pub enum ParameterResourcePreparationError {
     /// Resource identities or initial tier policies are invalid.
     #[error(transparent)]
     Plan(#[from] OffloadError),
+    /// An ordinary or pinned parameter binding is invalid.
+    #[error(transparent)]
+    Declaration(#[from] ResidencyDeclarationError),
+    /// The retained execution units could not be admitted.
+    #[error(transparent)]
+    Units(#[from] ExecutionUnitPreparationError),
+    /// A restricted source does not contain the retained recipe inputs.
+    #[error(transparent)]
+    Source(#[from] StoreError),
+    /// Strict loading found unrelated checkpoint tensors.
+    #[error("strict layerwise loading found unexpected checkpoint parameters: {unused:?}")]
+    UnexpectedCheckpointParameters {
+        /// Unexpected keys in stable source order.
+        unused: Vec<String>,
+    },
     /// Host allocations exceed the selected budget.
     #[error(
         "host budget {budget} bytes cannot contain {required} bytes of host-transfer allocations"
@@ -390,6 +409,68 @@ pub enum ParameterResourcePreparationError {
         /// Selected device budget.
         budget: u64,
     },
+}
+
+/// Additional physical owner with an independently retained source and lease boundary.
+pub struct SupplementaryResidencyUnit {
+    /// Canonical owner and immutable bindings.
+    pub definition: OffloadUnit,
+    /// Prepared checkpoint source for this owner.
+    pub source: SharedCheckpointSource,
+    /// Whether the owner overlaps every sequential auxiliary invocation.
+    pub shared: bool,
+}
+
+/// Admits pinned, ordinary and supplementary owners against one selected unit layout.
+///
+/// The backend supplies only capacity facts for each proposed allocation.
+pub fn prepare_parameter_resources(
+    source: &dyn CheckpointSource,
+    invocations: &crate::ExecutionUnitAddressMap,
+    residency: LayerWeightResidency,
+    static_bindings: Vec<WeightBinding>,
+    unit_bindings: Vec<Vec<WeightBinding>>,
+    supplementary: Vec<SupplementaryResidencyUnit>,
+    ignored: impl Fn(&str) -> bool,
+    host_capacity: impl Fn(&[WeightBinding]) -> Result<u64, eredu_core::BackendFailure>,
+) -> Result<PreparedParameterResources, ParameterResourcePreparationError> {
+    let unit_count = invocations.storage_layout().len();
+    if unit_count == 0 || unit_bindings.len() != unit_count {
+        return Err(ExecutionUnitPreparationError::UnitCount {
+            expected: unit_count,
+            actual: unit_bindings.len(),
+        }
+        .into());
+    }
+    residency.offload()?;
+    let pinned = crate::StaticUnitBindings::new("model.static", static_bindings)?
+        .prepare::<ParameterResourcePreparationError>()?;
+    let mut units = ExecutionUnitResourcePreparation::new("model", invocations, residency);
+    for bindings in unit_bindings {
+        units = units.push::<ParameterResourcePreparationError>(bindings, |bindings| {
+            host_capacity(bindings).map_err(Into::into)
+        })?;
+    }
+    let mut resources = ParameterResourcePreparation::new(pinned, units.finish()?);
+    for unit in supplementary {
+        resources = resources.push_auxiliary::<ParameterResourcePreparationError>(
+            unit.definition,
+            unit.source,
+            unit.shared,
+            |bindings| host_capacity(bindings).map_err(Into::into),
+        )?;
+    }
+    let mut consumed = resources.source_keys().clone();
+    consumed.extend(source.materialized_source_keys());
+    let unused: Vec<_> = source
+        .source_keys()
+        .into_iter()
+        .filter(|key| !consumed.contains(key) && !ignored(key))
+        .collect();
+    if !unused.is_empty() {
+        return Err(ParameterResourcePreparationError::UnexpectedCheckpointParameters { unused });
+    }
+    resources.finish()
 }
 
 /// Consuming assembly of independently leased pinned, ordinary and auxiliary resources.

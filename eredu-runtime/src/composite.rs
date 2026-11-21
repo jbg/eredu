@@ -10,53 +10,7 @@ use crate::{
     SelectedReplicatedTextRealization,
 };
 
-/// One generic host-media or tensor operation required by neutral preparation.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum ProcessorPrimitive {
-    /// Bicubic RGB image resizing.
-    RgbResizeBicubic,
-    /// Three-lobe Lanczos RGB image resizing.
-    RgbResizeLanczos3,
-    /// Channel-wise rescaling and normalization.
-    RgbNormalize,
-    /// Deterministic decoded-video frame selection and timestamps.
-    VideoSampling,
-    /// Windowed mono PCM framing.
-    AudioWindow,
-    /// Real-valued spectrum calculation.
-    AudioSpectrum,
-    /// Mel filter-bank projection.
-    AudioMelFilter,
-    /// Numeric logarithm over audio features.
-    AudioLogarithm,
-    /// Unsigned token tensor construction.
-    TensorU32,
-    /// Floating-point tensor construction.
-    TensorF32,
-    /// Signed metadata tensor construction.
-    TensorI32,
-    /// Boolean metadata tensor construction.
-    TensorBool,
-    /// Tensor padding.
-    Padding,
-    /// Tensor concatenation.
-    Concatenation,
-    /// Tensor slicing.
-    Slicing,
-    /// Indexed tensor movement.
-    Indexing,
-    /// Boolean or causal mask construction.
-    MaskConstruction,
-    /// Scatter or ordered merge into decoder positions.
-    Merge,
-    /// Native encoder module execution.
-    Encoder,
-    /// Native projector module execution.
-    Projector,
-    /// Exact small integer and Boolean metadata evaluation.
-    MetadataInspection,
-}
+pub use eredu_core::media::{MediaPrimitiveCapabilities, ProcessorPrimitive};
 
 /// Architecture requirements for one admitted input modality.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -235,40 +189,6 @@ impl ProcessorSelectionRequest {
     }
 }
 
-/// Generic mechanisms and native bounds implemented by one backend.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct MediaPrimitiveCapabilities {
-    raw_modalities: BTreeSet<InputModality>,
-    prepared_modalities: BTreeSet<InputModality>,
-    projected_modalities: BTreeSet<InputModality>,
-    primitives: BTreeSet<ProcessorPrimitive>,
-    maximum_dimension: u64,
-}
-
-impl MediaPrimitiveCapabilities {
-    /// Creates a fail-closed mechanism report.
-    pub fn new(
-        raw_modalities: impl IntoIterator<Item = InputModality>,
-        prepared_modalities: impl IntoIterator<Item = InputModality>,
-        projected_modalities: impl IntoIterator<Item = InputModality>,
-        primitives: impl IntoIterator<Item = ProcessorPrimitive>,
-        maximum_dimension: u64,
-    ) -> Self {
-        Self {
-            raw_modalities: raw_modalities.into_iter().collect(),
-            prepared_modalities: prepared_modalities.into_iter().collect(),
-            projected_modalities: projected_modalities.into_iter().collect(),
-            primitives: primitives.into_iter().collect(),
-            maximum_dimension,
-        }
-    }
-
-    /// Operations implemented with their exact neutral semantics.
-    pub const fn primitives(&self) -> &BTreeSet<ProcessorPrimitive> {
-        &self.primitives
-    }
-}
-
 /// Authoritative processor realization selected before construction or payload work.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedProcessorExecution {
@@ -424,7 +344,7 @@ pub fn select_processor_execution(
             issues.push(format!("architecture input modality {}", modality.as_str()));
             continue;
         };
-        if requirement.maximum_dimension > capabilities.maximum_dimension {
+        if requirement.maximum_dimension > capabilities.maximum_dimension() {
             issues.push(format!(
                 "{} native dimension {}",
                 modality.as_str(),
@@ -433,26 +353,26 @@ pub fn select_processor_execution(
         }
         if request.prepared_tensors
             && (!requirement.prepared_tensor
-                || !capabilities.prepared_modalities.contains(modality))
+                || !capabilities.prepared_modalities().contains(modality))
         {
             issues.push(format!("{} prepared tensors", modality.as_str()));
         }
         if request.projected_modalities.contains(modality)
             && (!requirement.projected_embeddings
-                || !capabilities.projected_modalities.contains(modality))
+                || !capabilities.projected_modalities().contains(modality))
         {
             issues.push(format!("{} projected embeddings", modality.as_str()));
         }
         if (request.raw_media || request.available_raw_media) && *modality != InputModality::Text {
             let mut raw_issues = Vec::new();
             if requirement.raw_primitives.is_empty()
-                || !capabilities.raw_modalities.contains(modality)
+                || !capabilities.raw_modalities().contains(modality)
             {
                 raw_issues.push(format!("{} raw media", modality.as_str()));
             }
             for primitive in requirement
                 .raw_primitives
-                .difference(&capabilities.primitives)
+                .difference(capabilities.primitives())
             {
                 raw_issues.push(format!("{} primitive {primitive:?}", modality.as_str()));
             }

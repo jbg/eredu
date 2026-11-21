@@ -55,7 +55,7 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
     )
     .unwrap();
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mock", "gpu:0").unwrap());
-    assert!(LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan).is_err());
+    assert!(LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan, None).is_err());
     let automatic = AutomaticPlanRequest::new(artifact.path(), plan.device().clone());
     let inspection = eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
     let (automatically_loaded, report) = LoadedModel::plan_and_load_with_text_options(
@@ -74,6 +74,7 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
             &MockBackend,
             artifact.path(),
             &plan,
+            None,
             text_options(),
         )
         .unwrap()
@@ -82,14 +83,19 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
         automatically_loaded.into_parts().0,
         PreparedTextModel::from_artifact(inspection, text_options())
             .unwrap()
-            .select_execution_plan(&MockBackend, &plan)
+            .select_execution_plan(&MockBackend, &plan, None)
             .unwrap()
             .load()
             .unwrap()
             .into_parts()
             .0,
-        LoadedModel::load_with_text_options(MockBackend, artifact.path(), (), text_options())
-            .unwrap(),
+        LoadedModel::load_with_text_options::<super::FixtureLoadSelection>(
+            MockBackend,
+            artifact.path(),
+            Default::default(),
+            text_options(),
+        )
+        .unwrap(),
     ];
     for mut model in models {
         assert_eq!(model.model_family(), ModelKind::Llama);
@@ -142,8 +148,13 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
         "{:?}",
         report.issues
     );
-    let mut loaded =
-        LoadedModel::load_with_text_options(MockBackend, artifact.path(), (), options).unwrap();
+    let mut loaded = LoadedModel::load_with_text_options::<super::FixtureLoadSelection>(
+        MockBackend,
+        artifact.path(),
+        Default::default(),
+        options,
+    )
+    .unwrap();
     assert_eq!(
         loaded.prepare_chat(request()).unwrap().rendered_prompt(),
         "hello"
@@ -157,7 +168,7 @@ fn missing_template_requires_explicit_choice_and_keeps_raw_generation_available(
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mock", "gpu:0").unwrap());
     let automatic = AutomaticPlanRequest::new(artifact.path(), plan.device().clone());
     let mut models = [
-        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan)
+        LoadedModel::load_execution_plan(&MockBackend, artifact.path(), &plan, None)
             .unwrap()
             .into_parts()
             .0,
@@ -309,7 +320,7 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
         (Some(MetadataValue::Uint32(42)), None),
     ] {
         let path = write_gguf(artifact.path(), embedded);
-        let loaded = LoadedModel::load_execution_plan(&MockBackend, &path, &plan);
+        let loaded = LoadedModel::load_execution_plan(&MockBackend, &path, &plan, None);
         if let Some(expected) = expected {
             assert_eq!(
                 loaded
@@ -334,6 +345,7 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
             &MockBackend,
             &path,
             &plan,
+            None,
             TextModelOptions {
                 chat_template: Some("override".into()),
             },
@@ -357,7 +369,7 @@ fn gguf_template_precedence_is_override_then_embedded_then_sidecar() {
         r#"{"chat_template":42}"#,
     )
     .unwrap();
-    let mut loaded = LoadedModel::load_execution_plan(&MockBackend, &path, &plan).unwrap();
+    let mut loaded = LoadedModel::load_execution_plan(&MockBackend, &path, &plan, None).unwrap();
     assert_eq!(
         loaded
             .model_mut()
@@ -486,7 +498,13 @@ fn text_inspection_uses_template_overrides_for_both_artifact_formats() {
                     );
                 }
                 let mut loaded =
-                    LoadedModel::load_with_text_options(MockBackend, &path, (), options).unwrap();
+                    LoadedModel::load_with_text_options::<super::FixtureLoadSelection>(
+                        MockBackend,
+                        &path,
+                        Default::default(),
+                        options,
+                    )
+                    .unwrap();
                 let prepared = loaded.prepare_chat(request()).unwrap();
                 assert!(matches!(
                     prepared.semantic_support(),
@@ -532,8 +550,13 @@ fn text_inspection_validates_the_override_instead_of_falling_back() {
                 issue.code == InspectionIssueCode::UnsupportedSemanticProtocol
                     && issue.severity == InspectionSeverity::Error
             }));
-            let mut loaded =
-                LoadedModel::load_with_text_options(MockBackend, path, (), options).unwrap();
+            let mut loaded = LoadedModel::load_with_text_options::<super::FixtureLoadSelection>(
+                MockBackend,
+                path,
+                Default::default(),
+                options,
+            )
+            .unwrap();
             assert!(matches!(
                 loaded.prepare_chat(request()),
                 Err(TextModelError::Template(_))
@@ -580,7 +603,9 @@ fn retained_text_selection_loads_the_inspected_policy_without_rediscovery() {
         std::fs::remove_file(artifact.path().join(name)).unwrap();
     }
     FACTORY_PHASES.with_borrow_mut(Vec::clear);
-    let mut selected = prepared.select_execution_plan(&MockBackend, &plan).unwrap();
+    let mut selected = prepared
+        .select_execution_plan(&MockBackend, &plan, None)
+        .unwrap();
     let report = selected.inspect(TextInspectionOptions {
         chat_request: Some(request()),
     });

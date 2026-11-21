@@ -31,6 +31,7 @@ impl CaptureBackend for TypedBackend {
         _: &Self::Tensor,
         _: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         self.transforms += 1;
         Ok(CapturePayload::Tensor(

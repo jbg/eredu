@@ -1,7 +1,8 @@
 //! Architecture projection of explicit, backend-neutral bounded load policy.
 use super::*;
+use eredu_core::cache::append_stream::AppendStreamBinding;
 use eredu_nn::TensorElementType;
-use eredu_runtime::{AppendStreamBinding, BoundedExecutionPolicy, NormalizedLoadRequest};
+use eredu_runtime::{BoundedExecutionPolicy, NormalizedLoadRequest};
 
 /// A load policy cannot change retained equations or silently reduce admitted history.
 #[derive(Debug, thiserror::Error)]

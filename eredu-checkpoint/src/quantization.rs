@@ -7,6 +7,55 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+/// Deterministic telemetry from one bounded weight-materialization pass.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct WeightMaterializationReport {
+    /// Planner ceiling for simultaneously live conversion data.
+    pub admitted_working_set_bytes: u64,
+    /// Number of dense semantic matrices transformed.
+    pub transformed_weights: usize,
+    /// Number of independently evaluated source row tiles.
+    pub source_tiles: usize,
+    /// Largest number of submitted tile completions retained simultaneously.
+    pub peak_in_flight_tiles: usize,
+    /// Total logical dense bytes selected from the source store.
+    pub source_bytes_read: u64,
+    /// Total encoded output bytes written to persistent storage.
+    pub output_bytes: u64,
+    /// Largest conservative conversion working set admitted for one tile.
+    pub peak_planned_working_set_bytes: u64,
+    /// Largest source recipe output tile.
+    pub largest_source_tile_bytes: u64,
+    /// Largest encoded output tile written together.
+    pub largest_output_tile_bytes: u64,
+}
+
+impl WeightMaterializationReport {
+    /// Merges one independent materialization pass into this aggregate.
+    ///
+    /// Additive counters retain the total work while capacity and peak fields
+    /// retain the greatest requirement observed by any pass.
+    pub fn merge(&mut self, next: Self) {
+        self.admitted_working_set_bytes = self
+            .admitted_working_set_bytes
+            .max(next.admitted_working_set_bytes);
+        self.transformed_weights += next.transformed_weights;
+        self.source_tiles += next.source_tiles;
+        self.peak_in_flight_tiles = self.peak_in_flight_tiles.max(next.peak_in_flight_tiles);
+        self.source_bytes_read += next.source_bytes_read;
+        self.output_bytes += next.output_bytes;
+        self.peak_planned_working_set_bytes = self
+            .peak_planned_working_set_bytes
+            .max(next.peak_planned_working_set_bytes);
+        self.largest_source_tile_bytes = self
+            .largest_source_tile_bytes
+            .max(next.largest_source_tile_bytes);
+        self.largest_output_tile_bytes = self
+            .largest_output_tile_bytes
+            .max(next.largest_output_tile_bytes);
+    }
+}
+
 /// One dense semantic weight that will be replaced by its packed representation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BoundedQuantizationTarget {
@@ -249,6 +298,65 @@ use crate::{
 use std::{collections::BTreeMap, sync::OnceLock};
 
 impl BoundedQuantizationPlan {
+    /// Derives the conversion bound from exact output metadata and the
+    /// largest minimum source row tile. No source payloads are acquired.
+    pub fn for_source(
+        source: &dyn CheckpointSource,
+        quantization: WeightQuantization,
+        targets: Vec<BoundedQuantizationTarget>,
+    ) -> Result<Self, StoreError> {
+        if targets.is_empty() {
+            return Err(quantization_error(
+                "bounded quantization requires at least one target",
+            ));
+        }
+        let mut output_bytes = 0u64;
+        let mut minimum_tile_bytes = 0u64;
+        for target in &targets {
+            let source_recipe = target.source();
+            let input = source_recipe
+                .infer(source)
+                .map_err(|error| quantization_error(error.to_string()))?;
+            let shape = input.shape();
+            let output = target.output_metadata(quantization, shape)?;
+            let bytes = output.values().try_fold(0u64, |bytes, tensor| {
+                bytes
+                    .checked_add(tensor.encoded_byte_len)
+                    .ok_or_else(|| quantization_error("packed target size overflow"))
+            })?;
+            output_bytes = output_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| quantization_error("packed checkpoint size overflow"))?;
+            let row_axis = shape.len() - 2;
+            let matrices = shape[..row_axis]
+                .iter()
+                .try_fold(1usize, |count, &dimension| {
+                    count
+                        .checked_mul(dimension)
+                        .ok_or_else(|| quantization_error("matrix count overflow"))
+                })?;
+            let rows = matrices
+                .checked_mul(shape[row_axis])
+                .ok_or_else(|| quantization_error("matrix row count overflow"))?;
+            let output_row_bytes = bytes / rows as u64;
+            for matrix in 0..matrices {
+                let one_row = source_recipe
+                    .select_bounded_matrix_rows(source, matrix, 0, 1)
+                    .map_err(|error| quantization_error(error.to_string()))?;
+                one_row
+                    .preflight_bounded(source)
+                    .map_err(|error| quantization_error(error.to_string()))?;
+                let peak = one_row
+                    .peak_materialization_bytes(source)
+                    .map_err(|error| quantization_error(error.to_string()))?
+                    .checked_add(output_row_bytes)
+                    .ok_or_else(|| quantization_error("conversion tile size overflow"))?;
+                minimum_tile_bytes = minimum_tile_bytes.max(peak);
+            }
+        }
+        Self::new(quantization, output_bytes.max(minimum_tile_bytes), targets)
+    }
+
     /// Exact encoded output geometry, inferred without reading source payloads.
     pub fn output_metadata(
         &self,
@@ -380,12 +488,14 @@ impl BoundedQuantizationTarget {
 }
 
 /// Immutable cold catalog with an explicitly pending bounded transformation.
-/// A native mechanism publishes exact encoded storage before any transformed read.
+/// The portable driver publishes exact encoded storage before any transformed read.
 /// Original source guards and metadata remain retained throughout preparation.
 pub struct PreparedQuantizedSource {
     source: SharedCheckpointSource,
     plan: BoundedQuantizationPlan,
     outputs: BTreeMap<String, TensorMetadata>,
+    materialized_keys: BTreeSet<String>,
+    materialized_shards: BTreeSet<std::path::PathBuf>,
     ready: OnceLock<SharedCheckpointSource>,
     recipes: crate::recipe::RecipeInferenceCache,
 }
@@ -397,10 +507,24 @@ impl PreparedQuantizedSource {
         plan: BoundedQuantizationPlan,
     ) -> Result<Self, StoreError> {
         let outputs = plan.output_metadata(source.as_ref())?;
+        let materialized_keys: BTreeSet<_> = plan
+            .targets()
+            .iter()
+            .flat_map(|target| target.source().source_keys())
+            .map(str::to_owned)
+            .collect();
+        let mut materialized_shards = BTreeSet::new();
+        for key in &materialized_keys {
+            if let Some(path) = source.source_metadata(key)?.backing_shard {
+                materialized_shards.insert(path);
+            }
+        }
         Ok(Self {
             source,
             plan,
             outputs,
+            materialized_keys,
+            materialized_shards,
             ready: OnceLock::new(),
             recipes: Default::default(),
         })
@@ -505,10 +629,36 @@ impl CheckpointSource for PreparedQuantizedSource {
         self.source.unclaimed_checkpoint_keys()
     }
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
-        self.ready
-            .get()
-            .unwrap_or(&self.source)
-            .source_diagnostics()
+        let mut original = self.source.source_diagnostics()?;
+        if let Some(ready) = self.ready.get() {
+            let packed = ready.source_diagnostics()?;
+            original.cache_hits = original.cache_hits.saturating_add(packed.cache_hits);
+            original.cache_misses = original.cache_misses.saturating_add(packed.cache_misses);
+            original.evictions = original.evictions.saturating_add(packed.evictions);
+            original.currently_cached_shards = original
+                .currently_cached_shards
+                .saturating_add(packed.currently_cached_shards);
+            original.physical_reads = original
+                .physical_reads
+                .saturating_add(packed.physical_reads);
+            original.physical_read_bytes = original
+                .physical_read_bytes
+                .saturating_add(packed.physical_read_bytes);
+            original.coalesced_group_hits = original
+                .coalesced_group_hits
+                .saturating_add(packed.coalesced_group_hits);
+            original
+                .touched_shard_paths
+                .extend(packed.touched_shard_paths);
+            original.touched_shard_paths.sort();
+            original.touched_shard_paths.dedup();
+            original
+                .payload_shard_paths
+                .extend(packed.payload_shard_paths);
+            original.payload_shard_paths.sort();
+            original.payload_shard_paths.dedup();
+        }
+        Ok(original)
     }
     fn is_authoritative_materialized_key(&self, key: &str) -> bool {
         self.outputs.contains_key(key) || self.source.is_authoritative_materialized_key(key)
@@ -534,14 +684,28 @@ impl CheckpointSource for PreparedQuantizedSource {
         }
     }
     fn materialized_source_keys(&self) -> Vec<String> {
-        self.ready
-            .get()
-            .map_or_else(Vec::new, |s| s.materialized_source_keys())
+        if self.ready.get().is_none() {
+            return Vec::new();
+        }
+        self.source
+            .materialized_source_keys()
+            .into_iter()
+            .chain(self.materialized_keys.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
     fn materialized_source_shards(&self) -> Vec<std::path::PathBuf> {
-        self.ready
-            .get()
-            .map_or_else(Vec::new, |s| s.materialized_source_shards())
+        if self.ready.get().is_none() {
+            return Vec::new();
+        }
+        self.source
+            .materialized_source_shards()
+            .into_iter()
+            .chain(self.materialized_shards.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 }
 

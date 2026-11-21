@@ -64,9 +64,6 @@ impl Completion for Pending {
 }
 
 impl BackendProvider for StatefulBackend {
-    type ModelConfig = ();
-    type Model = ();
-    type Session = Session;
     type Error = io::Error;
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor::new("stateful-host", "1")
@@ -74,13 +71,16 @@ impl BackendProvider for StatefulBackend {
     fn devices(&self) -> io::Result<Vec<(DeviceDescriptor, DeviceCapabilities)>> {
         Ok(vec![])
     }
-    fn prepare_model(&self, _: ()) -> io::Result<PreparedModel<()>> {
-        self.0.loads.set(self.0.loads.get() + 1);
-        Ok(PreparedModel::new((), SessionCapabilities::default()))
-    }
-    fn create_session(&self, _: PreparedModel<()>) -> io::Result<Session> {
+}
+
+impl eredu_core::backend::ModelSessionInstaller<StatefulBackend> for Session {
+    type Model = ();
+    type Session = Self;
+
+    fn install_session(backend: &StatefulBackend, _: PreparedModel<()>) -> Result<Self, io::Error> {
+        backend.0.loads.set(backend.0.loads.get() + 1);
         Ok(Session {
-            state: self.0.clone(),
+            state: backend.0.clone(),
             authority: Default::default(),
             history: vec![],
         })
@@ -126,72 +126,106 @@ impl BackendSession<StatefulBackend> for Session {
     }
 }
 
-impl TextGenerationBackend for StatefulBackend {
-    type Prompt = Vec<u32>;
-    type Token = Token;
-    type TextGenerationState = ();
-    type TextCompletion = Pending;
-    fn reset_session(_: &Self, session: &mut Session) -> Result<(), BackendFailure> {
-        session.authority.require_idle()?;
-        if session.state.fail_reset.get() {
+impl eredu_core::TextSessionLifecycle<StatefulBackend> for Session {
+    fn reset_session(&mut self, _: &StatefulBackend) -> Result<(), BackendFailure> {
+        self.authority.require_idle()?;
+        if self.state.fail_reset.get() {
             return Err(BackendFailure::new(
                 BackendFailureKind::Other,
                 io::Error::other("reset failed"),
             ));
         }
-        session.history.clear();
-        session.state.resets.set(session.state.resets.get() + 1);
+        self.history.clear();
+        self.state.resets.set(self.state.resets.get() + 1);
         Ok(())
     }
-    fn synchronize_session(_: &Self, session: &Session) -> Result<(), BackendFailure> {
-        session
-            .state
+    fn synchronize_session(&self, _: &StatefulBackend) -> Result<(), BackendFailure> {
+        self.state
             .settle()
             .map_err(|error| BackendFailure::new(BackendFailureKind::InvalidSession, error))?;
-        session.authority.require_idle().map_err(Into::into)
-    }
-    fn start_text_generation(_: &Self, _: TextGenerationConfig) -> io::Result<()> {
-        Ok(())
-    }
-    fn prepare_text_prompt(_: &Self, prompt: Vec<u32>) -> io::Result<Vec<u32>> {
-        Ok(prompt)
-    }
-    fn submit_text_operation(
-        runtime: &mut ModelRuntime<Self>,
-        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
-        decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
-        _state: &mut Self::TextGenerationState,
-        _remaining_tokens: Option<usize>,
-    ) -> Result<
-        Submission<
-            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
-            Self::TextCompletion,
-        >,
-        eredu_core::TextOperationError<Self::Error>,
-    > {
-        decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
-        if matches!(&input, eredu_core::PendingTextInput::Continue) {
-            return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
-        }
-        let submission =
-            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-                match input {
-                    eredu_core::PendingTextInput::Prefill(prompt) => runtime.prefill(prompt),
-                    eredu_core::PendingTextInput::Decode(token) => runtime.decode(token.0),
-                    eredu_core::PendingTextInput::Continue => {
-                        unreachable!("continuation is rejected before causal submission")
-                    }
-                }
-            };
-        let submission = submission().map_err(eredu_core::TextOperationError::Backend)?;
-        Ok(Submission {
-            output: eredu_core::TextOperationOutput::Token(submission.output),
-            completion: submission.completion,
-        })
+        self.authority.require_idle().map_err(Into::into)
     }
 }
 
-fn model() -> (LoadedModel<StatefulBackend>, Rc<State>) {
+impl eredu_core::backend::CausalTextSession<StatefulBackend, Vec<u32>, Token, ()> for Session {
+    fn submit_causal_prefill(
+        &mut self,
+        backend: &StatefulBackend,
+        prompt: Vec<u32>,
+        _: Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        _: &mut (),
+    ) -> Result<
+        eredu_core::backend::SessionSubmission<StatefulBackend, Self>,
+        eredu_core::TextOperationError<io::Error>,
+    > {
+        self.prefill(backend, prompt)
+            .map_err(eredu_core::TextOperationError::Backend)
+    }
+
+    fn submit_causal_decode(
+        &mut self,
+        backend: &StatefulBackend,
+        token: Token,
+        _: Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        _: &mut (),
+    ) -> Result<
+        eredu_core::backend::SessionSubmission<StatefulBackend, Self>,
+        eredu_core::TextOperationError<io::Error>,
+    > {
+        self.decode(backend, token.0)
+            .map_err(eredu_core::TextOperationError::Backend)
+    }
+}
+
+impl eredu_core::backend::TextOperationDriver<StatefulBackend> for Session {
+    type Prompt = Vec<u32>;
+    fn prepare_text_prompt(_: &StatefulBackend, prompt: Vec<u32>) -> io::Result<Vec<u32>> {
+        Ok(prompt)
+    }
+
+    type TextGenerationState = ();
+
+    fn start_text_generation(
+        &self,
+        _: &StatefulBackend,
+        _: TextGenerationConfig,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn sample_causal_submission(
+        &self,
+        _: &StatefulBackend,
+        submission: eredu_core::backend::SessionSubmission<StatefulBackend, Self>,
+        _: &eredu_core::TokenFilter,
+        _: &mut (),
+    ) -> Result<Submission<Token, Pending>, eredu_core::TextOperationError<io::Error>> {
+        Ok(submission)
+    }
+
+    fn text_operation_kind(
+        _: &ModelRuntime<StatefulBackend, Session>,
+        _: &eredu_core::PendingTextInput<
+            <Session as eredu_core::backend::TextOperationDriver<StatefulBackend>>::Prompt,
+            <StatefulBackend as TextGenerationBackend>::Token,
+        >,
+        _: &<Self as eredu_core::backend::TextOperationDriver<StatefulBackend>>::TextGenerationState,
+    ) -> eredu_core::TextOperationKind {
+        eredu_core::TextOperationKind::CausalDecision
+    }
+}
+
+impl eredu_core::AutomaticPromptCacheSession<StatefulBackend> for Session {}
+
+impl TextGenerationBackend for StatefulBackend {
+    type InputTensor = u32;
+
+    type Token = Token;
+
+    type TextCompletion = Pending;
+}
+
+fn model() -> (LoadedModel<StatefulBackend, Session>, Rc<State>) {
     let state = Rc::new(State::default());
     let vocabulary = ["[UNK]", "a", "b", "c"]
         .into_iter()
@@ -211,7 +245,11 @@ fn model() -> (LoadedModel<StatefulBackend>, Rc<State>) {
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     let model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(StatefulBackend(state.clone()), ()).unwrap(),
+        ModelRuntime::install::<Session>(
+            StatefulBackend(state.clone()),
+            PreparedModel::new((), SessionCapabilities::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -229,7 +267,12 @@ fn model() -> (LoadedModel<StatefulBackend>, Rc<State>) {
 }
 
 // These helpers have exactly the bound generic application code already uses.
-fn fresh_request<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u32> {
+fn fresh_request<
+    B: TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
+) -> Vec<u32> {
     model.reset().unwrap();
     let config = model
         .resolve_generation_config(GenerationConfigOverrides {
@@ -244,7 +287,12 @@ fn fresh_request<B: TextGenerationBackend>(model: &mut LoadedModel<B>) -> Vec<u3
         .collect()
 }
 
-fn evict<B: TextGenerationBackend>(model: LoadedModel<B>) -> Result<(), BackendFailure> {
+fn evict<
+    B: TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+>(
+    model: LoadedModel<B, S>,
+) -> Result<(), BackendFailure> {
     model.synchronize()?;
     drop(model);
     Ok(())

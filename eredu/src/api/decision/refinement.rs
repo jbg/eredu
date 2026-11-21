@@ -2,7 +2,10 @@
 use crate::api::{LoadedModel, PreparedChatGenerationSettings};
 use crate::runtime::chat::ChatTemplateRequest;
 use anyhow::{ensure, Context, Result};
-use eredu_core::{refinement::*, GenerationConfigOverrides, TextGenerationBackend};
+use eredu_core::{
+    capture::*, refinement::*, GenerationConfigOverrides, TextExecutionSession,
+    TextGenerationBackend,
+};
 use serde_json::json;
 use std::{collections::BTreeSet, ops::ControlFlow};
 
@@ -175,8 +178,8 @@ fn answer(question: &DecisionQuestion, scores: &[f64]) -> Result<DecisionAnswer>
 }
 
 /// Evaluates a text request using a loaded model's pinned refinement canvas.
-pub fn evaluate_refinement<B: TextGenerationBackend>(
-    model: &mut LoadedModel<B>,
+pub fn evaluate_refinement<B: TextGenerationBackend, S: TextExecutionSession<B>>(
+    model: &mut LoadedModel<B, S>,
     request: &DecisionRequest,
 ) -> Result<DecisionResponse> {
     request.validate()?;

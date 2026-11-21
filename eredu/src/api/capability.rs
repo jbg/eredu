@@ -2,17 +2,21 @@
 
 use eredu_core::{
     apply_admission_policy, AdmissionRequest, AdmissionResult, AvailableMemory, CapabilityError,
-    InputTokenCount, ModelCapabilities, ModelCapabilityBackend, RuntimeStateEstimate,
+    InputTokenCount, ModelCapabilities, ModelCapabilitySession, RuntimeStateEstimate,
     StaticMemoryReport,
 };
 
 use super::LoadedModel;
 use crate::runtime::chat::PreparedChat;
 
-impl<B: ModelCapabilityBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + ModelCapabilitySession<B>,
+    > LoadedModel<B, S>
+{
     /// Returns backend-independent capabilities derived from validated loaded state.
     pub fn capabilities(&self) -> Result<ModelCapabilities, CapabilityError> {
-        B::model_capabilities(&self.runtime)
+        S::model_capabilities(&self.runtime)
     }
 
     /// Counts an ordinary encoded prompt exactly.
@@ -47,9 +51,9 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
     /// Counts text IDs and actual model positions in a backend-prepared input.
     pub fn count_prepared_input(
         &self,
-        input: &B::Prompt,
+        input: &S::Prompt,
     ) -> Result<InputTokenCount, CapabilityError> {
-        B::count_prepared_input(&self.runtime, input)
+        S::count_prepared_input(&self.runtime, input)
     }
 
     /// Estimates persistent request state and prepared-media execution workspace.
@@ -59,12 +63,12 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
         max_output_tokens: u64,
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        B::estimate_runtime_state(&self.runtime, input, max_output_tokens, batch_size)
+        S::estimate_runtime_state(&self.runtime, input, max_output_tokens, batch_size)
     }
 
     /// Reports logical checkpoint/residency accounting and backend allocator observations.
     pub fn static_memory(&self) -> Result<StaticMemoryReport, CapabilityError> {
-        B::static_memory(&self.runtime)
+        S::static_memory(&self.runtime)
     }
 
     /// Applies portable context and memory policy without allocating a model cache.
@@ -83,7 +87,11 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
     }
 }
 
-impl<B: ModelCapabilityBackend> LoadedModel<B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + ModelCapabilitySession<B>,
+    > LoadedModel<B, S>
+{
     /// Reads this execution's conversion-retention budgets without evaluating,
     /// settling, or changing request state. Embedded owners share these budgets.
     ///
@@ -99,12 +107,15 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
         eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
         eredu_core::BackendFailure,
     > {
-        B::parameter_conversion_retention(&self.runtime)
+        S::parameter_conversion_retention(&self.runtime)
     }
 }
 
-impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRetentionObserver>
-    super::PlannedModel<B, eredu_core::RealizedDrafting<D>>
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + ModelCapabilitySession<B>,
+        D: eredu_core::residency::ParameterConversionRetentionObserver,
+    > super::PlannedModel<B, S, eredu_core::RealizedDrafting<D>>
 {
     /// Reports every loaded participant's retention budget. External drafting
     /// has an independent allowance; embedded owners are included in the target.
@@ -127,8 +138,11 @@ impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRet
     }
 }
 
-impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRetentionTrimmer>
-    super::PlannedModel<B, eredu_core::RealizedDrafting<D>>
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + ModelCapabilitySession<B>,
+        D: eredu_core::residency::ParameterConversionRetentionTrimmer,
+    > super::PlannedModel<B, S, eredu_core::RealizedDrafting<D>>
 {
     /// Releases optional conversions for the target and separately loaded drafter.
     /// Each participant establishes its ordinary settled boundary; no request

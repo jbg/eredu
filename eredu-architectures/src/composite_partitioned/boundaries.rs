@@ -1,9 +1,10 @@
 //! Retained architecture-authored schemas for composite pipeline edges.
 use std::collections::BTreeMap;
 
+use eredu_core::communication::BoundaryTensorDtype as Dtype;
 use eredu_runtime::{
-    BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype, BoundaryTensorSpec,
-    BoundaryWireSchema, ExecutionGraph, ExecutionUnitLayout,
+    BoundaryTensorDimension as Dim, BoundaryTensorSpec, BoundaryWireSchema, ExecutionGraph,
+    ExecutionUnitLayout,
 };
 
 /// Sequence bound for an encoder continuation or learned-context edge.

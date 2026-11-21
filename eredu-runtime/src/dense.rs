@@ -1,4 +1,4 @@
-//! Backend-neutral dense-stream residency telemetry.
+//! Backend-neutral dense-stream scheduling and residency telemetry.
 
 use eredu_core::residency::{
     BackgroundPrefetchReport, MemoryTier, OffloadReport, OffloadUnitId, ResidencyPolicy,
@@ -9,7 +9,17 @@ use std::{
     sync::Mutex,
 };
 
-use crate::{ResidencyReport, WeightMaterializationReport};
+use crate::ResidencyReport;
+use eredu_checkpoint::quantization::WeightMaterializationReport;
+
+mod stream;
+pub(crate) use stream::{
+    sample_residency_memory, DenseStreamForwardGuard, DenseStreamGroupGuard, DenseTransferWindow,
+};
+pub use stream::{
+    BackgroundLayerPrefetch, DenseResidencyMechanisms, DenseStreamController, DenseStreamError,
+    DenseStreamMechanisms, NativeResidencyObservations,
+};
 
 /// Stable dense-stream observations combining residency and worker state.
 #[derive(Debug, Clone, Eq, PartialEq)]

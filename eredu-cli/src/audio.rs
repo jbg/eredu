@@ -222,7 +222,7 @@ pub fn run(
 }
 
 fn run_turn(
-    factory: &(impl eredu_core::AutomaticPlanningBackend
+    factory: &(impl eredu_core::BackendHardware
           + RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>),
     task: AudioTask<'_>,
     args: ModelArgs,

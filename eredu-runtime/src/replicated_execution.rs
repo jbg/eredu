@@ -3,16 +3,18 @@
 //! This composes the ordinary partition communication authority. It owns no
 //! model state, random stream, scheduler or commit boundary.
 
-use std::borrow::Borrow;
+use std::{borrow::Borrow, cell::Cell};
 
 use eredu_core::{BackendFailure, CollectiveGroupId};
 
 use crate::{
-    BroadcastBackend, CommunicationBackend, CommunicationManifest, CommunicationOperation,
-    CommunicationTensorMetadata, DistributedExecutionPhase, FailureAgreementBackend,
-    OpaqueFailureAgreement, OpaqueOutputPublisher, PartitionCommitAgreement,
-    PartitionCommunication, PartitionOutputPublication, PartitionOutputPublisher,
+    DistributedExecutionPhase, OpaqueFailureAgreement, OpaqueOutputPublisher,
+    PartitionCommitAgreement, PartitionCommunication, PartitionOutputPublication,
+    PartitionOutputPublisher,
 };
+use eredu_core::communication::CommunicationManifest;
+use eredu_core::communication::CommunicationOperation;
+use eredu_core::communication::{BroadcastBackend, FailureAgreementBackend, RankCommunication};
 
 /// Mechanisms used by an architecture's replicated transition.
 pub trait ReplicatedCoordinator<T, C: ?Sized> {
@@ -42,10 +44,10 @@ pub enum CollectiveCoordinationError {
     Selection(&'static str),
     /// The retained operation declarations are malformed.
     #[error(transparent)]
-    Manifest(#[from] crate::CommunicationManifestError),
+    Manifest(#[from] eredu_core::communication::CommunicationManifestError),
     /// An exact operation, dtype, payload bound or completion requirement is absent.
     #[error(transparent)]
-    Capability(#[from] crate::CommunicationCapabilityError),
+    Capability(#[from] eredu_core::communication::CommunicationCapabilityError),
 }
 
 /// Checks a selected group's failure authority and exact data requirements.
@@ -55,8 +57,8 @@ pub enum CollectiveCoordinationError {
 pub fn validate_collective_coordination(
     manifest: &CommunicationManifest,
     group: CollectiveGroupId,
-    requirements: impl IntoIterator<Item = crate::CommunicationOperationRequirement>,
-) -> Result<&crate::CommunicationGroupDescriptor, CollectiveCoordinationError> {
+    requirements: impl IntoIterator<Item = eredu_core::communication::CommunicationOperationRequirement>,
+) -> Result<&eredu_core::communication::CommunicationGroupDescriptor, CollectiveCoordinationError> {
     let selected = manifest
         .groups()
         .iter()
@@ -69,11 +71,12 @@ pub fn validate_collective_coordination(
             "local membership and bounded completion are required",
         ));
     }
-    let capabilities = crate::CommunicationCapabilities::new(
+    let capabilities = eredu_core::communication::CommunicationCapabilities::new(
         selected.requirements().operations().iter().cloned(),
     )?;
-    capabilities
-        .validate_requirement(&crate::CommunicationOperationRequirement::failure_agreement(true))?;
+    capabilities.validate_requirement(
+        &eredu_core::communication::CommunicationOperationRequirement::failure_agreement(true),
+    )?;
     for requirement in requirements {
         capabilities.validate_requirement(&requirement)?;
     }
@@ -118,26 +121,16 @@ pub fn validate_coordination(
 }
 
 /// Existing bounded agreement/publication policies over one retained authority.
-pub struct OpaqueReplicatedCoordinator<B, G, R, I>
-where
-    B: CommunicationBackend,
-    G: Borrow<B::CommunicationGroup>,
-    R: Borrow<B::CommunicationRoute>,
-    I: CommunicationTensorMetadata<B>,
-{
-    communication: PartitionCommunication<B, G, R, I>,
+pub struct OpaqueReplicatedCoordinator<C: RankCommunication> {
+    communication: PartitionCommunication<C::Backend, C::Group, C::Route, C::Metadata>,
+    parallel: C::Parallel,
+    executor: <C::Backend as eredu_core::SubmissionBackend>::OwnedExecutor,
     group: CollectiveGroupId,
     owner: usize,
-    selection_agreed: bool,
+    selection_agreed: Cell<bool>,
 }
 
-impl<B, G, R, I> OpaqueReplicatedCoordinator<B, G, R, I>
-where
-    B: CommunicationBackend,
-    G: Borrow<B::CommunicationGroup>,
-    R: Borrow<B::CommunicationRoute>,
-    I: CommunicationTensorMetadata<B>,
-{
+impl<C: RankCommunication> OpaqueReplicatedCoordinator<C> {
     /// Exact retained operation and completion contract.
     pub fn manifest(&self) -> &CommunicationManifest {
         self.communication.manifest()
@@ -146,29 +139,43 @@ where
     pub fn group(&self) -> CollectiveGroupId {
         self.group
     }
-    /// Consumes exact retained communication resources; does not create a group.
-    pub fn new(
-        communication: PartitionCommunication<B, G, R, I>,
+    /// Exact native context for readiness-ordered tensor operations.
+    pub fn parallel_context(&self) -> &C::Parallel {
+        &self.parallel
+    }
+
+    /// Retains native rank resources selected by the portable coordinator.
+    pub fn bind(
+        rank: C,
+        manifest: CommunicationManifest,
         group: CollectiveGroupId,
         owner: usize,
-    ) -> Result<Self, CoordinationError> {
-        validate_coordination(communication.manifest(), group, owner)?;
+    ) -> Result<Self, BackendFailure> {
+        validate_coordination(&manifest, group, owner).map_err(BackendFailure::from_error)?;
+        let parallel = rank.coordinated_tensor_context(group).ok_or_else(|| {
+            BackendFailure::from_error(CoordinationError(
+                "the selected group cannot realize independently coordinated tensor operations",
+            ))
+        })?;
+        let (communication, _, executor) = PartitionCommunication::bind_rank(rank, manifest, None)?;
         Ok(Self {
             communication,
+            parallel,
+            executor,
             group,
             owner,
-            selection_agreed: false,
+            selection_agreed: Cell::new(false),
         })
     }
 }
 
-impl<B, G, R, I> ReplicatedCoordinator<B::Tensor, B::Executor>
-    for OpaqueReplicatedCoordinator<B, G, R, I>
+type Backend<C> = <C as RankCommunication>::Backend;
+type Exec<C> = <Backend<C> as eredu_core::SubmissionBackend>::Executor;
+type Value<C> = <Backend<C> as eredu_nn::NeuralBackend>::Tensor;
+
+impl<C> ReplicatedCoordinator<Value<C>, Exec<C>> for OpaqueReplicatedCoordinator<C>
 where
-    B: CommunicationBackend + BroadcastBackend + FailureAgreementBackend,
-    G: Borrow<B::CommunicationGroup>,
-    R: Borrow<B::CommunicationRoute>,
-    I: CommunicationTensorMetadata<B>,
+    C: RankCommunication<Backend: BroadcastBackend + FailureAgreementBackend>,
 {
     fn is_owner(&self) -> bool {
         self.communication.manifest().rank() == self.owner
@@ -177,10 +184,35 @@ where
         &mut self,
         descriptor: [u64; 8],
         success: bool,
-        context: &B::Executor,
+        _: &Exec<C>,
     ) -> Result<bool, BackendFailure> {
-        if !self.selection_agreed {
-            self.selection_agreed = OpaqueFailureAgreement
+        self.agree_phase(descriptor, success)
+    }
+    fn publish(&mut self, value: Value<C>, _: &Exec<C>) -> Result<Value<C>, BackendFailure> {
+        if !self.selection_agreed.get() {
+            return Err(BackendFailure::from_error(CoordinationError(
+                "decision owner has not been agreed",
+            )));
+        }
+        OpaqueOutputPublisher
+            .publish(
+                &self.communication,
+                value,
+                PartitionOutputPublication {
+                    group: self.group,
+                    owner_rank: self.owner,
+                },
+                DistributedExecutionPhase::SamplingSynchronization,
+                self.executor.borrow(),
+            )
+            .map_err(BackendFailure::from_error)
+    }
+}
+
+impl<C: RankCommunication<Backend: FailureAgreementBackend>> OpaqueReplicatedCoordinator<C> {
+    fn agree_phase(&self, descriptor: [u64; 8], success: bool) -> Result<bool, BackendFailure> {
+        if !self.selection_agreed.get() {
+            let accepted = OpaqueFailureAgreement
                 .agree_descriptor(
                     &self.communication,
                     self.group,
@@ -196,12 +228,13 @@ where
                         0,
                         0,
                     ],
-                    context,
+                    self.executor.borrow(),
                 )
                 .map_err(BackendFailure::from_error)?;
-            if !self.selection_agreed {
+            if !accepted {
                 return Ok(false);
             }
+            self.selection_agreed.set(true);
         }
         OpaqueFailureAgreement
             .agree_descriptor(
@@ -210,39 +243,42 @@ where
                 DistributedExecutionPhase::Execution,
                 success,
                 descriptor,
-                context,
+                self.executor.borrow(),
             )
             .map_err(BackendFailure::from_error)
     }
-    fn publish(
-        &mut self,
-        value: B::Tensor,
-        context: &B::Executor,
-    ) -> Result<B::Tensor, BackendFailure> {
-        if !self.selection_agreed {
-            return Err(BackendFailure::from_error(CoordinationError(
-                "decision owner has not been agreed",
-            )));
-        }
-        OpaqueOutputPublisher
-            .publish(
-                &self.communication,
-                value,
-                PartitionOutputPublication {
-                    group: self.group,
-                    owner_rank: self.owner,
-                },
-                DistributedExecutionPhase::SamplingSynchronization,
-                context,
-            )
-            .map_err(BackendFailure::from_error)
+}
+
+impl<B, C> crate::LayeredTensorCohort<B> for OpaqueReplicatedCoordinator<C>
+where
+    B: FailureAgreementBackend<
+        Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    >,
+    C: RankCommunication<Backend = B, Parallel = B::ParallelContext>,
+    B::ParallelContext: Sized,
+{
+    fn selection(&self) -> (&CommunicationManifest, CollectiveGroupId) {
+        (self.manifest(), self.group())
+    }
+
+    fn parallel_context(&self) -> &B::ParallelContext {
+        &self.parallel
+    }
+
+    fn agree(
+        &self,
+        descriptor: [u64; 8],
+        ready: bool,
+        _: &B::Executor,
+    ) -> Result<bool, BackendFailure> {
+        self.agree_phase(descriptor, ready)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use eredu_core::communication::{
         CommunicationCapabilityError, CommunicationCompletionPolicy, CommunicationGroupDescriptor,
         CommunicationGroupRequirements, CommunicationOperationRequirement,
         CommunicationTensorLimits,

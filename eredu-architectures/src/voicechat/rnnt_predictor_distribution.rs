@@ -7,13 +7,14 @@ use super::{
     },
     rnnt_predictor_preparation::PreparedRnntPredictorBindings,
 };
+use eredu_core::communication::CommunicationManifest;
+use eredu_core::communication::PipelineActivationDtype;
 use eredu_core::{BackendFailure, CollectiveGroupId};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition,
     ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
-    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
-    PipelineBindingError,
+    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineBindingError,
 };
 
 use super::rnnt_predictor_stage::{RnntPredictorPipeline, RnntPredictorPipelineArchitecture};
@@ -95,14 +96,14 @@ impl PreparedRnntPredictorPipelineBindings {
             .iter()
             .find(|group| group.id() == publication.group)
             .expect("validated predictor publication group");
-        let capabilities = eredu_runtime::CommunicationCapabilities::new(
+        let capabilities = eredu_core::communication::CommunicationCapabilities::new(
             group.requirements().operations().iter().cloned(),
         )?;
         capabilities.validate_requirement(
-            &eredu_runtime::CommunicationOperationRequirement::tensors(
-                eredu_runtime::CommunicationOperation::Broadcast,
+            &eredu_core::communication::CommunicationOperationRequirement::tensors(
+                eredu_core::communication::CommunicationOperation::Broadcast,
                 [eredu_core::checkpoint::TensorDtype::F32],
-                eredu_runtime::CommunicationTensorLimits::new(
+                eredu_core::communication::CommunicationTensorLimits::new(
                     1,
                     2,
                     bindings.dimensions().predictor_width as usize,
@@ -156,7 +157,7 @@ impl PreparedRnntPredictorPipelineBindings {
         H: ComponentRankMechanisms<B, RnntPredictorRuntimeState<B::Tensor>, C>,
     {
         let (pipeline, layout) = self.into_pipeline::<B>(residency)?;
-        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        let (execution, metadata) = pipeline.bind(mechanisms, communication)?;
         Ok((RnntPredictorPipeline::new(execution, layout), metadata))
     }
 

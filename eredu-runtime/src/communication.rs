@@ -5,1276 +5,49 @@
 //! axes, but the descriptors handed to a backend contain only ordered world
 //! ranks, opaque identities, operations, and mechanical limits.
 
+use eredu_core::communication::{
+    validate_compatible_communication_manifests, CommunicationBindingError,
+    CommunicationBindingGeometryError, CommunicationBindings, CommunicationCapabilities,
+    CommunicationCapabilityError, CommunicationCompletionPolicy, CommunicationGroupDescriptor,
+    CommunicationGroupRequirements, CommunicationManifest, CommunicationManifestError,
+    CommunicationOperation, CommunicationOperationRequirement, CommunicationRouteDescriptor,
+    CommunicationRouteId, CommunicationSetupTransport, CommunicationTopologyCapabilities,
+    WorldCommunicationBinding,
+};
+#[cfg(test)]
+use eredu_core::communication::{
+    BoundaryDimensionContract, BoundaryFramingProtocol, BoundaryRoleContract,
+    CommunicationCompletionCapabilities, CommunicationTensorLimits, RoleExactBoundaryContract,
+};
 use std::{collections::BTreeSet, ops::Range};
 
+#[cfg(test)]
+use eredu_core::{checkpoint::TensorDtype, CollectiveGroupDescriptor, CompletionCancellationMode};
 use eredu_core::{
-    checkpoint::TensorDtype, consensus::ConsensusTransport, CollectiveGroupDescriptor,
-    CollectiveGroupId, CompletionCancellationMode, ParallelAxis, ParallelRankTopology,
+    consensus::ConsensusTransport, CollectiveGroupId, ParallelAxis, ParallelRankTopology,
     ParallelTopology,
 };
 use serde::{Deserialize, Serialize};
 
 mod session_identity;
-pub use session_identity::{
-    establish_communication_session, AgreedCommunicationSession, CommunicationSessionIdentity,
-};
+pub use session_identity::{establish_communication_session, AgreedCommunicationSession};
 
-/// Exact rank-local send and receive element counts for a variable exchange.
-///
-/// Counts are ordered by opaque communication-group membership. Zero is a
-/// valid count for an idle peer; the peer cardinality itself must be positive.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct CommunicationPeerCounts {
-    send: Vec<usize>,
-    receive: Vec<usize>,
-}
-
-impl CommunicationPeerCounts {
-    /// Validates one send and receive count for every ordered group member.
-    pub fn new(
-        send: Vec<usize>,
-        receive: Vec<usize>,
-        group_size: usize,
-    ) -> Result<Self, CommunicationManifestError> {
-        if group_size == 0 || send.len() != group_size || receive.len() != group_size {
-            return Err(CommunicationManifestError::InvalidPeerCounts {
-                group_size,
-                send: send.len(),
-                receive: receive.len(),
-            });
-        }
-        Ok(Self { send, receive })
-    }
-
-    /// Elements submitted to each peer in ordered membership order.
-    pub fn send(&self) -> &[usize] {
-        &self.send
-    }
-
-    /// Elements expected from each peer in ordered membership order.
-    pub fn receive(&self) -> &[usize] {
-        &self.receive
-    }
-
-    /// Ordered communication-group cardinality.
-    pub fn group_size(&self) -> usize {
-        self.send.len()
-    }
-}
-
-impl<'de> Deserialize<'de> for CommunicationPeerCounts {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            send: Vec<usize>,
-            receive: Vec<usize>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        let group_size = raw.send.len();
-        Self::new(raw.send, raw.receive, group_size).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Stable opaque identity of one directed communication route.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CommunicationRouteId(u64);
-
-impl CommunicationRouteId {
-    /// Creates an opaque route identity.
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the stable numeric representation used by backend maps.
-    pub const fn value(self) -> u64 {
-        self.0
-    }
-}
-
-/// One exact mechanism required by a communication group or route.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Failure projecting semantic parallel axes into opaque descriptors.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
-pub enum CommunicationOperation {
-    /// Elementwise sum reduction over an ordered group.
-    AllReduceSum,
-    /// Equal-size gather with concatenation in group-member order.
-    AllGatherEven,
-    /// Unequal-size gather with concatenation in group-member order.
-    AllGatherUneven,
-    /// All-to-all with an exact count supplied for every ordered peer.
-    VariableAllToAll,
-    /// Directed point-to-point transfer.
-    SendReceive,
-    /// Root-to-group broadcast.
-    Broadcast,
-    /// Group synchronization without a tensor payload.
-    Barrier,
-    /// All-rank boolean conjunction used to propagate a local phase failure.
-    FailureAgreement,
-}
-
-/// Maximum tensor and per-peer counts admitted for one operation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-pub struct CommunicationTensorLimits {
-    max_tensors: usize,
-    max_tensor_rank: usize,
-    max_tensor_elements: usize,
-    max_output_tensor_elements: usize,
-    max_count_per_peer: Option<usize>,
-}
-
-impl<'de> Deserialize<'de> for CommunicationTensorLimits {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            max_tensors: usize,
-            max_tensor_rank: usize,
-            max_tensor_elements: usize,
-            #[serde(default)]
-            max_output_tensor_elements: Option<usize>,
-            max_count_per_peer: Option<usize>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        let limits = Self::new(
-            raw.max_tensors,
-            raw.max_tensor_rank,
-            raw.max_tensor_elements,
-            raw.max_count_per_peer,
-        )
-        .map_err(serde::de::Error::custom)?;
-        match raw.max_output_tensor_elements {
-            Some(elements) => limits
-                .with_output_tensor_elements(elements)
-                .map_err(serde::de::Error::custom),
-            None => Ok(limits),
-        }
-    }
-}
-
-impl CommunicationTensorLimits {
-    /// Validates positive payload limits. Tensor rank may be zero for scalars.
-    pub fn new(
-        max_tensors: usize,
-        max_tensor_rank: usize,
-        max_tensor_elements: usize,
-        max_count_per_peer: Option<usize>,
-    ) -> Result<Self, CommunicationManifestError> {
-        if max_tensors == 0 || max_tensor_elements == 0 || max_count_per_peer == Some(0) {
-            return Err(CommunicationManifestError::InvalidOperationLimits);
-        }
-        Ok(Self {
-            max_tensors,
-            max_tensor_rank,
-            max_tensor_elements,
-            max_output_tensor_elements: max_tensor_elements,
-            max_count_per_peer,
-        })
-    }
-
-    /// Selects a distinct upper bound for the completed result tensor.
-    ///
-    /// Gather and variable-count operations can return more elements than one rank submits.
-    pub fn with_output_tensor_elements(
-        mut self,
-        max_output_tensor_elements: usize,
-    ) -> Result<Self, CommunicationManifestError> {
-        if max_output_tensor_elements == 0 {
-            return Err(CommunicationManifestError::InvalidOperationLimits);
-        }
-        self.max_output_tensor_elements = max_output_tensor_elements;
-        Ok(self)
-    }
-
-    /// Maximum tensors submitted in one operation.
-    pub const fn max_tensors(self) -> usize {
-        self.max_tensors
-    }
-
-    /// Maximum logical rank of one tensor. Zero admits scalars only.
-    pub const fn max_tensor_rank(self) -> usize {
-        self.max_tensor_rank
-    }
-
-    /// Maximum logical elements in one tensor.
-    pub const fn max_tensor_elements(self) -> usize {
-        self.max_tensor_elements
-    }
-
-    /// Maximum logical elements in one completed result tensor.
-    pub const fn max_output_tensor_elements(self) -> usize {
-        self.max_output_tensor_elements
-    }
-
-    /// Maximum elements addressed to or received from one peer, when used.
-    pub const fn max_count_per_peer(self) -> Option<usize> {
-        self.max_count_per_peer
-    }
-
-    fn covers(self, required: Self) -> bool {
-        self.max_tensors >= required.max_tensors
-            && self.max_tensor_rank >= required.max_tensor_rank
-            && self.max_tensor_elements >= required.max_tensor_elements
-            && self.max_output_tensor_elements >= required.max_output_tensor_elements
-            && match (self.max_count_per_peer, required.max_count_per_peer) {
-                (_, None) => true,
-                (Some(available), Some(required)) => available >= required,
-                (None, Some(_)) => false,
-            }
-    }
-}
-
-/// Fine-grained operation, dtype, limit, and completion requirement.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct CommunicationOperationRequirement {
-    operation: CommunicationOperation,
-    dtypes: Vec<TensorDtype>,
-    limits: Option<CommunicationTensorLimits>,
-    exact_completion: bool,
-}
-
-impl CommunicationOperationRequirement {
-    /// Validates one tensor-carrying operation requirement.
-    pub fn tensors(
-        operation: CommunicationOperation,
-        dtypes: impl IntoIterator<Item = TensorDtype>,
-        limits: CommunicationTensorLimits,
-        exact_completion: bool,
-    ) -> Result<Self, CommunicationManifestError> {
-        if matches!(
-            operation,
-            CommunicationOperation::Barrier | CommunicationOperation::FailureAgreement
-        ) {
-            return Err(CommunicationManifestError::InvalidOperationLimits);
-        }
-        if operation == CommunicationOperation::VariableAllToAll
-            && limits.max_count_per_peer().is_none()
-        {
-            return Err(CommunicationManifestError::InvalidOperationLimits);
-        }
-        if operation != CommunicationOperation::VariableAllToAll
-            && limits.max_count_per_peer().is_some()
-        {
-            return Err(CommunicationManifestError::InvalidOperationLimits);
-        }
-        let dtypes = dtypes.into_iter().collect::<Vec<_>>();
-        if dtypes.is_empty() || contains_duplicate_dtypes(&dtypes) {
-            return Err(CommunicationManifestError::InvalidOperationDtypes);
-        }
-        Ok(Self {
-            operation,
-            dtypes,
-            limits: Some(limits),
-            exact_completion,
-        })
-    }
-
-    /// Creates a payload-free barrier requirement.
-    pub const fn barrier(exact_completion: bool) -> Self {
-        Self {
-            operation: CommunicationOperation::Barrier,
-            dtypes: Vec::new(),
-            limits: None,
-            exact_completion,
-        }
-    }
-
-    /// Creates a payload-free all-rank failure-agreement requirement.
-    pub const fn failure_agreement(exact_completion: bool) -> Self {
-        Self {
-            operation: CommunicationOperation::FailureAgreement,
-            dtypes: Vec::new(),
-            limits: None,
-            exact_completion,
-        }
-    }
-
-    /// Required operation semantics.
-    pub const fn operation(&self) -> CommunicationOperation {
-        self.operation
-    }
-
-    /// Exact admitted logical tensor element types.
-    pub fn dtypes(&self) -> &[TensorDtype] {
-        &self.dtypes
-    }
-
-    /// Payload limits, absent for payload-free synchronization operations.
-    pub const fn limits(&self) -> Option<CommunicationTensorLimits> {
-        self.limits
-    }
-
-    /// Whether the operation requires an exact completion object.
-    pub const fn exact_completion(&self) -> bool {
-        self.exact_completion
-    }
-
-    fn validate(&self) -> Result<(), CommunicationManifestError> {
-        match (self.operation, self.limits) {
-            (CommunicationOperation::Barrier | CommunicationOperation::FailureAgreement, None)
-                if self.dtypes.is_empty() =>
-            {
-                Ok(())
-            }
-            (CommunicationOperation::VariableAllToAll, Some(limits))
-                if limits.max_count_per_peer().is_some()
-                    && !self.dtypes.is_empty()
-                    && !contains_duplicate_dtypes(&self.dtypes) =>
-            {
-                Ok(())
-            }
-            (operation, Some(limits))
-                if operation != CommunicationOperation::Barrier
-                    && operation != CommunicationOperation::FailureAgreement
-                    && operation != CommunicationOperation::VariableAllToAll
-                    && limits.max_count_per_peer().is_none()
-                    && !self.dtypes.is_empty()
-                    && !contains_duplicate_dtypes(&self.dtypes) =>
-            {
-                Ok(())
-            }
-            _ => Err(CommunicationManifestError::InvalidOperationLimits),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for CommunicationOperationRequirement {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            operation: CommunicationOperation,
-            dtypes: Vec<TensorDtype>,
-            limits: Option<CommunicationTensorLimits>,
-            exact_completion: bool,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        let requirement = Self {
-            operation: raw.operation,
-            dtypes: raw.dtypes,
-            limits: raw.limits,
-            exact_completion: raw.exact_completion,
-        };
-        requirement.validate().map_err(serde::de::Error::custom)?;
-        Ok(requirement)
-    }
-}
-
-/// Exact operations required on one opaque group.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct CommunicationGroupRequirements {
-    operations: Vec<CommunicationOperationRequirement>,
-}
-
-impl<'de> Deserialize<'de> for CommunicationGroupRequirements {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            operations: Vec<CommunicationOperationRequirement>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Self::new(raw.operations).map_err(serde::de::Error::custom)
-    }
-}
-
-impl CommunicationGroupRequirements {
-    /// Validates a non-empty, operation-unique requirement list.
-    pub fn new(
-        operations: impl IntoIterator<Item = CommunicationOperationRequirement>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let operations = operations.into_iter().collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
-        if operations.is_empty()
-            || operations.iter().any(|requirement| {
-                requirement.validate().is_err() || !seen.insert(requirement.operation())
-            })
-        {
-            return Err(CommunicationManifestError::DuplicateOrMissingOperation);
-        }
-        Ok(Self { operations })
-    }
-
-    /// Operations in deterministic declaration order.
-    pub fn operations(&self) -> &[CommunicationOperationRequirement] {
-        &self.operations
-    }
-
-    /// Checks an additional invocation against this group's retained admission.
-    /// Backend support alone cannot enlarge a selected group's payload bounds.
-    /// Membership and session authority remain the caller's responsibility.
-    pub fn validate_requirement(
-        &self,
-        requirement: &CommunicationOperationRequirement,
-    ) -> Result<(), CommunicationCapabilityError> {
-        validate_operation_requirement(&self.operations, requirement)
-    }
-}
-
-/// Ordered membership and exact requirements for one opaque group.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct CommunicationGroupDescriptor {
-    id: CollectiveGroupId,
-    creation_order: usize,
-    members: Vec<usize>,
-    local_index: Option<usize>,
-    requirements: CommunicationGroupRequirements,
-}
-
-impl CommunicationGroupDescriptor {
-    /// Validates local ordered membership independent of world geometry.
-    pub fn new(
-        id: CollectiveGroupId,
-        creation_order: usize,
-        members: Vec<usize>,
-        local_index: Option<usize>,
-        requirements: CommunicationGroupRequirements,
-    ) -> Result<Self, CommunicationManifestError> {
-        let unique = members.iter().copied().collect::<BTreeSet<_>>();
-        if members.is_empty() {
-            return Err(CommunicationManifestError::EmptyGroup { id });
-        }
-        if unique.len() != members.len() {
-            return Err(CommunicationManifestError::DuplicateGroupMember { id });
-        }
-        if local_index.is_some_and(|index| index >= members.len()) {
-            return Err(CommunicationManifestError::WrongLocalIndex { id });
-        }
-        Ok(Self {
-            id,
-            creation_order,
-            members,
-            local_index,
-            requirements,
-        })
-    }
-
-    /// Opaque stable group identity.
-    pub const fn id(&self) -> CollectiveGroupId {
-        self.id
-    }
-
-    /// Canonical group-creation position shared by every world rank.
-    pub const fn creation_order(&self) -> usize {
-        self.creation_order
-    }
-
-    /// Ordered world-rank membership.
-    pub fn members(&self) -> &[usize] {
-        &self.members
-    }
-
-    /// This manifest rank's position, or `None` when it does not participate.
-    pub const fn local_index(&self) -> Option<usize> {
-        self.local_index
-    }
-
-    /// Exact operations and limits required on the group.
-    pub const fn requirements(&self) -> &CommunicationGroupRequirements {
-        &self.requirements
-    }
-
-    /// Returns the established core descriptor when this rank participates.
-    ///
-    /// Backends can consume this narrow local descriptor without learning the
-    /// semantic topology that produced it.
-    pub fn collective_descriptor(&self) -> Option<CollectiveGroupDescriptor> {
-        self.local_index.map(|local_index| {
-            CollectiveGroupDescriptor::new(self.id, self.members.clone(), local_index)
-                .expect("runtime communication descriptor already validates local membership")
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for CommunicationGroupDescriptor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            id: CollectiveGroupId,
-            creation_order: usize,
-            members: Vec<usize>,
-            local_index: Option<usize>,
-            requirements: CommunicationGroupRequirements,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Self::new(
-            raw.id,
-            raw.creation_order,
-            raw.members,
-            raw.local_index,
-            raw.requirements,
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Directed route with exact mechanical transfer requirements.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct CommunicationRouteDescriptor {
-    id: CommunicationRouteId,
-    submission_order: usize,
-    source: usize,
-    destination: usize,
-    requirement: CommunicationOperationRequirement,
-    boundary: Option<RoleExactBoundaryContract>,
-    /// Every world rank submits one framed source broadcast in route order.
-    #[serde(default)]
-    world_broadcast: bool,
-}
-
-/// Versioned in-band framing protocol selected for a boundary route.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BoundaryFramingProtocol {
-    /// One U8 message containing the full canonical header followed by payload bytes.
-    RoleExactV1,
-}
-
-/// One exact ordered tensor role on a boundary route.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct BoundaryRoleContract {
-    role: String,
-    dtype: TensorDtype,
-    shape: Vec<BoundaryDimensionContract>,
-}
-
-impl<'de> Deserialize<'de> for BoundaryRoleContract {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            role: String,
-            dtype: TensorDtype,
-            shape: Vec<BoundaryDimensionContract>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Self::symbolic(raw.role, raw.dtype, raw.shape).map_err(serde::de::Error::custom)
-    }
-}
-
-/// One manifest-selected boundary dimension constraint.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BoundaryDimensionContract {
-    /// Invocation dimension bounded by the admitted maximum.
-    Variable {
-        /// Positive admission-time upper bound for this invocation dimension.
-        maximum: usize,
-    },
-    /// Architecture dimension that must match exactly.
-    Fixed(usize),
-}
-
-impl BoundaryRoleContract {
-    /// Creates one concrete role contract.
-    pub fn new(
-        role: impl Into<String>,
-        dtype: TensorDtype,
-        shape: Vec<usize>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let role = role.into();
-        if role.trim().is_empty() || shape.is_empty() || shape.contains(&0) {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        tensor_dtype_width(&dtype).ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-        Ok(Self {
-            role,
-            dtype,
-            shape: shape
-                .into_iter()
-                .map(BoundaryDimensionContract::Fixed)
-                .collect(),
-        })
-    }
-
-    /// Creates one role with symbolic invocation and exact fixed dimensions.
-    pub fn symbolic(
-        role: impl Into<String>,
-        dtype: TensorDtype,
-        shape: Vec<BoundaryDimensionContract>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let role = role.into();
-        if role.trim().is_empty()
-            || shape.is_empty()
-            || shape.iter().any(|dimension| match dimension {
-                BoundaryDimensionContract::Variable { maximum } => *maximum == 0,
-                BoundaryDimensionContract::Fixed(value) => *value == 0,
-            })
-        {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        tensor_dtype_width(&dtype).ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-        Ok(Self { role, dtype, shape })
-    }
-
-    /// Stable semantic role.
-    pub fn role(&self) -> &str {
-        &self.role
-    }
-    /// Exact scalar dtype.
-    pub const fn dtype(&self) -> &TensorDtype {
-        &self.dtype
-    }
-    /// Per-axis admitted maximum shape.
-    pub fn shape(&self) -> &[BoundaryDimensionContract] {
-        &self.shape
-    }
-}
-
-/// Architecture-selected role/schema contract embedded in a route manifest.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct RoleExactBoundaryContract {
-    protocol: BoundaryFramingProtocol,
-    schema: String,
-    roles: Vec<BoundaryRoleContract>,
-}
-
-impl<'de> Deserialize<'de> for RoleExactBoundaryContract {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            protocol: BoundaryFramingProtocol,
-            schema: String,
-            roles: Vec<BoundaryRoleContract>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        if raw.protocol != BoundaryFramingProtocol::RoleExactV1 {
-            return Err(serde::de::Error::custom(
-                CommunicationManifestError::InvalidBoundaryContract,
-            ));
-        }
-        Self::new(raw.schema, raw.roles).map_err(serde::de::Error::custom)
-    }
-}
-
-impl RoleExactBoundaryContract {
-    /// Creates a non-empty ordered role contract.
-    pub fn new(
-        schema: impl Into<String>,
-        roles: impl IntoIterator<Item = BoundaryRoleContract>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let schema = schema.into();
-        let roles = roles.into_iter().collect::<Vec<_>>();
-        let mut names = BTreeSet::new();
-        if schema.trim().is_empty()
-            || roles.is_empty()
-            || roles.iter().any(|role| !names.insert(role.role()))
-        {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        Ok(Self {
-            protocol: BoundaryFramingProtocol::RoleExactV1,
-            schema,
-            roles,
-        })
-    }
-
-    /// Stable architecture schema identity.
-    pub fn schema(&self) -> &str {
-        &self.schema
-    }
-    /// Ordered primary then auxiliary role contracts.
-    pub fn roles(&self) -> &[BoundaryRoleContract] {
-        &self.roles
-    }
-
-    fn validate_actual_roles(
-        &self,
-        actual_roles: &[BoundaryRoleContract],
-    ) -> Result<(), CommunicationManifestError> {
-        if actual_roles.len() != self.roles.len() {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        for (actual, admitted) in actual_roles.iter().zip(&self.roles) {
-            if actual.role != admitted.role
-                || actual.dtype != admitted.dtype
-                || actual.shape.len() != admitted.shape.len()
-                || actual
-                    .shape
-                    .iter()
-                    .zip(&admitted.shape)
-                    .any(|(actual, admitted)| {
-                        let BoundaryDimensionContract::Fixed(actual) = actual else {
-                            return true;
-                        };
-                        match admitted {
-                            BoundaryDimensionContract::Variable { maximum } => actual > maximum,
-                            BoundaryDimensionContract::Fixed(expected) => actual != expected,
-                        }
-                    })
-            {
-                return Err(CommunicationManifestError::InvalidBoundaryContract);
-            }
-        }
-        Ok(())
-    }
-
-    /// Validates invocation-resolved roles without constructing or submitting payloads.
-    pub fn validate_invocation(
-        &self,
-        actual_roles: &[BoundaryRoleContract],
-    ) -> Result<(), CommunicationManifestError> {
-        self.validate_actual_roles(actual_roles)
-    }
-
-    /// Builds canonical headers for an already locally validated tensor bundle.
-    pub fn frame_values<T>(
-        &self,
-        route: CommunicationRouteId,
-        actual_roles: &[BoundaryRoleContract],
-        values: Vec<T>,
-    ) -> Result<Vec<crate::RoleExactBoundaryValue<T>>, CommunicationManifestError> {
-        if values.len() != self.roles.len() {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        self.validate_actual_roles(actual_roles)?;
-        values
-            .into_iter()
-            .zip(actual_roles)
-            .enumerate()
-            .map(|(ordinal, (tensor, actual))| {
-                Ok(crate::RoleExactBoundaryValue::new(
-                    boundary_frame_header(route, &self.schema, ordinal, actual)?,
-                    tensor,
-                ))
-            })
-            .collect()
-    }
-}
-
-impl CommunicationRouteDescriptor {
-    /// Validates a directed point-to-point route independent of world geometry.
-    pub fn new(
-        id: CommunicationRouteId,
-        submission_order: usize,
-        source: usize,
-        destination: usize,
-        requirement: CommunicationOperationRequirement,
-    ) -> Result<Self, CommunicationManifestError> {
-        if source == destination {
-            return Err(CommunicationManifestError::InvalidRouteEndpoints { id });
-        }
-        if requirement.operation() != CommunicationOperation::SendReceive {
-            return Err(CommunicationManifestError::InvalidRouteOperation { id });
-        }
-        requirement.validate()?;
-        Ok(Self {
-            id,
-            submission_order,
-            source,
-            destination,
-            requirement,
-            boundary: None,
-            world_broadcast: false,
-        })
-    }
-
-    /// Selects bounded world participation; only the destination consumes the result.
-    pub fn with_world_broadcast(mut self) -> Self {
-        self.world_broadcast = true;
-        self
-    }
-    /// Whether every rank participates in this route's source broadcast.
-    pub const fn world_broadcast(&self) -> bool {
-        self.world_broadcast
-    }
-    /// Exact submission participants, independent of tensor ownership.
-    pub fn participates(&self, rank: usize) -> bool {
-        self.world_broadcast || rank == self.source || rank == self.destination
-    }
-
-    /// Attaches the exact role/schema framing contract selected for this route.
-    pub fn with_boundary_contract(
-        mut self,
-        boundary: RoleExactBoundaryContract,
-    ) -> Result<Self, CommunicationManifestError> {
-        let Some(limits) = self.requirement.limits() else {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        };
-        if !self.requirement.exact_completion() || boundary.roles().len() > limits.max_tensors() {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        let mut aggregate_bytes = 0usize;
-        for role in boundary.roles() {
-            if !self.requirement.dtypes().contains(role.dtype())
-                || role.shape().len() > limits.max_tensor_rank()
-            {
-                return Err(CommunicationManifestError::InvalidBoundaryContract);
-            }
-            let elements = role
-                .shape()
-                .iter()
-                .try_fold(1usize, |elements, dimension| {
-                    let extent = match dimension {
-                        BoundaryDimensionContract::Variable { maximum } => *maximum,
-                        BoundaryDimensionContract::Fixed(value) => *value,
-                    };
-                    elements.checked_mul(extent)
-                })
-                .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-            if elements > limits.max_tensor_elements()
-                || elements > limits.max_output_tensor_elements()
-            {
-                return Err(CommunicationManifestError::InvalidBoundaryContract);
-            }
-            let bytes = elements
-                .checked_mul(
-                    tensor_dtype_width(role.dtype())
-                        .ok_or(CommunicationManifestError::InvalidBoundaryContract)?,
-                )
-                .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-            aggregate_bytes = aggregate_bytes
-                .checked_add(bytes)
-                .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-        }
-        self.boundary = Some(boundary);
-        Ok(self)
-    }
-
-    /// Opaque stable route identity.
-    pub const fn id(&self) -> CommunicationRouteId {
-        self.id
-    }
-
-    /// Canonical route-submission position shared by every world rank.
-    pub const fn submission_order(&self) -> usize {
-        self.submission_order
-    }
-
-    /// Source world rank.
-    pub const fn source(&self) -> usize {
-        self.source
-    }
-
-    /// Destination world rank.
-    pub const fn destination(&self) -> usize {
-        self.destination
-    }
-
-    /// Exact transfer dtype, tensor-count, shape, and completion requirement.
-    pub const fn requirement(&self) -> &CommunicationOperationRequirement {
-        &self.requirement
-    }
-
-    /// Exact architecture-selected framing contract, when this is a boundary route.
-    pub const fn boundary_contract(&self) -> Option<&RoleExactBoundaryContract> {
-        self.boundary.as_ref()
-    }
-}
-
-impl<'de> Deserialize<'de> for CommunicationRouteDescriptor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            id: CommunicationRouteId,
-            submission_order: usize,
-            source: usize,
-            destination: usize,
-            requirement: CommunicationOperationRequirement,
-            #[serde(default)]
-            boundary: Option<RoleExactBoundaryContract>,
-            #[serde(default)]
-            world_broadcast: bool,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        let route = Self::new(
-            raw.id,
-            raw.submission_order,
-            raw.source,
-            raw.destination,
-            raw.requirement,
-        )
-        .map_err(serde::de::Error::custom)?;
-        let route = if raw.world_broadcast {
-            route.with_world_broadcast()
-        } else {
-            route
-        };
-        match raw.boundary {
-            Some(boundary) => route
-                .with_boundary_contract(boundary)
-                .map_err(serde::de::Error::custom),
-            None => Ok(route),
-        }
-    }
-}
-
-fn tensor_dtype_width(dtype: &TensorDtype) -> Option<usize> {
-    Some(match dtype {
-        TensorDtype::Bool | TensorDtype::I8 | TensorDtype::U8 => 1,
-        TensorDtype::F16 | TensorDtype::Bf16 | TensorDtype::U16 | TensorDtype::I16 => 2,
-        TensorDtype::F32 | TensorDtype::U32 | TensorDtype::I32 => 4,
-        TensorDtype::F64 | TensorDtype::U64 | TensorDtype::I64 | TensorDtype::Complex64 => 8,
-        TensorDtype::Encoded(_) => return None,
-    })
-}
-
-fn dtype_tag(dtype: &TensorDtype) -> Result<u8, CommunicationManifestError> {
-    Ok(match dtype {
-        TensorDtype::Bool => 0,
-        TensorDtype::F32 => 1,
-        TensorDtype::F16 => 2,
-        TensorDtype::Bf16 => 3,
-        TensorDtype::I8 => 4,
-        TensorDtype::U8 => 5,
-        TensorDtype::U16 => 6,
-        TensorDtype::U32 => 7,
-        TensorDtype::U64 => 8,
-        TensorDtype::I16 => 9,
-        TensorDtype::I32 => 10,
-        TensorDtype::I64 => 11,
-        TensorDtype::F64 => 12,
-        TensorDtype::Complex64 => 13,
-        TensorDtype::Encoded(_) => return Err(CommunicationManifestError::InvalidBoundaryContract),
-    })
-}
-
-fn boundary_frame_header(
-    route: CommunicationRouteId,
-    schema: &str,
-    ordinal: usize,
-    role: &BoundaryRoleContract,
-) -> Result<Vec<u8>, CommunicationManifestError> {
-    let exact_shape = role
-        .shape
-        .iter()
-        .map(|dimension| match dimension {
-            BoundaryDimensionContract::Fixed(value) => Ok(*value),
-            BoundaryDimensionContract::Variable { .. } => {
-                Err(CommunicationManifestError::InvalidBoundaryContract)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let payload_elements = exact_shape
-        .iter()
-        .try_fold(1usize, |value, dimension| value.checked_mul(*dimension))
-        .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-    let payload_bytes = payload_elements
-        .checked_mul(
-            tensor_dtype_width(&role.dtype)
-                .ok_or(CommunicationManifestError::InvalidBoundaryContract)?,
-        )
-        .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-    let ordinal =
-        u32::try_from(ordinal).map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let schema_len = u32::try_from(schema.len())
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let role_len = u32::try_from(role.role.len())
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let rank = u32::try_from(exact_shape.len())
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let payload_bytes = u64::try_from(payload_bytes)
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let mut header = b"EREDUBND".to_vec();
-    header.extend_from_slice(&1u16.to_le_bytes());
-    header.extend_from_slice(&route.value().to_le_bytes());
-    header.extend_from_slice(&ordinal.to_le_bytes());
-    header.push(dtype_tag(&role.dtype)?);
-    header.extend_from_slice(&schema_len.to_le_bytes());
-    header.extend_from_slice(schema.as_bytes());
-    header.extend_from_slice(&role_len.to_le_bytes());
-    header.extend_from_slice(role.role.as_bytes());
-    header.extend_from_slice(&rank.to_le_bytes());
-    for dimension in &exact_shape {
-        header.extend_from_slice(
-            &u64::try_from(*dimension)
-                .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?
-                .to_le_bytes(),
-        );
-    }
-    header.extend_from_slice(&payload_bytes.to_le_bytes());
-    Ok(header)
-}
-
-/// Selected deadline and safe disposition for exact communication completion.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-pub struct CommunicationCompletionPolicy {
-    timeout_millis: u64,
-    cancellation: CompletionCancellationMode,
-}
-
-impl CommunicationCompletionPolicy {
-    /// Selects a positive relative deadline and the required timeout disposition.
-    pub fn new(
-        timeout: std::time::Duration,
-        cancellation: CompletionCancellationMode,
-    ) -> Result<Self, CommunicationManifestError> {
-        let timeout_millis = u64::try_from(timeout.as_millis())
-            .map_err(|_| CommunicationManifestError::InvalidCompletionPolicy)?;
-        if timeout_millis == 0 || std::time::Instant::now().checked_add(timeout).is_none() {
-            return Err(CommunicationManifestError::InvalidCompletionPolicy);
-        }
-        Ok(Self {
-            timeout_millis,
-            cancellation,
-        })
-    }
-
-    /// Positive selected relative deadline.
-    pub const fn timeout(self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.timeout_millis)
-    }
-
-    /// Required safe disposition for work live at the deadline.
-    pub const fn cancellation(self) -> CompletionCancellationMode {
-        self.cancellation
-    }
-
-    /// Converts the serialized manifest contract into the core completion policy.
-    pub fn bounded_wait(self) -> eredu_core::BoundedCompletionWait {
-        eredu_core::BoundedCompletionWait::new(self.timeout(), self.cancellation)
-            .expect("checked communication completion policy has a positive timeout")
-    }
-}
-
-impl<'de> Deserialize<'de> for CommunicationCompletionPolicy {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            timeout_millis: u64,
-            cancellation: CompletionCancellationMode,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Self::new(
-            std::time::Duration::from_millis(raw.timeout_millis),
-            raw.cancellation,
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Backend support for bounded completion and safe timeout disposition.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CommunicationCompletionCapabilities {
-    cancellation_modes: Vec<CompletionCancellationMode>,
-}
-
-impl CommunicationCompletionCapabilities {
-    /// Advertises the safe timeout dispositions implemented by a backend.
-    pub fn new(
-        cancellation_modes: impl IntoIterator<Item = CompletionCancellationMode>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let cancellation_modes = cancellation_modes.into_iter().collect::<Vec<_>>();
-        let unique = cancellation_modes.iter().copied().collect::<BTreeSet<_>>();
-        if cancellation_modes.is_empty() || unique.len() != cancellation_modes.len() {
-            return Err(CommunicationManifestError::InvalidCompletionCapabilities);
-        }
-        Ok(Self { cancellation_modes })
-    }
-
-    /// Whether this backend can safely apply the policy's timeout disposition.
-    pub fn supports(&self, policy: CommunicationCompletionPolicy) -> bool {
-        self.cancellation_modes.contains(&policy.cancellation())
-    }
-}
-
-/// Complete opaque communication description as viewed by one world rank.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct CommunicationManifest {
-    world_size: usize,
-    rank: usize,
-    groups: Vec<CommunicationGroupDescriptor>,
-    routes: Vec<CommunicationRouteDescriptor>,
-    completion: Option<CommunicationCompletionPolicy>,
-}
-
-impl CommunicationManifest {
-    /// Validates world geometry, membership, local positions, endpoints, and order.
-    pub fn new(
-        world_size: usize,
-        rank: usize,
-        groups: Vec<CommunicationGroupDescriptor>,
-        routes: Vec<CommunicationRouteDescriptor>,
-    ) -> Result<Self, CommunicationManifestError> {
-        if world_size == 0 || rank >= world_size {
-            return Err(CommunicationManifestError::RankOutOfRange { rank, world_size });
-        }
-        let mut group_ids = BTreeSet::new();
-        for (order, group) in groups.iter().enumerate() {
-            if !group_ids.insert(group.id()) {
-                return Err(CommunicationManifestError::DuplicateGroupId { id: group.id() });
-            }
-            if group.creation_order() != order {
-                return Err(CommunicationManifestError::WrongGroupOrder {
-                    id: group.id(),
-                    expected: order,
-                    actual: group.creation_order(),
-                });
-            }
-            if group.members().iter().any(|member| *member >= world_size) {
-                return Err(CommunicationManifestError::GroupMemberOutOfRange {
-                    id: group.id(),
-                    world_size,
-                });
-            }
-            let expected = group.members().iter().position(|member| *member == rank);
-            if group.local_index() != expected {
-                return Err(CommunicationManifestError::WrongLocalIndex { id: group.id() });
-            }
-        }
-
-        let mut route_ids = BTreeSet::new();
-        for (order, route) in routes.iter().enumerate() {
-            if !route_ids.insert(route.id()) {
-                return Err(CommunicationManifestError::DuplicateRouteId { id: route.id() });
-            }
-            if route.submission_order() != order {
-                return Err(CommunicationManifestError::WrongRouteOrder {
-                    id: route.id(),
-                    expected: order,
-                    actual: route.submission_order(),
-                });
-            }
-            if route.source() >= world_size || route.destination() >= world_size {
-                return Err(CommunicationManifestError::RouteEndpointOutOfRange {
-                    id: route.id(),
-                    world_size,
-                });
-            }
-        }
-        Ok(Self {
-            world_size,
-            rank,
-            groups,
-            routes,
-            completion: None,
-        })
-    }
-
-    /// Attaches the exact bounded-completion policy selected before realization.
-    pub fn with_completion_policy(mut self, policy: CommunicationCompletionPolicy) -> Self {
-        self.completion = Some(policy);
-        self
-    }
-
-    /// Total process count.
-    pub const fn world_size(&self) -> usize {
-        self.world_size
-    }
-
-    /// World rank whose local positions this manifest carries.
-    pub const fn rank(&self) -> usize {
-        self.rank
-    }
-
-    /// This rank's opaque groups in canonical collective-creation order.
-    pub fn groups(&self) -> &[CommunicationGroupDescriptor] {
-        &self.groups
-    }
-
-    /// Directed routes in canonical submission order.
-    pub fn routes(&self) -> &[CommunicationRouteDescriptor] {
-        &self.routes
-    }
-
-    /// Returns the manifest-proven route submission waves in canonical order.
-    ///
-    /// A multi-route wave is selected only when one contiguous batch has an
-    /// identical mechanical contract, disjoint endpoints, and covers every
-    /// world rank exactly once. Such logical endpoint groups may share one
-    /// world-backed native collective ordinal. Routes without that proof stay
-    /// in singleton waves and retain ordinary sequential point-to-point order.
-    pub(crate) fn route_submission_waves(&self) -> Vec<Range<usize>> {
-        let mut waves = Vec::new();
-        let mut start = 0;
-        while start < self.routes.len() {
-            let reference = &self.routes[start];
-            if reference.world_broadcast() {
-                waves.push(start..start + 1);
-                start += 1;
-                continue;
-            }
-            let mut endpoints = vec![false; self.world_size];
-            let mut end = start;
-            while end < self.routes.len() {
-                let route = &self.routes[end];
-                if route.world_broadcast()
-                    || route.requirement() != reference.requirement()
-                    || route.boundary_contract() != reference.boundary_contract()
-                    || endpoints[route.source()]
-                    || endpoints[route.destination()]
-                {
-                    break;
-                }
-                endpoints[route.source()] = true;
-                endpoints[route.destination()] = true;
-                end += 1;
-                if endpoints.iter().all(|endpoint| *endpoint) {
-                    break;
-                }
-            }
-            if !endpoints.iter().all(|endpoint| *endpoint) {
-                end = start + 1;
-            }
-            waves.push(start..end);
-            start = end;
-        }
-        waves
-    }
-
-    /// Selected bounded-completion policy, if this manifest requires one.
-    pub const fn completion_policy(&self) -> Option<CommunicationCompletionPolicy> {
-        self.completion
-    }
-}
-
-impl<'de> Deserialize<'de> for CommunicationManifest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            world_size: usize,
-            rank: usize,
-            groups: Vec<CommunicationGroupDescriptor>,
-            routes: Vec<CommunicationRouteDescriptor>,
-            #[serde(default)]
-            completion: Option<CommunicationCompletionPolicy>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        let manifest = Self::new(raw.world_size, raw.rank, raw.groups, raw.routes)
-            .map_err(serde::de::Error::custom)?;
-        Ok(match raw.completion {
-            Some(policy) => manifest.with_completion_policy(policy),
-            None => manifest,
-        })
-    }
+pub enum CommunicationProjectionError {
+    /// Invalid opaque descriptor or incompatible rank manifests.
+    #[error(transparent)]
+    Manifest(#[from] CommunicationManifestError),
+    /// Rank topology and complete topology disagree.
+    #[error("rank topology does not match the topology being projected")]
+    TopologyMismatch,
+    /// A validated core topology could not be projected consistently.
+    #[error("parallel topology could not be projected into communication descriptors")]
+    InvalidTopologyProjection,
+    /// The projected descriptor count cannot be represented by the stable ID.
+    #[error("communication descriptor count exceeds its stable ID representation")]
+    DescriptorCountOverflow,
 }
 
 /// Semantic inputs used only while projecting opaque communication descriptors.
@@ -1340,25 +113,25 @@ impl TopologyCommunicationPlan {
         &self,
         topology: ParallelTopology,
         rank: ParallelRankTopology,
-    ) -> Result<Option<CollectiveGroupId>, CommunicationManifestError> {
+    ) -> Result<Option<CollectiveGroupId>, CommunicationProjectionError> {
         if self.tensor_groups.is_none() {
             return Ok(None);
         }
         if rank.topology() != topology {
-            return Err(CommunicationManifestError::TopologyMismatch);
+            return Err(CommunicationProjectionError::TopologyMismatch);
         }
         let groups = unique_axis_groups(topology, ParallelAxis::Tensor)?;
         let subgroup = groups
             .iter()
             .position(|members| members.contains(&rank.global_rank()))
-            .ok_or(CommunicationManifestError::InvalidTopologyProjection)?;
+            .ok_or(CommunicationProjectionError::InvalidTopologyProjection)?;
         let first = 1usize + usize::from(self.session_group.is_some());
         let numeric = first
             .checked_add(subgroup)
-            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+            .ok_or(CommunicationProjectionError::DescriptorCountOverflow)?;
         Ok(Some(CollectiveGroupId::new(
             u32::try_from(numeric)
-                .map_err(|_| CommunicationManifestError::DescriptorCountOverflow)?,
+                .map_err(|_| CommunicationProjectionError::DescriptorCountOverflow)?,
         )))
     }
 
@@ -1414,9 +187,9 @@ pub fn project_communication_manifest(
     topology: ParallelTopology,
     rank: ParallelRankTopology,
     plan: &TopologyCommunicationPlan,
-) -> Result<CommunicationManifest, CommunicationManifestError> {
+) -> Result<CommunicationManifest, CommunicationProjectionError> {
     if rank.topology() != topology {
-        return Err(CommunicationManifestError::TopologyMismatch);
+        return Err(CommunicationProjectionError::TopologyMismatch);
     }
 
     let mut groups = Vec::new();
@@ -1446,13 +219,13 @@ pub fn project_communication_manifest(
             .iter()
             .enumerate()
             .find(|(_, members)| members.contains(&rank.global_rank()))
-            .ok_or(CommunicationManifestError::InvalidTopologyProjection)?;
+            .ok_or(CommunicationProjectionError::InvalidTopologyProjection)?;
         let numeric_id = next_group_id
             .checked_add(subgroup_index)
-            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+            .ok_or(CommunicationProjectionError::DescriptorCountOverflow)?;
         let id = CollectiveGroupId::new(
             u32::try_from(numeric_id)
-                .map_err(|_| CommunicationManifestError::DescriptorCountOverflow)?,
+                .map_err(|_| CommunicationProjectionError::DescriptorCountOverflow)?,
         );
         let local_index = members
             .iter()
@@ -1466,23 +239,23 @@ pub fn project_communication_manifest(
         )?);
         next_group_id = next_group_id
             .checked_add(axis_groups.len())
-            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+            .ok_or(CommunicationProjectionError::DescriptorCountOverflow)?;
     }
 
     if let Some(requirements) = &plan.pipeline_stage_groups {
         let width = topology
             .tensor()
             .checked_mul(topology.expert())
-            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+            .ok_or(CommunicationProjectionError::DescriptorCountOverflow)?;
         let stage = rank.global_rank() / width;
         let start = stage * width;
         let numeric = next_group_id
             .checked_add(stage)
-            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+            .ok_or(CommunicationProjectionError::DescriptorCountOverflow)?;
         groups.push(CommunicationGroupDescriptor::new(
             CollectiveGroupId::new(
                 u32::try_from(numeric)
-                    .map_err(|_| CommunicationManifestError::DescriptorCountOverflow)?,
+                    .map_err(|_| CommunicationProjectionError::DescriptorCountOverflow)?,
             ),
             groups.len(),
             (start..start + width).collect(),
@@ -1496,13 +269,13 @@ pub fn project_communication_manifest(
         for source in 0..topology.world_size() {
             let coordinates = topology
                 .coordinates(source)
-                .map_err(|_| CommunicationManifestError::InvalidTopologyProjection)?;
+                .map_err(|_| CommunicationProjectionError::InvalidTopologyProjection)?;
             if coordinates.pipeline() + 1 == topology.pipeline() {
                 continue;
             }
             let destination = topology
                 .rank_for(coordinates.with_pipeline(coordinates.pipeline() + 1))
-                .map_err(|_| CommunicationManifestError::InvalidTopologyProjection)?;
+                .map_err(|_| CommunicationProjectionError::InvalidTopologyProjection)?;
             let id = CommunicationRouteId::new(routes.len() as u64);
             routes.push(CommunicationRouteDescriptor::new(
                 id,
@@ -1526,111 +299,16 @@ pub fn project_communication_manifest(
 pub fn project_all_communication_manifests(
     topology: ParallelTopology,
     plan: &TopologyCommunicationPlan,
-) -> Result<Vec<CommunicationManifest>, CommunicationManifestError> {
+) -> Result<Vec<CommunicationManifest>, CommunicationProjectionError> {
     let manifests = (0..topology.world_size())
         .map(|global_rank| {
             let rank = ParallelRankTopology::new(topology, global_rank)
-                .map_err(|_| CommunicationManifestError::InvalidTopologyProjection)?;
+                .map_err(|_| CommunicationProjectionError::InvalidTopologyProjection)?;
             project_communication_manifest(topology, rank, plan)
         })
         .collect::<Result<Vec<_>, _>>()?;
     validate_compatible_communication_manifests(&manifests)?;
     Ok(manifests)
-}
-
-/// Proves that all ranks derived identical global descriptors and exact local indices.
-pub fn validate_compatible_communication_manifests(
-    manifests: &[CommunicationManifest],
-) -> Result<(), CommunicationManifestError> {
-    let Some(reference) = manifests.first() else {
-        return Err(CommunicationManifestError::MissingRankManifest { rank: 0 });
-    };
-    if manifests.len() != reference.world_size() {
-        return Err(CommunicationManifestError::WrongManifestCount {
-            expected: reference.world_size(),
-            actual: manifests.len(),
-        });
-    }
-    let mut ranks = vec![None; reference.world_size()];
-    for manifest in manifests {
-        if manifest.world_size() != reference.world_size()
-            || manifest.rank() >= reference.world_size()
-        {
-            return Err(CommunicationManifestError::IncompatibleRankManifest {
-                rank: manifest.rank(),
-            });
-        }
-        let rank = manifest.rank();
-        if ranks[rank].replace(manifest).is_some() {
-            return Err(CommunicationManifestError::DuplicateRankManifest { rank });
-        }
-    }
-    let ranks = ranks
-        .into_iter()
-        .enumerate()
-        .map(|(rank, manifest)| {
-            manifest.ok_or(CommunicationManifestError::MissingRankManifest { rank })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let group_count = reference.groups().len();
-    let mut ids_across_orders = BTreeSet::new();
-    for (rank, manifest) in ranks.iter().copied().enumerate() {
-        if manifest.routes() != reference.routes()
-            || manifest.groups().len() != group_count
-            || manifest.completion_policy() != reference.completion_policy()
-        {
-            return Err(CommunicationManifestError::IncompatibleRankManifest { rank });
-        }
-    }
-    for order in 0..group_count {
-        let mut subgroup_ids = BTreeSet::new();
-        let mut covered = vec![false; reference.world_size()];
-        for (rank, manifest) in ranks.iter().copied().enumerate() {
-            let group = &manifest.groups()[order];
-            if group.creation_order() != order
-                || group.local_index() != group.members().iter().position(|member| *member == rank)
-            {
-                return Err(CommunicationManifestError::IncompatibleRankManifest { rank });
-            }
-            if subgroup_ids.insert(group.id()) {
-                if !ids_across_orders.insert(group.id()) {
-                    return Err(CommunicationManifestError::IncompatibleRankManifest { rank });
-                }
-                for member in group.members() {
-                    if covered[*member] {
-                        return Err(CommunicationManifestError::IncompatibleRankManifest { rank });
-                    }
-                    covered[*member] = true;
-                }
-            }
-            for member in group.members() {
-                if *member >= ranks.len() {
-                    return Err(CommunicationManifestError::IncompatibleRankManifest { rank });
-                }
-                let peer = &ranks[*member].groups()[order];
-                if peer.id() != group.id()
-                    || peer.creation_order() != group.creation_order()
-                    || peer.members() != group.members()
-                    || peer.requirements() != group.requirements()
-                {
-                    return Err(CommunicationManifestError::IncompatibleRankManifest {
-                        rank: *member,
-                    });
-                }
-            }
-        }
-        if covered.contains(&false) {
-            return Err(CommunicationManifestError::IncompatibleRankManifest { rank: 0 });
-        }
-    }
-    for (rank, manifest) in ranks.iter().copied().enumerate() {
-        for group in manifest.groups() {
-            if group.local_index().is_none() {
-                return Err(CommunicationManifestError::IncompatibleRankManifest { rank });
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Gathers and cross-validates one complete opaque manifest from every world rank.
@@ -1785,84 +463,6 @@ fn gather_manifest_words<T: ConsensusTransport>(
     Ok(gathered)
 }
 
-/// Backend capability limits for exact opaque communication mechanisms.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CommunicationCapabilities {
-    operations: Vec<CommunicationOperationRequirement>,
-    completion: Option<CommunicationCompletionCapabilities>,
-    boundary_framing: Vec<BoundaryFramingProtocol>,
-    world_boundary_broadcast: bool,
-}
-
-/// Backend support for realizing logical groups and directed routes over one
-/// already-created world communicator.
-///
-/// This describes reachability only. Operation, dtype, size, framing, and
-/// completion support remain in [`CommunicationCapabilities`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum CommunicationTopologyCapabilities {
-    /// The backend can create every validated logical subgroup and route
-    /// directly, without requiring unrelated world ranks to participate.
-    FullyConnected,
-    /// Direct logical communication is limited to neighboring world ranks.
-    /// Other groups and endpoint routes require a disjoint same-operation world
-    /// wave. Explicit world-participating boundary broadcasts use their own
-    /// advertised mechanism and singleton route order.
-    RingWithWorldWaves,
-}
-
-/// Communication descriptors and world-wave proofs validated before native
-/// subgroup or route resources are created.
-#[derive(Debug, Clone)]
-pub struct PreparedCommunicationRealization {
-    manifest: CommunicationManifest,
-    group_world_waves: Vec<bool>,
-    route_world_waves: Vec<bool>,
-}
-
-impl PreparedCommunicationRealization {
-    /// Exact rank-local manifest retained by this realization.
-    pub const fn manifest(&self) -> &CommunicationManifest {
-        &self.manifest
-    }
-
-    /// Whether one group may use a complete-world collective wave.
-    pub fn group_world_wave(&self, creation_order: usize) -> Option<bool> {
-        self.group_world_waves.get(creation_order).copied()
-    }
-
-    /// Whether one directed route may use a complete-world collective wave.
-    pub fn route_world_wave(&self, submission_order: usize) -> Option<bool> {
-        self.route_world_waves.get(submission_order).copied()
-    }
-
-    /// Invokes a mechanism-only callback for every checked group in order.
-    pub fn try_create_groups<T, E>(
-        &self,
-        mut create: impl FnMut(&CommunicationGroupDescriptor, bool) -> Result<T, E>,
-    ) -> Result<Vec<T>, E> {
-        self.manifest
-            .groups()
-            .iter()
-            .zip(self.group_world_waves.iter().copied())
-            .map(|(descriptor, world_wave)| create(descriptor, world_wave))
-            .collect()
-    }
-
-    /// Invokes a mechanism-only callback for every checked route in order.
-    pub fn try_create_routes<T, E>(
-        &self,
-        mut create: impl FnMut(&CommunicationRouteDescriptor, bool) -> Result<T, E>,
-    ) -> Result<Vec<T>, E> {
-        self.manifest
-            .routes()
-            .iter()
-            .zip(self.route_world_waves.iter().copied())
-            .map(|(descriptor, world_wave)| create(descriptor, world_wave))
-            .collect()
-    }
-}
-
 /// Failure while converting compatible manifests into a native-resource-free
 /// communication realization.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -1874,6 +474,9 @@ pub enum CommunicationRealizationError {
     /// Required operation, completion, or reachability support is unavailable.
     #[error(transparent)]
     Capability(#[from] CommunicationCapabilityError),
+    /// The selected choices could not be bound to the native descriptors.
+    #[error(transparent)]
+    Binding(#[from] CommunicationBindingGeometryError),
     /// The separately supplied local manifest differs from its agreed rank entry.
     #[error("local communication manifest differs from the agreed rank projection")]
     LocalManifestMismatch,
@@ -1886,7 +489,7 @@ pub fn prepare_communication_realization(
     compatible_manifests: &[CommunicationManifest],
     capabilities: &CommunicationCapabilities,
     topology: CommunicationTopologyCapabilities,
-) -> Result<PreparedCommunicationRealization, CommunicationRealizationError> {
+) -> Result<CommunicationBindings, CommunicationRealizationError> {
     validate_compatible_communication_manifests(compatible_manifests)?;
     let agreed = compatible_manifests
         .iter()
@@ -1938,11 +541,62 @@ pub fn prepare_communication_realization(
         }
     }
 
-    Ok(PreparedCommunicationRealization {
-        manifest: manifest.clone(),
-        group_world_waves: selected_group_waves,
-        route_world_waves: selected_route_waves,
-    })
+    CommunicationBindings::new(manifest.clone(), selected_group_waves, selected_route_waves)
+        .map_err(Into::into)
+}
+
+/// Failure agreeing the world setup or preparing its rank-local realization.
+#[derive(Debug, thiserror::Error)]
+pub enum CommunicationSetupError<E: std::error::Error> {
+    /// Ranks failed to agree on a compatible world.
+    #[error(transparent)]
+    Consensus(#[from] CommunicationManifestConsensusError<E>),
+    /// Agreed topology exceeds the native communication capabilities.
+    #[error(transparent)]
+    Realization(#[from] CommunicationRealizationError),
+    /// An agreed descriptor cannot be represented from this rank.
+    #[error(transparent)]
+    Manifest(#[from] CommunicationManifestError),
+    /// Could not establish the final native binding.
+    #[error(transparent)]
+    Binding(#[from] CommunicationBindingError),
+}
+
+/// Agrees exact opaque manifests and plans native handles before allocation.
+pub fn prepare_world_communication<T: CommunicationSetupTransport>(
+    transport: T,
+    manifest: &CommunicationManifest,
+) -> Result<WorldCommunicationBinding<T>, CommunicationSetupError<T::Error>> {
+    let agreed = establish_communication_session(&transport, manifest, transport.setup_nonce())?;
+    let (identity, manifests) = agreed.into_parts();
+    let realization = prepare_communication_realization(
+        manifest,
+        &manifests,
+        &transport.capabilities(),
+        transport.topology_capabilities(),
+    )?;
+    let mut descriptors = std::collections::BTreeMap::new();
+    for group in manifests.iter().flat_map(CommunicationManifest::groups) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = descriptors.entry(group.id()) {
+            entry.insert(CommunicationGroupDescriptor::new(
+                group.id(),
+                group.creation_order(),
+                group.members().to_vec(),
+                group
+                    .members()
+                    .iter()
+                    .position(|rank| *rank == manifest.rank()),
+                group.requirements().clone(),
+            )?);
+        }
+    }
+    WorldCommunicationBinding::new(
+        transport,
+        realization,
+        descriptors.into_values().collect(),
+        identity,
+    )
+    .map_err(Into::into)
 }
 
 /// Returns complete-world collective-wave proofs for each compatible group order.
@@ -1972,13 +626,58 @@ pub fn compatible_group_world_wave_proofs(manifests: &[CommunicationManifest]) -
         .collect()
 }
 
+/// Returns the manifest-proven route submission waves in canonical order.
+///
+/// A multi-route wave is selected only when one contiguous batch has an
+/// identical mechanical contract, disjoint endpoints, and covers every
+/// world rank exactly once. Such logical endpoint groups may share one
+/// world-backed native collective ordinal. Routes without that proof stay
+/// in singleton waves and retain ordinary sequential point-to-point order.
+pub(crate) fn route_submission_waves(manifest: &CommunicationManifest) -> Vec<Range<usize>> {
+    let mut waves = Vec::new();
+    let mut start = 0;
+    while start < manifest.routes().len() {
+        let reference = &manifest.routes()[start];
+        if reference.world_broadcast() {
+            waves.push(start..start + 1);
+            start += 1;
+            continue;
+        }
+        let mut endpoints = vec![false; manifest.world_size()];
+        let mut end = start;
+        while end < manifest.routes().len() {
+            let route = &manifest.routes()[end];
+            if route.world_broadcast()
+                || route.requirement() != reference.requirement()
+                || route.boundary_contract() != reference.boundary_contract()
+                || endpoints[route.source()]
+                || endpoints[route.destination()]
+            {
+                break;
+            }
+            endpoints[route.source()] = true;
+            endpoints[route.destination()] = true;
+            end += 1;
+            if endpoints.iter().all(|endpoint| *endpoint) {
+                break;
+            }
+        }
+        if !endpoints.iter().all(|endpoint| *endpoint) {
+            end = start + 1;
+        }
+        waves.push(start..end);
+        start = end;
+    }
+    waves
+}
+
 /// Returns complete-world collective-wave proofs for each route submission order.
 ///
 /// Production backends should normally consume these through
 /// [`prepare_communication_realization`].
 pub fn route_world_wave_proofs(manifest: &CommunicationManifest) -> Vec<bool> {
     let mut proofs = vec![false; manifest.routes().len()];
-    for wave in manifest.route_submission_waves() {
+    for wave in route_submission_waves(&manifest) {
         let mut members = vec![false; manifest.world_size()];
         for route in &manifest.routes()[wave.clone()] {
             members[route.source()] = true;
@@ -1995,324 +694,21 @@ fn ring_neighbors(left: usize, right: usize, world_size: usize) -> bool {
     world_size > 1 && ((left + 1) % world_size == right || (right + 1) % world_size == left)
 }
 
-impl CommunicationCapabilities {
-    /// Validates one capability entry per operation.
-    pub fn new(
-        operations: impl IntoIterator<Item = CommunicationOperationRequirement>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let operations = operations.into_iter().collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
-        if operations.iter().any(|capability| {
-            capability.validate().is_err() || !seen.insert(capability.operation())
-        }) {
-            return Err(CommunicationManifestError::DuplicateOrMissingOperation);
-        }
-        Ok(Self {
-            operations,
-            completion: None,
-            boundary_framing: Vec::new(),
-            world_boundary_broadcast: false,
-        })
-    }
-
-    /// Advertises exact framed source broadcasts with explicit world participation.
-    pub fn with_world_boundary_broadcast(mut self) -> Self {
-        self.world_boundary_broadcast = true;
-        self
-    }
-
-    /// Advertises exact in-band boundary protocols implemented by the backend.
-    pub fn with_boundary_framing(
-        mut self,
-        protocols: impl IntoIterator<Item = BoundaryFramingProtocol>,
-    ) -> Result<Self, CommunicationManifestError> {
-        let protocols = protocols.into_iter().collect::<Vec<_>>();
-        if protocols.is_empty()
-            || protocols
-                .iter()
-                .enumerate()
-                .any(|(index, protocol)| protocols[..index].contains(protocol))
-        {
-            return Err(CommunicationManifestError::InvalidBoundaryContract);
-        }
-        self.boundary_framing = protocols;
-        Ok(self)
-    }
-
-    /// Attaches backend support for bounded completion timeout dispositions.
-    pub fn with_completion_capabilities(
-        mut self,
-        completion: CommunicationCompletionCapabilities,
-    ) -> Self {
-        self.completion = Some(completion);
-        self
-    }
-
-    /// Validates every manifest requirement against these generic mechanisms.
-    pub fn validate_manifest(
-        &self,
-        manifest: &CommunicationManifest,
-    ) -> Result<(), CommunicationCapabilityError> {
-        if !manifest.groups().is_empty() || !manifest.routes().is_empty() {
-            let policy = manifest
-                .completion_policy()
-                .ok_or(CommunicationCapabilityError::MissingSelectedCompletionPolicy)?;
-            let completion = self
-                .completion
-                .as_ref()
-                .ok_or(CommunicationCapabilityError::MissingBoundedCompletion)?;
-            if !completion.supports(policy) {
-                return Err(CommunicationCapabilityError::UnsupportedCancellationMode {
-                    cancellation: policy.cancellation(),
-                });
-            }
-        }
-        for group in manifest.groups() {
-            for requirement in group.requirements().operations() {
-                self.validate_requirement(requirement)?;
-            }
-        }
-        for route in manifest.routes() {
-            if route.world_broadcast() && !self.world_boundary_broadcast {
-                return Err(CommunicationCapabilityError::MissingWorldBoundaryBroadcast);
-            }
-            self.validate_requirement(route.requirement())?;
-            if let Some(boundary) = route.boundary_contract() {
-                if !self.boundary_framing.contains(&boundary.protocol) {
-                    return Err(CommunicationCapabilityError::MissingBoundaryFraming {
-                        protocol: boundary.protocol,
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Checks one exact operation, dtype, payload bound and completion requirement.
-    /// This performs no native allocation or communication; callers retain ownership
-    /// of group membership and the selected bounded completion policy.
-    pub fn validate_requirement(
-        &self,
-        requirement: &CommunicationOperationRequirement,
-    ) -> Result<(), CommunicationCapabilityError> {
-        validate_operation_requirement(&self.operations, requirement)
-    }
-}
-
-fn validate_operation_requirement(
-    operations: &[CommunicationOperationRequirement],
-    requirement: &CommunicationOperationRequirement,
-) -> Result<(), CommunicationCapabilityError> {
-    let capability = operations
-        .iter()
-        .find(|capability| capability.operation() == requirement.operation())
-        .ok_or(CommunicationCapabilityError::MissingOperation {
-            operation: requirement.operation(),
-        })?;
-    for dtype in requirement.dtypes() {
-        if !capability.dtypes().contains(dtype) {
-            return Err(CommunicationCapabilityError::UnsupportedDtype {
-                operation: requirement.operation(),
-                dtype: dtype.clone(),
-            });
-        }
-    }
-    match (capability.limits(), requirement.limits()) {
-        (Some(available), Some(required)) if available.covers(required) => {}
-        (None, None) => {}
-        _ => {
-            return Err(CommunicationCapabilityError::InsufficientLimits {
-                operation: requirement.operation(),
-            });
-        }
-    }
-    if requirement.exact_completion() && !capability.exact_completion() {
-        return Err(CommunicationCapabilityError::MissingExactCompletion {
-            operation: requirement.operation(),
-        });
-    }
-    Ok(())
-}
-
 fn unique_axis_groups(
     topology: ParallelTopology,
     axis: ParallelAxis,
-) -> Result<Vec<Vec<usize>>, CommunicationManifestError> {
+) -> Result<Vec<Vec<usize>>, CommunicationProjectionError> {
     let mut seen = BTreeSet::new();
     let mut groups = Vec::new();
     for rank in 0..topology.world_size() {
         let members = topology
             .axis_members(rank, axis)
-            .map_err(|_| CommunicationManifestError::InvalidTopologyProjection)?;
+            .map_err(|_| CommunicationProjectionError::InvalidTopologyProjection)?;
         if seen.insert(members.clone()) {
             groups.push(members);
         }
     }
     Ok(groups)
-}
-
-fn contains_duplicate_dtypes(dtypes: &[TensorDtype]) -> bool {
-    dtypes
-        .iter()
-        .enumerate()
-        .any(|(index, dtype)| dtypes[..index].contains(dtype))
-}
-
-/// Invalid opaque communication manifest or topology projection.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum CommunicationManifestError {
-    /// A role-exact route schema is empty, incoherent, or not representable.
-    #[error("communication boundary framing contract is invalid")]
-    InvalidBoundaryContract,
-    /// Manifest rank is outside the declared world.
-    #[error("communication rank {rank} is outside world size {world_size}")]
-    RankOutOfRange {
-        /// Invalid rank.
-        rank: usize,
-        /// Declared world size.
-        world_size: usize,
-    },
-    /// Rank topology and complete topology disagree.
-    #[error("rank topology does not match the topology being projected")]
-    TopologyMismatch,
-    /// A validated core topology could not be projected consistently.
-    #[error("parallel topology could not be projected into communication descriptors")]
-    InvalidTopologyProjection,
-    /// Tensor/count limits were absent or incoherent for the operation.
-    #[error("communication operation has invalid tensor or per-peer limits")]
-    InvalidOperationLimits,
-    /// Dtype requirements were empty or repeated.
-    #[error("communication operation tensor dtypes must be non-empty and unique")]
-    InvalidOperationDtypes,
-    /// A bounded completion policy has no positive representable deadline.
-    #[error("communication completion policy must have a positive millisecond deadline")]
-    InvalidCompletionPolicy,
-    /// Completion capability modes were absent or repeated.
-    #[error("communication completion capabilities must be non-empty and unique")]
-    InvalidCompletionCapabilities,
-    /// A group requirement was empty or repeated an operation.
-    #[error("communication group operations must be non-empty and unique")]
-    DuplicateOrMissingOperation,
-    /// A group has no members.
-    #[error("communication group {id:?} has no members")]
-    EmptyGroup {
-        /// Invalid group.
-        id: CollectiveGroupId,
-    },
-    /// A group repeats a world rank.
-    #[error("communication group {id:?} repeats a world rank")]
-    DuplicateGroupMember {
-        /// Invalid group.
-        id: CollectiveGroupId,
-    },
-    /// A group member is outside the manifest world.
-    #[error("communication group {id:?} contains a rank outside world size {world_size}")]
-    GroupMemberOutOfRange {
-        /// Invalid group.
-        id: CollectiveGroupId,
-        /// Declared world size.
-        world_size: usize,
-    },
-    /// A group local index does not identify the manifest rank exactly.
-    #[error("communication group {id:?} has the wrong local member index")]
-    WrongLocalIndex {
-        /// Invalid group.
-        id: CollectiveGroupId,
-    },
-    /// Group IDs are not unique.
-    #[error("communication group ID {id:?} is repeated")]
-    DuplicateGroupId {
-        /// Repeated group identity.
-        id: CollectiveGroupId,
-    },
-    /// Group descriptors are not in their declared canonical order.
-    #[error("communication group {id:?} has creation order {actual}, expected {expected}")]
-    WrongGroupOrder {
-        /// Invalid group.
-        id: CollectiveGroupId,
-        /// Required position.
-        expected: usize,
-        /// Declared position.
-        actual: usize,
-    },
-    /// A route is not directed between distinct endpoints.
-    #[error("communication route {id:?} must have distinct endpoints")]
-    InvalidRouteEndpoints {
-        /// Invalid route.
-        id: CommunicationRouteId,
-    },
-    /// A route carries a non-point-to-point operation.
-    #[error("communication route {id:?} must require send/receive")]
-    InvalidRouteOperation {
-        /// Invalid route.
-        id: CommunicationRouteId,
-    },
-    /// A route endpoint is outside the manifest world.
-    #[error("communication route {id:?} contains an endpoint outside world size {world_size}")]
-    RouteEndpointOutOfRange {
-        /// Invalid route.
-        id: CommunicationRouteId,
-        /// Declared world size.
-        world_size: usize,
-    },
-    /// Route IDs are not unique.
-    #[error("communication route ID {id:?} is repeated")]
-    DuplicateRouteId {
-        /// Repeated route identity.
-        id: CommunicationRouteId,
-    },
-    /// Route descriptors are not in their declared canonical order.
-    #[error("communication route {id:?} has submission order {actual}, expected {expected}")]
-    WrongRouteOrder {
-        /// Invalid route.
-        id: CommunicationRouteId,
-        /// Required position.
-        expected: usize,
-        /// Declared position.
-        actual: usize,
-    },
-    /// The number of per-rank projections does not match the world.
-    #[error("communication projection has {actual} manifests, expected {expected}")]
-    WrongManifestCount {
-        /// Expected world size.
-        expected: usize,
-        /// Actual manifest count.
-        actual: usize,
-    },
-    /// No manifest was supplied for a world rank.
-    #[error("communication projection is missing rank {rank}")]
-    MissingRankManifest {
-        /// Missing world rank.
-        rank: usize,
-    },
-    /// More than one manifest was supplied for a world rank.
-    #[error("communication projection repeats rank {rank}")]
-    DuplicateRankManifest {
-        /// Repeated world rank.
-        rank: usize,
-    },
-    /// A rank derived different global descriptors or local positions.
-    #[error("communication projection for rank {rank} is incompatible with its peers")]
-    IncompatibleRankManifest {
-        /// Incompatible world rank.
-        rank: usize,
-    },
-    /// The projected descriptor count cannot be represented by the stable ID.
-    #[error("communication descriptor count exceeds its stable ID representation")]
-    DescriptorCountOverflow,
-    /// Variable exchange counts do not match opaque group membership.
-    #[error(
-        "communication peer counts have send length {send} and receive length {receive}, expected {group_size}"
-    )]
-    InvalidPeerCounts {
-        /// Expected opaque group cardinality.
-        group_size: usize,
-        /// Supplied send-count cardinality.
-        send: usize,
-        /// Supplied receive-count cardinality.
-        receive: usize,
-    },
 }
 
 /// Failure while exchanging or validating complete rank-local manifests.
@@ -2394,77 +790,6 @@ pub enum CommunicationManifestConsensusError<E = std::convert::Infallible> {
     /// The reconstructed rank manifests are not mutually compatible.
     #[error(transparent)]
     Manifest(#[from] CommunicationManifestError),
-}
-
-/// Missing or insufficient generic communication mechanism capability.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum CommunicationCapabilityError {
-    /// The backend has no exact framed world-participation transport.
-    #[error("backend does not support world-participating boundary broadcasts")]
-    MissingWorldBoundaryBroadcast,
-    /// A logical group cannot be realized directly or as a proven world wave.
-    #[error("communication group {id:?} is unreachable with the selected topology mechanisms")]
-    UnreachableGroup {
-        /// Unreachable group.
-        id: CollectiveGroupId,
-    },
-    /// A directed route cannot be realized directly or as a proven world wave.
-    #[error(
-        "communication route {id:?} ({source_rank} -> {destination_rank}) is unreachable with the selected topology mechanisms"
-    )]
-    UnreachableRoute {
-        /// Unreachable route.
-        id: CommunicationRouteId,
-        /// Source world rank.
-        source_rank: usize,
-        /// Destination world rank.
-        destination_rank: usize,
-    },
-    /// A route selected an in-band framing protocol unavailable in the backend.
-    #[error("boundary framing protocol {protocol:?} is unavailable")]
-    MissingBoundaryFraming {
-        /// Selected protocol.
-        protocol: BoundaryFramingProtocol,
-    },
-    /// The manifest requires bounded completion but the backend did not advertise it.
-    #[error("bounded communication completion is unavailable")]
-    MissingBoundedCompletion,
-    /// A manifest selects communication resources but no bounded completion policy.
-    #[error("communication manifest has no selected bounded completion policy")]
-    MissingSelectedCompletionPolicy,
-    /// The backend cannot safely apply the selected timeout disposition.
-    #[error("communication completion cannot apply cancellation mode {cancellation:?}")]
-    UnsupportedCancellationMode {
-        /// Selected but unavailable timeout disposition.
-        cancellation: CompletionCancellationMode,
-    },
-    /// The exact operation is unavailable.
-    #[error("communication operation {operation:?} is unavailable")]
-    MissingOperation {
-        /// Missing operation.
-        operation: CommunicationOperation,
-    },
-    /// The operation cannot carry one required dtype.
-    #[error("communication operation {operation:?} does not support dtype {dtype:?}")]
-    UnsupportedDtype {
-        /// Required operation.
-        operation: CommunicationOperation,
-        /// Unsupported dtype.
-        dtype: TensorDtype,
-    },
-    /// Tensor shape or count limits are too small.
-    #[error("communication operation {operation:?} has insufficient tensor or count limits")]
-    InsufficientLimits {
-        /// Required operation.
-        operation: CommunicationOperation,
-    },
-    /// Exact completion is required but unavailable.
-    #[error("communication operation {operation:?} lacks exact completion")]
-    MissingExactCompletion {
-        /// Required operation.
-        operation: CommunicationOperation,
-    },
 }
 
 #[cfg(test)]
@@ -2752,7 +1077,9 @@ mod tests {
                 owner_rank: 3,
             }),
             Some(selected_id),
-            crate::PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            crate::PipelineWireContract::new(
+                eredu_core::communication::PipelineActivationDtype::Float32,
+            ),
         )
         .unwrap();
         assert_eq!(execution.publication().unwrap().group, selected_id);
@@ -2889,8 +1216,20 @@ mod tests {
                 .with_tensor_groups(group_requirements(CommunicationOperation::AllReduceSum)),
         )
         .unwrap();
-        manifests[1].groups[0].members.swap(0, 1);
-        manifests[1].groups[0].local_index = Some(0);
+        let original = &manifests[1].groups()[0];
+        let mut members = original.members().to_vec();
+        members.swap(0, 1);
+        let group = CommunicationGroupDescriptor::new(
+            original.id(),
+            original.creation_order(),
+            members,
+            Some(0),
+            original.requirements().clone(),
+        )
+        .unwrap();
+        manifests[1] = CommunicationManifest::new(2, 1, vec![group], vec![])
+            .unwrap()
+            .with_completion_policy(test_completion_policy());
         assert_eq!(
             validate_compatible_communication_manifests(&manifests),
             Err(CommunicationManifestError::IncompatibleRankManifest { rank: 1 })
@@ -2907,8 +1246,8 @@ mod tests {
                 .with_tensor_groups(group_requirements(CommunicationOperation::AllReduceSum)),
         )
         .unwrap();
-        let rank_one = &manifests[1].groups[0];
-        manifests[1].groups[0] = CommunicationGroupDescriptor::new(
+        let rank_one = &manifests[1].groups()[0];
+        let group = CommunicationGroupDescriptor::new(
             rank_one.id(),
             rank_one.creation_order(),
             rank_one.members().to_vec(),
@@ -2923,6 +1262,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        manifests[1] = CommunicationManifest::new(2, 1, vec![group], vec![])
+            .unwrap()
+            .with_completion_policy(test_completion_policy());
         let transport = ScriptedManifestTransport::new(&manifests);
 
         assert_eq!(
@@ -3048,13 +1390,18 @@ mod tests {
 
     #[test]
     fn variable_peer_counts_preserve_zeroes_and_exact_member_order() {
-        let counts = CommunicationPeerCounts::new(vec![0, 3, 1], vec![2, 0, 2], 3).unwrap();
+        let counts = eredu_core::communication::CommunicationPeerCounts::new(
+            vec![0, 3, 1],
+            vec![2, 0, 2],
+            3,
+        )
+        .unwrap();
         assert_eq!(counts.send(), [0, 3, 1]);
         assert_eq!(counts.receive(), [2, 0, 2]);
         assert_eq!(counts.group_size(), 3);
         assert_eq!(
-            CommunicationPeerCounts::new(vec![1], vec![1, 0], 2),
-            Err(CommunicationManifestError::InvalidPeerCounts {
+            eredu_core::communication::CommunicationPeerCounts::new(vec![1], vec![1, 0], 2),
+            Err(eredu_core::communication::CommunicationPeerCountsError {
                 group_size: 2,
                 send: 1,
                 receive: 2,
@@ -3350,8 +1697,8 @@ mod tests {
             (0..4).map(|rank| route(rank, rank + 4, rank)).collect(),
         )
         .unwrap();
-        assert_eq!(complete.route_submission_waves().len(), 1);
-        assert_eq!(complete.route_submission_waves()[0], 0..4);
+        assert_eq!(route_submission_waves(&complete).len(), 1);
+        assert_eq!(route_submission_waves(&complete)[0], 0..4);
 
         let omitted = CommunicationManifest::new(
             8,
@@ -3360,7 +1707,7 @@ mod tests {
             (0..3).map(|rank| route(rank, rank + 4, rank)).collect(),
         )
         .unwrap();
-        assert_eq!(omitted.route_submission_waves(), [0..1, 1..2, 2..3]);
+        assert_eq!(route_submission_waves(&omitted), [0..1, 1..2, 2..3]);
 
         let overlapping = CommunicationManifest::new(
             8,
@@ -3375,7 +1722,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            overlapping.route_submission_waves(),
+            route_submission_waves(&overlapping),
             [0..1, 1..2, 2..3, 3..4]
         );
     }
@@ -3479,8 +1826,7 @@ mod tests {
         let decoded: CommunicationManifest =
             serde_json::from_slice(&serde_json::to_vec(prepared.manifest()).unwrap()).unwrap();
         assert_eq!(&decoded, prepared.manifest());
-        assert!(decoded
-            .route_submission_waves()
+        assert!(route_submission_waves(&decoded)
             .iter()
             .all(|wave| wave.len() == 1));
     }
@@ -3514,15 +1860,13 @@ mod tests {
             .enumerate()
             .all(|(order, _)| prepared.route_world_wave(order) == Some(true)));
 
-        let calls = std::cell::Cell::new(0usize);
         let routes = prepared
-            .try_create_routes(|descriptor, world_wave| {
-                calls.set(calls.get() + 1);
+            .routes()
+            .map(|(descriptor, world_wave)| {
                 assert!(world_wave);
-                Ok::<_, std::convert::Infallible>(descriptor.id())
+                descriptor.id()
             })
-            .unwrap();
-        assert_eq!(calls.get(), prepared.manifest().routes().len());
-        assert_eq!(routes.len(), calls.get());
+            .collect::<Vec<_>>();
+        assert_eq!(routes.len(), prepared.manifest().routes().len());
     }
 }

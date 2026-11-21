@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
         max_bytes: 32 * 1024 * 1024,
     }));
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &artifact, &plan)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &artifact, &plan, None)?
             .into_parts();
 
     // The report supplies requested/effective policy, scope and eligibility;

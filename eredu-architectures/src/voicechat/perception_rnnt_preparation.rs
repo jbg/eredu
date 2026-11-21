@@ -1,4 +1,5 @@
 //! Cold composition of perception and transcription sources and distributed authority.
+
 use super::{
     perception_distribution::PreparedPerceptionPipelineBindings,
     perception_layered::PerceptionRuntimeState,
@@ -14,14 +15,19 @@ use super::{
     rnnt_projection_layered::RnntProjection,
     rnnt_projection_preparation::PreparedRnntProjectionBindings,
 };
+use eredu_core::communication::CommunicationOperation;
+use eredu_core::communication::{
+    CommunicationCapabilities, CommunicationCapabilityError, CommunicationGroupDescriptor,
+    CommunicationManifest, CommunicationManifestError, CommunicationOperationRequirement,
+    CommunicationTensorLimits,
+};
+use eredu_core::residency::parameter_binding::WeightBinding;
+use eredu_core::SubmissionBackend;
 use eredu_core::{checkpoint::TensorDtype, BackendFailure, CollectiveGroupId};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     replicated_execution::{validate_coordination, CoordinationError, ReplicatedCoordinator},
-    CommunicationCapabilities, CommunicationCapabilityError, CommunicationGroupDescriptor,
-    CommunicationManifest, CommunicationManifestError, CommunicationOperation,
-    CommunicationOperationRequirement, CommunicationTensorLimits, ComponentRankMechanisms,
-    LayeredTensorCohort, SubmissionBackend, WeightBinding,
+    ComponentRankMechanisms, LayeredTensorCohort,
 };
 use std::collections::BTreeSet;
 

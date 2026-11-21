@@ -7,14 +7,7 @@ use eredu_checkpoint::{
 use eredu_core::residency::OffloadUnitRange;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Source representation used by a scalar recipe, without artifact identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowScaleSource {
-    /// Logical and physical tensor geometry. Shard paths are discarded at admission.
-    pub metadata: TensorMetadata,
-    /// Exact container encoding required by the materializer.
-    pub encoding: eredu_checkpoint::SourceTensorEncoding,
-}
+pub use eredu_core::preparation::rows::RowScaleSource;
 
 /// Exact scalar recipe and physical headers; this catalog has no payload methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +189,20 @@ impl RowLookupDescriptor {
     pub fn limits(&self) -> RowLookupLimits {
         self.limits
     }
+    pub(crate) fn native_request(&self) -> eredu_core::preparation::rows::RowDecodeRequest<'_> {
+        use eredu_core::preparation::rows::{RowDecodeRequest, RowScalarMaterialization};
+
+        RowDecodeRequest {
+            rows: self.maximum_acquisition_rows(),
+            encoded_row_bytes: self.range.bytes(),
+            geometry: self.spec.decode_geometry(),
+            scalar: self.scale.as_ref().map(|scale| RowScalarMaterialization {
+                recipe: scale.recipe(),
+                sources: scale.catalog(),
+            }),
+        }
+    }
+
     /// Largest distinct-row acquisition allowed by all limits.
     pub fn maximum_acquisition_rows(&self) -> u64 {
         self.spec

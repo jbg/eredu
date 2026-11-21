@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::lfm3::audio::encoder::MEL_BINS;
+use eredu_core::execution_control::SnapshotRetention;
 use eredu_media::audio::power_mel::{PowerMel, PowerMelState};
 
 const BINS: usize = MEL_BINS as usize;
@@ -45,7 +46,7 @@ impl SnapshotValue for PcmInput {
         self.estimate_with_mel(&self.mel)
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut values = Vec::new();
         values
             .try_reserve_exact(self.values.capacity())
@@ -229,7 +230,8 @@ where
         &mut self,
         restart: bool,
     ) -> Result<Option<AudioTranscriptionBlock>, AudioTranscriptionError> {
-        H::with_input_recovery(|| self.advance_pcm(restart))
+        let _scope = H::open_input_recovery()?;
+        self.advance_pcm(restart)
     }
 
     fn advance_pcm(

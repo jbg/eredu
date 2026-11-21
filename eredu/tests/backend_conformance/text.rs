@@ -26,8 +26,8 @@ fn terminal<S>(output: GenerationOutput<S>) -> Terminal {
 // then accepts 11 and commits bonus 17.
 fn generate<F: FnMut(SemanticEvent)>(
     method: usize,
-    model: &mut LoadedModel<MockBackend>,
-    input: PreparedChatInput<'_, MockBackend>,
+    model: &mut LoadedModel<MockBackend, MockSession>,
+    input: PreparedChatInput<'_, Vec<u32>>,
     stops: &[String],
     cancellation: GenerationCancellationToken,
     on_event: F,
@@ -133,7 +133,7 @@ pub(super) fn output_model(
     method: usize,
     pieces: [&str; 2],
     template: &str,
-) -> (LoadedModel<MockBackend>, Vec<u32>) {
+) -> (LoadedModel<MockBackend, MockSession>, Vec<u32>) {
     let mut probe = unicode_model_with_template(None, 64, template);
     let chat = probe.prepare_chat(request()).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
@@ -156,7 +156,11 @@ pub(super) fn output_model(
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     let model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -191,7 +195,7 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                     assert_eq!(chat.rendered_prompt(), "user says: hello\nreply begins: ");
                     let prompt = model.encode(chat.rendered_prompt(), false).unwrap();
                     let input = if backend_input {
-                        PreparedChatInput::prepared_backend_input(&chat, prompt)
+                        PreparedChatInput::prepared_input(&chat, prompt)
                     } else {
                         PreparedChatInput::rendered_prompt(&chat)
                     };
@@ -272,7 +276,7 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
                 let (ids, reason, ttft) = generate(
                     method,
                     &mut model,
-                    PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]),
+                    PreparedChatInput::prepared_input(&chat, vec![0; 7]),
                     &stops,
                     cancellation,
                     |event| events.push(event),
@@ -299,7 +303,7 @@ fn text_ttft_counts_invisible_eos_and_stop_tokens_and_excludes_pre_cancellation(
         let (ids, reason, ttft) = generate(
             method,
             &mut model,
-            PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]),
+            PreparedChatInput::prepared_input(&chat, vec![0; 7]),
             &[],
             cancellation.clone(),
             |_| cancellation.cancel(),

@@ -41,7 +41,7 @@ pub(super) fn operation_kind(state: &observed_mock::State) -> TextOperationKind 
 }
 
 fn append_suffix(
-    runtime: &mut ModelRuntime<MockBackend>,
+    runtime: &mut ModelRuntime<MockBackend, MockSession>,
     state: &mut observed_mock::State,
 ) -> Result<(), MockError> {
     if !state.sampling.mode_suffix.is_empty() {
@@ -56,7 +56,7 @@ fn append_suffix(
 }
 
 pub(super) fn settle(
-    runtime: &mut ModelRuntime<MockBackend>,
+    runtime: &mut ModelRuntime<MockBackend, MockSession>,
     input: &mut Option<PendingTextInput<Vec<u32>, MockToken>>,
     state: &mut observed_mock::State,
     requested: DecodingMode,
@@ -95,7 +95,7 @@ pub(super) fn settle(
 
 #[allow(clippy::type_complexity)]
 pub(super) fn submit(
-    runtime: &mut ModelRuntime<MockBackend>,
+    runtime: &mut ModelRuntime<MockBackend, MockSession>,
     input: PendingTextInput<Vec<u32>, MockToken>,
     decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
     state: &mut observed_mock::State,
@@ -156,6 +156,9 @@ pub(super) fn submit(
                 },
             }
         }
+        TextOperationKind::CausalDecision => {
+            return Err(eredu_core::TextOperationPolicyError::OutcomeMismatch.into());
+        }
         TextOperationKind::Decision(_) => {
             if matches!(state.sampling.mode, DecodingMode::Autoregressive) {
                 append_suffix(runtime, state).map_err(eredu_core::TextOperationError::Backend)?;
@@ -198,13 +201,17 @@ fn setup(
     mode: DecodingMode,
     max_tokens: usize,
 ) -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
     SettlementAudit,
 ) {
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().switchable = true;
     let audit = runtime.session().mode_settlements.clone();
     let mut model = unicode_model_with_runtime(None, 64, QWEN_TEMPLATE, runtime);

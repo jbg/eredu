@@ -10,9 +10,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use eredu_core::cache::mechanisms::CacheIoOperationKey;
+
 use super::{
     CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
-    CacheIoExecutionStateError, CacheIoOperationKey, CacheIoPreparation, CacheIoStartDisposition,
+    CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
 };
 
 enum CacheIoWorkerRequest<Task, Output> {
@@ -590,7 +592,7 @@ pub enum CacheIoWorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::CacheIoOperationKind;
+    use eredu_core::cache::mechanisms::CacheIoOperationKind;
     use eredu_core::cache::{CacheBlockId, CacheRepresentation};
     use std::{sync::mpsc, time::Duration};
 

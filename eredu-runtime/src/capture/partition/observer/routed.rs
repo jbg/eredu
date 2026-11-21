@@ -1,7 +1,7 @@
 //! Sparse provider callbacks spend the ordinary partition observer's authority.
 use super::*;
 
-impl<'a, B, T, L, N, F> PartitionCaptureObserver<'a, B, T, L, N, F>
+impl<'a, B, T, L: ?Sized, N, F> PartitionCaptureObserver<'a, B, T, L, N, F>
 where
     B: CaptureBackend,
     T: PartitionCaptureHookTransport,
@@ -138,7 +138,7 @@ where
     }
 }
 
-impl<B, T, L, N, F> crate::RoutedUnitObserver<B::Tensor>
+impl<B, T, L: ?Sized, N, F> crate::RoutedUnitObserver<B::Tensor>
     for PartitionCaptureObserver<'_, B, T, L, N, F>
 where
     B: CaptureBackend,
@@ -371,7 +371,7 @@ where
     }
 }
 
-impl<B, T, L, N, F> PartitionCaptureObserver<'_, B, T, L, N, F>
+impl<B, T, L: ?Sized, N, F> PartitionCaptureObserver<'_, B, T, L, N, F>
 where
     B: CaptureBackend,
     B::Error: Send + Sync,

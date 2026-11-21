@@ -1,19 +1,20 @@
 //! Cold exact binding plans for independently leased function head units.
 
+use eredu_core::SubmissionBackend;
+
 use std::collections::BTreeMap;
 
 use super::function_head_layered::BoundFunctionHead;
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::{SharedCheckpointSource, StoreError},
 };
-use eredu_runtime::{
-    ComponentPreparationError, LocalModelLayout, PreparedComponent, WeightBinding,
-};
+use eredu_core::residency::parameter_binding::WeightBinding;
+use eredu_runtime::{ComponentPreparationError, LocalModelLayout, PreparedComponent};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
@@ -51,7 +52,7 @@ pub enum FunctionHeadPreparationError {
     Coordination(#[from] eredu_runtime::replicated_execution::CollectiveCoordinationError),
     /// An exact tensor communication requirement is malformed.
     #[error(transparent)]
-    Manifest(#[from] eredu_runtime::CommunicationManifestError),
+    Manifest(#[from] eredu_core::communication::CommunicationManifestError),
     /// An admitted parameter disagrees with architecture or recipe geometry.
     #[error("VoiceChat function head parameter {0} has inconsistent geometry")]
     Geometry(String),
@@ -301,14 +302,13 @@ impl PreparedFunctionHeadBindings {
 /// Actual batch/sequence extents remain bounded by the retained communication authority.
 pub fn validate_parallel_communication(
     dimensions: FunctionHeadDimensions,
-    manifest: &eredu_runtime::CommunicationManifest,
+    manifest: &eredu_core::communication::CommunicationManifest,
     group: eredu_core::CollectiveGroupId,
 ) -> Result<(), FunctionHeadPreparationError> {
     use eredu_core::checkpoint::TensorDtype;
-    use eredu_runtime::{
-        replicated_execution::validate_collective_coordination, CommunicationOperation,
-        CommunicationOperationRequirement, CommunicationTensorLimits,
-    };
+    use eredu_core::communication::CommunicationOperation;
+    use eredu_core::communication::{CommunicationOperationRequirement, CommunicationTensorLimits};
+    use eredu_runtime::replicated_execution::validate_collective_coordination;
     dimensions.validate()?;
     let selected = validate_collective_coordination(manifest, group, [])?;
     let vocabulary = dimensions.vocabulary as usize;

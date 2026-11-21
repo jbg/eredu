@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::CacheIoOperationKey;
+use eredu_core::cache::mechanisms::CacheIoOperationKey;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum OperationPhase {
@@ -262,7 +262,7 @@ pub enum CacheIoExecutionStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::CacheIoOperationKind;
+    use eredu_core::cache::mechanisms::CacheIoOperationKind;
     use eredu_core::cache::{CacheBlockId, CacheRepresentation};
 
     fn key(block: i64) -> CacheIoOperationKey {

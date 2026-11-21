@@ -76,7 +76,7 @@ pub enum PreparationError {
     RowSelection(#[from] eredu_runtime::RowLookupSelectionError),
     /// Named stream geometry or finite read/storage bounds are invalid.
     #[error(transparent)]
-    Streams(#[from] eredu_runtime::AppendStreamError),
+    Streams(#[from] eredu_core::cache::append_stream::AppendStreamError),
     /// Portable context or state-memory projection is invalid.
     #[error(transparent)]
     Capability(#[from] eredu_core::CapabilityError),
@@ -444,5 +444,4 @@ pub use conditional_partition::{
     SelectedConditionalPartitionExecution,
 };
 
-#[cfg(feature = "tensor-capture")]
 pub(crate) use graph::join_prediction_descriptor;

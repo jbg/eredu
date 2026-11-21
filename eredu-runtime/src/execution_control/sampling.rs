@@ -1,6 +1,7 @@
 //! Prospective sampling policy validated before native RNG preparation.
 use eredu_core::{
-    ModelRuntime, TextContinuationBoundary, TextGenerationBackend, TokenFilterController,
+    ModelRuntime, TextContinuationBoundary, TextExecutionSession, TextGenerationBackend,
+    TokenFilterController,
 };
 use serde::{Deserialize, Serialize};
 
@@ -45,23 +46,25 @@ impl ValidatedSamplingOverride {
 
 /// Minimal native mechanism; ordinary sampling and snapshot state keep their
 /// existing owners. Errors must preserve the previous logical sampling state.
-pub trait TextSamplingControlBackend: TextGenerationBackend {
+pub trait TextSamplingControlBackend<S: eredu_core::backend::TextOperationDriver<Self>>:
+    TextGenerationBackend
+{
     /// Statistical meaning of the selected commitment scores. Iterative position
     /// finalization does not admit a causal sampler temperature override.
     fn sampling_score_kind(
-        _runtime: &ModelRuntime<Self>,
-        _state: &Self::TextGenerationState,
+        _runtime: &ModelRuntime<Self, S>,
+        _state: &S::TextGenerationState,
     ) -> eredu_core::refinement::PredictionScoreKind {
         eredu_core::refinement::PredictionScoreKind::CausalConditional
     }
     /// Side-effect-free facts for the installed sampling state.
-    fn sampling_control_facts(state: &Self::TextGenerationState) -> SamplingStateFacts;
+    fn sampling_control_facts(state: &S::TextGenerationState) -> SamplingStateFacts;
     /// Prepares any replacement key and proves completion through the existing
     /// recovery owner before installing temperature/key together. Consumes no RNG
     /// draw, submits no model prediction and leaves all sampler history intact.
     fn install_sampling_override(
-        runtime: &mut ModelRuntime<Self>,
-        state: &mut Self::TextGenerationState,
+        runtime: &mut ModelRuntime<Self, S>,
+        state: &mut S::TextGenerationState,
         request: ValidatedSamplingOverride,
     ) -> Result<(), Self::Error>;
 }
@@ -110,8 +113,12 @@ pub fn validate_sampling_override<E: std::error::Error + 'static>(
 /// Validates and applies one future sampling change at a proven native and record
 /// boundary. Stochastic-to-greedy retains RNG; switching back resumes that stream.
 /// A run created without an RNG needs an explicit seed to become stochastic.
-pub fn apply_sampling_override<B: TextSamplingControlBackend, C: TokenFilterController>(
-    boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+pub fn apply_sampling_override<
+    B: TextSamplingControlBackend<S>,
+    C: TokenFilterController,
+    S: TextExecutionSession<B>,
+>(
+    boundary: &mut TextContinuationBoundary<'_, '_, B, C, S>,
     request: SamplingOverride,
 ) -> Result<SamplingStateFacts, SamplingOverrideError<B::Error>> {
     let (runtime, state, _) = boundary.mechanism_parts();
@@ -122,13 +129,17 @@ pub fn apply_sampling_override<B: TextSamplingControlBackend, C: TokenFilterCont
 /// state. Used during branch construction under its copy reservation, while the
 /// loaded runtime is quiescent. Native installation must preserve the installed
 /// model state and cooperate with its existing submission/completion owner.
-pub fn apply_prepared_sampling_override<B: TextSamplingControlBackend>(
-    runtime: &mut ModelRuntime<B>,
-    state: &mut B::TextGenerationState,
+pub fn apply_prepared_sampling_override<
+    B: TextSamplingControlBackend<S>,
+    S: TextExecutionSession<B>,
+>(
+    runtime: &mut ModelRuntime<B, S>,
+    state: &mut S::TextGenerationState,
     request: SamplingOverride,
 ) -> Result<SamplingStateFacts, SamplingOverrideError<B::Error>> {
-    if let eredu_core::execution_control::ControlSupport::Unsupported { .. } =
-        B::text_sampling_control_support(runtime)
+    if let eredu_core::execution_control::ControlSupport::Unsupported { .. } = runtime
+        .session()
+        .text_sampling_control_support(runtime.backend())
     {
         return Err(SamplingOverrideError::Invalid(
             "loaded execution does not support sampling overrides",

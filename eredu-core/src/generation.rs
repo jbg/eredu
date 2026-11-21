@@ -1144,6 +1144,14 @@ pub enum GenerationError {
     /// The selected backend cannot submit an assistant proposal.
     #[error("speculative backend does not permit any draft tokens")]
     NoBackendDraftCapacity,
+    /// The admitted lane exceeds the selected executor's proposal capacity.
+    #[error("lane requests {requested} draft tokens, but the selected speculative realization admits at most {capacity}")]
+    DraftCapacityExceeded {
+        /// Proposal capacity requested for this lane.
+        requested: usize,
+        /// Proposal capacity of the selected realization.
+        capacity: usize,
+    },
     /// Temperature is NaN, infinite, or negative.
     #[error("temperature must be finite and non-negative, got {0}")]
     InvalidTemperature(f32),

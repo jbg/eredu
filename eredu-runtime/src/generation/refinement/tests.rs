@@ -32,108 +32,40 @@ impl RefinementBackend for Numeric {
     type Mask = Vec<bool>;
     type ConditioningFormat = ();
 
-    fn initialize_masked_canvas(
-        canvas: NonZeroU32,
-        mask_token: u32,
-        layout: Option<&eredu_core::refinement::RefinementCanvas>,
-        context: &Context,
-    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
-        let mut tokens = vec![mask_token; canvas.get() as usize];
-        if let Some(layout) = layout {
-            tokens = Self::seed_canvas(&tokens, layout, context)?.0;
-        }
-        let count = tokens.iter().filter(|x| **x == mask_token).count() as u32;
-        Ok(Some((tokens, count)))
+    fn read_tokens(tokens: &Self::Token, _: &Context) -> Result<Vec<u32>, Self::Error> {
+        Ok(tokens.clone())
     }
-
-    fn masked_refinement_step(
-        canvas: &Self::Token,
-        previous: Option<&Self::Logits>,
-        logits: &Self::Logits,
-        mask_token: u32,
-        config: eredu_core::refinement::MaskedRefinementConfig,
-        scheduled: u32,
+    fn read_mask(flags: &Self::Mask, _: &Context) -> Result<Vec<bool>, Self::Error> {
+        Ok(flags.clone())
+    }
+    fn masked_score_shape(scores: &Self::Logits) -> Option<[usize; 2]> {
+        Some([scores.len(), scores.first()?.len()])
+    }
+    fn read_scores(scores: &Self::Logits, _: &Context) -> Result<Vec<f32>, Self::Error> {
+        Ok(scores.iter().flatten().copied().collect())
+    }
+    fn masked_uniforms(
+        count: usize,
         random: &mut u64,
         _: &Context,
-    ) -> Result<Option<MaskedRefinementStep<Self>>, Self::Error> {
-        let options = config.options();
-        let eligible: Vec<_> = canvas.iter().map(|x| *x == mask_token).collect();
-        let sampled: Vec<_> = logits
-            .iter()
-            .map(|row| {
-                masked::sample_position(row, options.sampling, options.temperature, || {
-                    *random += 1;
-                    0.5
-                })
-                .map_err(|_| "invalid masked scores")
-            })
-            .collect::<Result<_, _>>()?;
-        let transfer = masked::transfer_positions(
-            logits,
-            &sampled,
-            &eligible,
-            scheduled,
-            options.confidence_threshold,
-        )
-        .map_err(|_| "invalid masked transfer")?;
-        let result = Self::select_tokens(&transfer, &sampled, canvas, &context())?;
-        let scores = logits
-            .iter()
-            .enumerate()
-            .map(|(p, row)| {
-                if !eligible[p] {
-                    previous.map_or(row, |old| &old[p]).clone()
-                } else {
-                    row.clone()
-                }
-            })
-            .collect();
-        let remaining = result.iter().filter(|x| **x == mask_token).count() as u32;
-        Ok(Some(MaskedRefinementStep {
-            canvas: result,
-            scores,
-            transfer,
-            remaining,
-        }))
+    ) -> Result<Vec<f64>, Self::Error> {
+        *random += count as u64;
+        Ok(vec![0.5; count])
+    }
+    fn materialize_tokens(tokens: &[u32], _: &Context) -> Result<Self::Token, Self::Error> {
+        Ok(tokens.to_vec())
+    }
+    fn materialize_mask(flags: &[bool], _: &Context) -> Result<Self::Mask, Self::Error> {
+        Ok(flags.to_vec())
+    }
+    fn materialize_scores(
+        scores: &[f32],
+        [_, width]: [usize; 2],
+        _: &Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(scores.chunks_exact(width).map(<[f32]>::to_vec).collect())
     }
 
-    fn invalidate_masked_suffix(
-        canvas: &Self::Token,
-        position: usize,
-        token: &Self::Token,
-        mask_token: u32,
-        pins: Option<(&Self::Token, &Self::Mask)>,
-        _: &Context,
-    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
-        let mut ids = canvas.clone();
-        ids[position] = token[0];
-        ids[position + 1..].fill(mask_token);
-        if let Some((seeds, fixed)) = pins {
-            for p in position + 1..ids.len() {
-                if fixed[p] {
-                    ids[p] = seeds[p];
-                }
-            }
-        }
-        let count = ids.iter().filter(|x| **x == mask_token).count() as u32;
-        Ok(Some((ids, count)))
-    }
-
-    fn seed_canvas(
-        noise: &Self::Token,
-        layout: &eredu_core::refinement::RefinementCanvas,
-        _: &Context,
-    ) -> Result<(Self::Token, Self::Mask), Self::Error> {
-        let tokens = noise
-            .iter()
-            .zip(&layout.seed_tokens)
-            .map(|(n, s)| s.unwrap_or(*n))
-            .collect();
-        let pins = (0..noise.len())
-            .map(|p| layout.pinned_positions.contains(&(p as u32)))
-            .collect();
-        Ok((tokens, pins))
-    }
     fn pin_scores(
         scores: &Self::Logits,
         tokens: &Self::Token,

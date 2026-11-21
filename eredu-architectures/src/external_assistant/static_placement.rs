@@ -3,15 +3,17 @@ use crate::{
     composite_execution::ExternalPredictionTargetOperationKind as Kind,
     prepared_sources::PreparedModelDiscovery,
 };
+use eredu_core::communication::CommunicationOperation;
+use eredu_core::communication::{
+    CommunicationGroupRequirements, CommunicationOperationRequirement, CommunicationTensorLimits,
+};
 use eredu_core::{
     capture::{CaptureBudget, CaptureError, CaptureReservation, CaptureSkipReason, CaptureUsage},
     ParallelRankTopology,
 };
 use eredu_nn::Error;
 use eredu_runtime::{
-    CommunicationGroupRequirements, CommunicationOperation, CommunicationOperationRequirement,
-    CommunicationTensorLimits, PredictionTensorAssembly, PredictionTensorAssemblyPlan,
-    PredictionTensorSource,
+    PredictionTensorAssembly, PredictionTensorAssemblyPlan, PredictionTensorSource,
 };
 use std::{collections::BTreeMap, ops::Range};
 
@@ -406,4 +408,16 @@ fn reserve(budget: &mut MetadataReservation, bytes: u64) -> Result<(), Error> {
         })
         .map_err(Error::backend_source)?;
     Ok(())
+}
+
+impl eredu_runtime::executable_binding::discovery::ExternalTargetStaticPlacement
+    for PreparedTargetStaticPlacement
+{
+    fn resolve(
+        &self,
+        kind: Kind,
+        input_shape: &[i32],
+    ) -> Result<PredictionTensorAssemblyPlan, Error> {
+        self.resolve(kind, input_shape)
+    }
 }

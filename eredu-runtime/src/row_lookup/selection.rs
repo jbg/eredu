@@ -3,16 +3,7 @@ use super::*;
 use crate::{AddressableStorageCapabilities, ParameterBankLoadOptions};
 use std::collections::BTreeMap;
 
-/// Native temporary storage for one exact prepared row contract. These are
-/// conservative peaks, excluding residency, retained scalars and portable output
-/// planning, which the selection driver accounts separately.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RowLookupWorkspace {
-    /// Decode/copy workspace for the largest permitted acquisition.
-    pub decode_bytes: u64,
-    /// Workspace for materializing the exact scalar recipe during binding.
-    pub scalar_bytes: u64,
-}
+pub use eredu_core::preparation::rows::RowLookupWorkspace;
 
 /// Side-effect-free support for a single exact row contract. Implementations must
 /// inspect retained metadata only: no payload reads, native tensors or devices.
@@ -33,6 +24,28 @@ pub trait RowLookupMechanismSupport {
         &self,
         prepared: &RowLookupDescriptor,
     ) -> Result<Option<RowLookupWorkspace>, RowLookupError>;
+}
+
+impl<N: eredu_core::preparation::rows::NativeRowLookupSupport + ?Sized> RowLookupMechanismSupport
+    for N
+{
+    fn storage(&self) -> Option<AddressableStorageCapabilities> {
+        self.row_storage()
+    }
+
+    fn decode_memory(
+        &self,
+        descriptor: &RowLookupDescriptor,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, RowLookupError> {
+        Ok(self.row_decode_memory(descriptor.native_request(), descriptor.decode_memory()?)?)
+    }
+
+    fn workspace(
+        &self,
+        descriptor: &RowLookupDescriptor,
+    ) -> Result<Option<RowLookupWorkspace>, RowLookupError> {
+        Ok(self.row_workspace(descriptor.native_request())?)
+    }
 }
 
 /// Selected resource facts. Lookups execute serially; their workspace is a peak,

@@ -64,7 +64,8 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
             "nvidia/Nemotron-Labs-Diffusion-3B",
         ));
     let mut loaded =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &plan).unwrap();
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &plan, None)
+            .unwrap();
     let (model, _) = loaded.parts_mut();
     let chat = model
         .prepare_chat(ChatTemplateRequest {

@@ -47,7 +47,7 @@ pub fn derive_parameter_coordinates(
     task: &ReplicatedTextMaterializationTask,
     tensor: &LocalTensorLayout,
     rank: usize,
-    reservation: &mut impl CaptureReservation,
+    reservation: &mut (impl CaptureReservation + ?Sized),
 ) -> Result<Option<ParameterCoordinateMap>, ParameterError> {
     derive_coordinates(
         task.logical_shape(),
@@ -65,7 +65,7 @@ fn derive_companion_coordinates(
     logical: &[usize],
     tensor: &LocalTensorLayout,
     rank: usize,
-    reservation: &mut impl CaptureReservation,
+    reservation: &mut (impl CaptureReservation + ?Sized),
 ) -> Result<Option<ParameterCoordinateMap>, ParameterError> {
     derive_coordinates(
         logical,
@@ -83,7 +83,7 @@ fn derive_coordinates(
     format: eredu_checkpoint::LinearFormat,
     tensor: &LocalTensorLayout,
     rank: usize,
-    reservation: &mut impl CaptureReservation,
+    reservation: &mut (impl CaptureReservation + ?Sized),
 ) -> Result<Option<ParameterCoordinateMap>, ParameterError> {
     let physical = tensor.global_shape();
     if logical.len() > 32
@@ -249,7 +249,7 @@ fn derive_coordinates(
 }
 
 fn charge(
-    reservation: &mut impl CaptureReservation,
+    reservation: &mut (impl CaptureReservation + ?Sized),
     host_bytes: u64,
 ) -> Result<(), ParameterError> {
     reservation.reserve_quota(CaptureUsage {
@@ -274,7 +274,7 @@ pub fn derive_parameter_member_layout(
     placement: ParallelRankTopology,
     owns: bool,
     retained_layout: Option<&crate::LocalModelLayout>,
-    reservation: &mut impl eredu_core::capture::CaptureReservation,
+    reservation: &mut (impl eredu_core::capture::CaptureReservation + ?Sized),
 ) -> Result<ParameterPartitionLayout, eredu_core::parameters::ParameterError> {
     use eredu_core::parameters::ParameterError;
     let crate::ResolvedParameterMember {
@@ -364,7 +364,7 @@ pub fn derive_rank_parameter_member_layout(
     parameter: &str,
     index: Option<&crate::ParameterMemberIndex>,
     authored: Option<&crate::LocalModelLayout>,
-    reservation: &mut impl CaptureReservation,
+    reservation: &mut (impl CaptureReservation + ?Sized),
 ) -> Result<ParameterPartitionLayout, ParameterError> {
     if parameters.graph() != execution.execution_graph()
         || parameters.unit_layout() != execution.execution_units()

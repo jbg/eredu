@@ -1,10 +1,8 @@
 //! Checkpoint materialization, host transfer, and capacity accounting.
 
 use super::*;
-use crate::backend::runtime::checkpoint::recipe::{
-    plan_binding_reads, BindingReadBatch, DirectRecipeRead,
-};
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use eredu_core::checkpoint_mechanisms::ParameterReadInput;
 
 struct HostMaterialization {
     array: Array,
@@ -17,341 +15,117 @@ impl Retention for HostMaterialization {
     fn observe(&self, _: Status) {}
 }
 
-pub(super) struct PreparedResidentArrays {
-    pub(super) arrays: BTreeMap<String, Array>,
-    pub(super) direction: TransferDirection,
-}
-
-pub(super) fn shared_arrays_for_unit(
-    state: &ManagerState,
-    _store: &dyn eredu_checkpoint::store::CheckpointSource,
+pub(super) fn materialize_host_buffer(
     id: &OffloadUnitId,
-) -> Result<BTreeMap<String, Array>, ResidencyError> {
-    let shared = state
-        .control
-        .unit(id)
-        .ok_or(ResidencyError::StatePoisoned)?
-        .bindings()
-        .iter()
-        .filter_map(|binding| {
-            state
-                .control
-                .binding_owner(id, binding)
-                .map(|(owner_unit, owner)| {
-                    (
-                        binding.name().to_owned(),
-                        (owner_unit.clone(), owner.name().to_owned()),
-                        owner.name().to_owned(),
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
-    let mut arrays = BTreeMap::new();
-    for (target, (owner_unit, owner_name), _) in shared {
-        if owner_unit == *id {
-            continue;
-        }
-        let array = state
-            .storage
-            .get(&owner_unit)
-            .and_then(|storage| storage.device.as_ref())
-            .and_then(|owner| owner.arrays.get(&owner_name))
-            .ok_or(ResidencyError::StatePoisoned)?;
-        arrays.insert(target, array.clone());
-    }
-    Ok(arrays)
-}
-
-pub(super) fn shared_host_buffers_for_unit(
-    state: &ManagerState,
-    id: &OffloadUnitId,
-) -> Result<BTreeMap<String, Arc<ResidentHostAllocation>>, ResidencyError> {
-    let unit = state
-        .control
-        .unit(id)
-        .ok_or(ResidencyError::StatePoisoned)?;
-    let mut shared = BTreeMap::new();
-    for binding in unit.bindings().iter().filter(|binding| binding.is_alias()) {
-        let (owner_unit, owner) = state
-            .control
-            .binding_owner(id, binding)
-            .ok_or(ResidencyError::StatePoisoned)?;
-        if owner_unit == id {
-            continue;
-        }
-        let buffer = state
-            .storage
-            .get(owner_unit)
-            .and_then(|storage| storage.host.as_ref())
-            .and_then(|buffers| buffers.buffers.get(owner.name()))
-            .ok_or(ResidencyError::StatePoisoned)?;
-        shared.insert(binding.name().to_owned(), Arc::clone(buffer));
-    }
-    Ok(shared)
-}
-
-pub(super) fn materialize_host_buffers(
-    id: &OffloadUnitId,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    bindings: &[WeightBinding],
-    source_stream: &Stream,
+    binding: &WeightBinding,
+    input: ParameterReadInput<'_>,
     context: &MlxParameterMaterializationContext,
-    shared: &BTreeMap<String, Arc<ResidentHostAllocation>>,
-) -> Result<ResidentHostBuffers, ResidencyError> {
-    let mut buffers = shared.clone();
-    for binding in bindings {
-        if buffers.contains_key(binding.name()) {
-            continue;
-        }
-        let (array, sources) = match binding.recipe() {
-            Some(recipe) => {
-                let pending = recipe
-                    .prepare_materialization(store, context)
-                    .map_err(|source| ResidencyError::Recipe {
-                        binding: binding.name().to_owned(),
-                        source,
-                    })?;
-                pending.into_parts()
-            }
-            None => {
-                let lease = store.acquire_lease(eredu_checkpoint::store::TensorReadRequest {
-                    key: binding.checkpoint_key().to_owned(),
-                    selection: binding.selection().clone(),
-                    policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
-                })?;
-                let lease = context.weight_lease(lease)?;
-                let pending = lease.prepare_materialization(source_stream, source_stream)?;
-                (pending.output().clone(), vec![pending])
-            }
-        };
-        let mut retained = Recovery::begin(HostMaterialization {
-            array,
-            _sources: sources,
-            buffer: None,
-            event: None,
-        })
-        .map_err(|source| ResidencyError::Mlx {
-            id: id.clone(),
-            operation: "prepare host materialization recovery",
-            source,
-        })?;
-        let result = HostTransferBuffer::copy_from_array(
-            &retained.retention().array,
-            HostTransferPolicy::Transfer,
-            source_stream,
-        );
-        retained.seal();
-        let (buffer, event) = result
-            .map_err(|source| ResidencyError::Mlx {
-                id: id.clone(),
-                operation: "weight array-to-host-buffer submission",
+) -> Result<Arc<ResidentHostAllocation>, ResidencyError> {
+    let source_stream = context.source_stream();
+    let (array, sources) = match input {
+        ParameterReadInput::Recipe(recipe, source) => recipe
+            .prepare_materialization(source, context)
+            .map_err(|source| ResidencyError::Recipe {
+                binding: binding.name().to_owned(),
                 source,
             })?
-            .into_parts();
-        retained.retention_mut().buffer = Some(buffer);
-        retained.retention_mut().event = Some(event);
-        loop {
-            let status = retained.progress();
-            if status.failed || status.blocked {
-                return Err(ResidencyError::Mlx {
-                    id: id.clone(),
-                    operation: "weight array-to-host-buffer completion",
-                    source: safemlx::error::Exception::custom(
-                        "native host transfer failed; unresolved resources remain retained",
-                    ),
-                });
-            }
-            if status.settled {
-                break;
-            }
-            std::thread::yield_now();
+            .into_parts(),
+        ParameterReadInput::Lease(lease) => {
+            let pending = context
+                .weight_lease(lease)?
+                .prepare_materialization(source_stream, source_stream)?;
+            (pending.output().clone(), vec![pending])
         }
-        let buffer = retained
-            .retention_mut()
-            .buffer
-            .take()
-            .expect("completed host buffer");
-        let actual = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
+    };
+    let mut retained = Recovery::begin(HostMaterialization {
+        array,
+        _sources: sources,
+        buffer: None,
+        event: None,
+    })
+    .map_err(|source| ResidencyError::Mlx {
+        id: id.clone(),
+        operation: "prepare host materialization recovery",
+        source,
+    })?;
+    let result = HostTransferBuffer::copy_from_array(
+        &retained.retention().array,
+        HostTransferPolicy::Transfer,
+        source_stream,
+    );
+    retained.seal();
+    let (buffer, event) = result
+        .map_err(|source| ResidencyError::Mlx {
             id: id.clone(),
-            operation: "host-buffer byte inspection",
+            operation: "weight array-to-host-buffer submission",
             source,
-        })?)
-        .map_err(|_| ResidencyError::ArithmeticOverflow {
-            context: "host-buffer byte conversion",
-        })?;
-        if actual != binding.expected_bytes() {
-            return Err(ResidencyError::BindingByteMismatch {
-                id: id.clone(),
-                binding: binding.name().to_owned(),
-                expected_bytes: binding.expected_bytes(),
-                actual_bytes: actual,
-            });
-        }
-        buffers.insert(
-            binding.name().to_owned(),
-            Arc::new(ResidentHostAllocation::new(buffer.freeze())?),
-        );
-        let status = retained.finish();
+        })?
+        .into_parts();
+    retained.retention_mut().buffer = Some(buffer);
+    retained.retention_mut().event = Some(event);
+    loop {
+        let status = retained.progress();
         if status.failed || status.blocked {
             return Err(ResidencyError::Mlx {
                 id: id.clone(),
-                operation: "host materialization retirement",
-                source: safemlx::error::Exception::custom("native host materialization failed"),
+                operation: "weight array-to-host-buffer completion",
+                source: safemlx::error::Exception::custom(
+                    "native host transfer failed; unresolved resources remain retained",
+                ),
             });
         }
+        if status.settled {
+            break;
+        }
+        std::thread::yield_now();
     }
-    Ok(ResidentHostBuffers {
-        owner: host_resources::identity("mlx.resident_host_owner"),
-        buffers,
-    })
-}
-
-pub(super) fn prepare_from_disk(
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    bindings: &[WeightBinding],
-    source_stream: &Stream,
-    execution_stream: &Stream,
-    context: &MlxParameterMaterializationContext,
-    direction: TransferDirection,
-    shared: &BTreeMap<String, Array>,
-    retained: &mut ResidentTransferResources,
-) -> Result<PreparedResidentArrays, ResidencyError> {
-    let mut arrays = shared.clone();
-    retained.retained_arrays.extend(shared.values().cloned());
-    let batches = plan_binding_reads(
-        store,
-        bindings
-            .iter()
-            .filter(|binding| !shared.contains_key(binding.name())),
-    )
-    .map_err(|source| ResidencyError::Recipe {
-        binding: "<parameter batch>".into(),
+    let buffer = retained
+        .retention_mut()
+        .buffer
+        .take()
+        .expect("completed host buffer");
+    let actual = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
+        id: id.clone(),
+        operation: "host-buffer byte inspection",
         source,
+    })?)
+    .map_err(|_| ResidencyError::ArithmeticOverflow {
+        context: "host-buffer byte conversion",
     })?;
-    for batch in batches {
-        let binding = match batch {
-            BindingReadBatch::Direct { bindings, reads } => {
-                let inputs =
-                    DirectRecipeRead::materialize_many(reads, source_stream).map_err(|source| {
-                        ResidencyError::Recipe {
-                            binding: "<parameter batch>".into(),
-                            source,
-                        }
-                    })?;
-                // Arm the enclosing recovery owner before any stream operation.
-                retained.retained_arrays.extend(inputs.iter().cloned());
-                for (binding, input) in bindings.into_iter().zip(inputs) {
-                    let output = if source_stream == execution_stream {
-                        input
-                    } else {
-                        crate::backend::runtime::checkpoint::recipe::copy_parameter_storage(
-                            &input,
-                            binding.storage_layout(),
-                            execution_stream,
-                        )
-                        .map_err(|source| ResidencyError::Recipe {
-                            binding: binding.name().to_owned(),
-                            source: WeightRecipeError::Mlx(source),
-                        })?
-                    };
-                    retained.retained_arrays.push(output.clone());
-                    arrays.insert(binding.name().to_owned(), output);
-                }
-                continue;
-            }
-            BindingReadBatch::Ordinary(binding) => binding,
-        };
-        let mut retried_after_capacity = false;
-        loop {
-            let prepared = (|| match binding.recipe() {
-                Some(recipe) => {
-                    let pending =
-                        crate::backend::runtime::checkpoint::recipe::prepare_ordinary_recipe(
-                            recipe, store, context, false,
-                        )
-                        .map_err(|source| ResidencyError::Recipe {
-                            binding: binding.name().to_owned(),
-                            source,
-                        })?;
-                    let (host, sources) = pending.into_parts();
-                    retained.sources.extend(sources);
-                    retained.retained_arrays.push(host.clone());
-                    if execution_stream == source_stream {
-                        Ok(host)
-                    } else {
-                        let output =
-                            host.ensure_device_storage(execution_stream)
-                                .map_err(|source| ResidencyError::Recipe {
-                                    binding: binding.name().to_owned(),
-                                    source: WeightRecipeError::Mlx(source),
-                                })?;
-                        Ok(output)
-                    }
-                }
-                None => {
-                    let lease =
-                        store.acquire_lease(eredu_checkpoint::store::TensorReadRequest {
-                            key: binding.checkpoint_key().to_owned(),
-                            selection: binding.selection().clone(),
-                            policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
-                        })?;
-                    let lease = context.weight_lease(lease)?;
-                    let pending = lease.prepare_materialization(source_stream, execution_stream)?;
-                    let output = pending.output().clone();
-                    retained.sources.push(pending);
-                    Ok(output)
-                }
-            })();
-            match prepared {
-                Ok(output) => {
-                    retained.retained_arrays.push(output.clone());
-                    arrays.insert(binding.name().to_owned(), output);
-                    break;
-                }
-                Err(error)
-                    if !retried_after_capacity
-                        && !retained.sources.is_empty()
-                        && is_shard_cache_capacity_error(&error) =>
-                {
-                    let prior = WeightMaterialization::prepare_retained(
-                        Vec::new(),
-                        std::mem::take(&mut retained.sources),
-                    )?
-                    .submit_outputs(retained.retained_arrays.clone())?;
-                    prior.wait()?;
-                    prior.finish()?;
-                    retried_after_capacity = true;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+    if actual != binding.expected_bytes() {
+        return Err(ResidencyError::BindingByteMismatch {
+            id: id.clone(),
+            binding: binding.name().to_owned(),
+            expected_bytes: binding.expected_bytes(),
+            actual_bytes: actual,
+        });
     }
-    Ok(PreparedResidentArrays { arrays, direction })
-}
-
-pub(super) fn is_shard_cache_capacity_error(error: &ResidencyError) -> bool {
-    matches!(
-        error,
-        ResidencyError::CheckpointStore(
-            eredu_checkpoint::store::StoreError::CapacityExhausted { .. }
-        ) | ResidencyError::Recipe {
-            source: WeightRecipeError::CheckpointStore(
-                eredu_checkpoint::store::StoreError::CapacityExhausted { .. }
-            ),
-            ..
-        }
-    )
+    let allocation = Arc::new(ResidentHostAllocation::new(buffer.freeze())?);
+    let status = retained.finish();
+    if status.failed || status.blocked {
+        return Err(ResidencyError::Mlx {
+            id: id.clone(),
+            operation: "host materialization retirement",
+            source: safemlx::error::Exception::custom("native host materialization failed"),
+        });
+    }
+    Ok(allocation)
 }
 
 pub(super) fn prepare_copy_to_device(
     id: &OffloadUnitId,
+    names: &[&str],
     host: Arc<ResidentHostBuffers>,
     device_stream: &Stream,
     retained: &mut ResidentTransferResources,
-) -> Result<PreparedResidentArrays, ResidencyError> {
+) -> Result<BTreeMap<String, Array>, ResidencyError> {
     let mut arrays = BTreeMap::new();
     retained.retained_host.push(Arc::clone(&host));
-    for (name, buffer) in &host.buffers {
+    for &name in names {
+        let buffer = host
+            .buffers
+            .get(name)
+            .ok_or(ResidencyError::StatePoisoned)?;
         let submitted = buffer
             .buffer
             .copy_to_array(device_stream)
@@ -362,13 +136,10 @@ pub(super) fn prepare_copy_to_device(
             })?;
         let (array, completion) = submitted.into_parts();
         retained.retained_arrays.push(array.clone());
-        arrays.insert(name.clone(), array);
+        arrays.insert(name.to_owned(), array);
         retained.retained_events.push(completion);
     }
-    Ok(PreparedResidentArrays {
-        arrays,
-        direction: TransferDirection::HostToDevice,
-    })
+    Ok(arrays)
 }
 
 pub(super) fn arrays_nbytes(
@@ -504,112 +275,4 @@ pub(super) fn host_buffers_capacity(
                     context: "resident host-buffer capacity total",
                 })
         })
-}
-
-/// Batches byte-preserving source reads across independently resident units.
-/// Selection and admission already happened; this never broadens a source range.
-/// Units requiring aliases, host copies or transformations use the ordinary path.
-pub(super) fn prepare_direct_units(
-    state: &ManagerState,
-    sources: &ResidencySources,
-    ids: &[OffloadUnitId],
-    missing: &[bool],
-    retained: &mut ResidentTransferResources,
-) -> Result<BTreeMap<OffloadUnitId, PreparedResidentArrays>, ResidencyError> {
-    let mut result = BTreeMap::new();
-    let mut batch = Vec::new();
-    let mut owners = Vec::new();
-    let mut budget = eredu_runtime::ParameterBatchBudget::default();
-    fn finish(
-        reads: &mut Vec<DirectRecipeRead>,
-        owners: &mut Vec<(OffloadUnitId, String)>,
-        result: &mut BTreeMap<OffloadUnitId, PreparedResidentArrays>,
-        state: &ManagerState,
-        retained: &mut ResidentTransferResources,
-    ) -> Result<(), ResidencyError> {
-        if reads.is_empty() {
-            return Ok(());
-        }
-        let arrays =
-            DirectRecipeRead::materialize_many(std::mem::take(reads), &state.source_stream)
-                .map_err(|source| ResidencyError::Recipe {
-                    binding: "<residency batch>".into(),
-                    source,
-                })?;
-        retained.retained_arrays.extend(arrays.iter().cloned());
-        for ((id, name), input) in std::mem::take(owners).into_iter().zip(arrays) {
-            let output = if state.source_stream == state.device_stream {
-                input
-            } else {
-                let binding = state
-                    .control
-                    .unit(&id)
-                    .ok_or(ResidencyError::StatePoisoned)?
-                    .bindings()
-                    .iter()
-                    .find(|binding| binding.name() == name)
-                    .ok_or(ResidencyError::StatePoisoned)?;
-                crate::backend::runtime::checkpoint::recipe::copy_parameter_storage(
-                    &input,
-                    binding.storage_layout(),
-                    &state.device_stream,
-                )
-                .map_err(|source| ResidencyError::Recipe {
-                    binding: name.clone(),
-                    source: WeightRecipeError::Mlx(source),
-                })?
-            };
-            retained.retained_arrays.push(output.clone());
-            result
-                .entry(id)
-                .or_insert_with(|| PreparedResidentArrays {
-                    arrays: BTreeMap::new(),
-                    direction: TransferDirection::DiskToDevice,
-                })
-                .arrays
-                .insert(name, output);
-        }
-        Ok(())
-    }
-    for (id, missing) in ids.iter().zip(missing) {
-        if !missing || state.storage[id].host.is_some() {
-            continue;
-        }
-        let unit = state
-            .control
-            .unit(id)
-            .ok_or(ResidencyError::StatePoisoned)?;
-        if unit.bindings().iter().any(WeightBinding::is_alias) {
-            continue;
-        }
-        let mut candidates = Vec::new();
-        for binding in unit.bindings() {
-            let recipe = binding.source_recipe();
-            let read = DirectRecipeRead::prepare_with_layout(
-                &recipe,
-                sources.source(id),
-                binding.storage_layout(),
-            )
-            .map_err(|source| ResidencyError::Recipe {
-                binding: binding.name().into(),
-                source,
-            })?;
-            let Some(read) = read else {
-                candidates.clear();
-                break;
-            };
-            candidates.push((binding, read));
-        }
-        for (binding, read) in candidates {
-            if !budget.try_push(binding.expected_bytes()) {
-                finish(&mut batch, &mut owners, &mut result, state, retained)?;
-                budget = eredu_runtime::ParameterBatchBudget::default();
-                budget.try_push(binding.expected_bytes());
-            }
-            owners.push((id.clone(), binding.name().into()));
-            batch.push(read);
-        }
-    }
-    finish(&mut batch, &mut owners, &mut result, state, retained)?;
-    Ok(result)
 }

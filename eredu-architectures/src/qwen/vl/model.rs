@@ -16,10 +16,7 @@ use eredu_runtime::{
 use crate::decoder::DecoderStaticResources;
 use crate::qwen::vision::{VisionBlock, VisionInput, VisionState, VisionStatic};
 use crate::qwen::{self, AttentionInput};
-use crate::{
-    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
-    media_plan::QwenVlInputPartPlan,
-};
+use crate::{composite_execution::PreparedCompositeInput, media_plan::QwenVlInputPartPlan};
 use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
 
 use super::{
@@ -139,7 +136,7 @@ pub fn prepare_input<T: Tensor>(
     for (part_index, (part, plan)) in prepared.parts().iter().zip(admitted.parts()).enumerate() {
         match plan {
             QwenVlInputPartPlan::TextTokens { .. } => {
-                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::TokenIds(value) = part.payload() else {
                     return Err(Error::backend(
                         "Qwen3-VL admitted text part lost its token payload",
                     ));
@@ -149,7 +146,7 @@ pub fn prepare_input<T: Tensor>(
                 projected.push(None);
             }
             QwenVlInputPartPlan::ProjectedText { positions } => {
-                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Embeddings(value) = part.payload() else {
                     return Err(Error::backend(
                         "Qwen3-VL admitted projected part lost its embedding payload",
                     ));
@@ -161,7 +158,7 @@ pub fn prepare_input<T: Tensor>(
                 projected.push(Some(value.clone()));
             }
             QwenVlInputPartPlan::Media { ingress, .. } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Qwen3-VL admitted media part lost its tensor payload",
                     ));
@@ -206,7 +203,8 @@ pub fn prepare_input<T: Tensor>(
     })
 }
 
-impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for VlKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -214,7 +212,7 @@ where
 {
 }
 
-impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S> for VlKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -241,7 +239,7 @@ where
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
 
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Self::Error> {
@@ -250,13 +248,13 @@ where
     type AdmissionConfig = ModelArgs;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.kernel().args.clone()
+        self.args.clone()
     }
 
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<
         crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         eredu_core::CapabilityError,
@@ -344,7 +342,7 @@ where
                 Ok(
                     (patches > 0).then_some(CompositeContinuationGeometry::Uniform(vec![
                         patches,
-                        self.kernel().args.vision.hidden_size,
+                        self.args.vision.hidden_size,
                     ])),
                 )
             })()?
@@ -394,17 +392,14 @@ where
                 if patch_positions == 0 || projected_positions == 0 {
                     return Ok(Some(vec![Vec::new(); pipeline_stages]));
                 }
-                let layers = self.kernel().args.vision.layer_count();
+                let layers = self.args.vision.layer_count();
                 if layers < pipeline_stages {
                     return Err(
                         "Qwen3-VL vision collective schedule has fewer units than PP stages".into(),
                     );
                 }
-                let patch_shape = vec![patch_positions, self.kernel().args.vision.hidden_size];
-                let projected_shape = vec![
-                    projected_positions,
-                    self.kernel().args.vision.out_hidden_size,
-                ];
+                let patch_shape = vec![patch_positions, self.args.vision.hidden_size];
+                let projected_shape = vec![projected_positions, self.args.vision.out_hidden_size];
                 let mut ingress_operations = Vec::new();
                 for (part, plan) in input
                     .prepared()
@@ -417,7 +412,7 @@ where
                         let positions = i32::try_from(*positions)
                             .map_err(|_| "Qwen3-VL text positions exceed i32".to_owned())?;
                         ingress_operations.push(CompositeTensorCollective::Sum {
-                            shape: vec![batch, positions, self.kernel().args.text.hidden_size],
+                            shape: vec![batch, positions, self.args.text.hidden_size],
                         });
                     }
                 }
@@ -434,7 +429,6 @@ where
                             },
                         ]);
                         if self
-                            .kernel()
                             .args
                             .vision
                             .layer_policy(layer)
@@ -485,7 +479,7 @@ where
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Self::Error> {
         if source_group == 1 && destination_group == 1 {
             let schema = eredu_runtime::ArchitectureBoundary::wire_schema(
-                &PipelineBoundarySchema::from_args(&self.kernel().args),
+                &PipelineBoundarySchema::from_args(&self.args),
             )
             .map_err(|error| Error::backend(error.to_string()))?;
             let auxiliary = selected.auxiliary().len();
@@ -508,12 +502,9 @@ where
             return Ok(None);
         }
         let same_group = source_group == destination_group;
-        let schema = vision_partition_boundary_schema(
-            &self.kernel().args,
-            same_group,
-            selected.auxiliary().len(),
-        )
-        .map_err(|error| Error::backend(error.to_string()))?;
+        let schema =
+            vision_partition_boundary_schema(&self.args, same_group, selected.auxiliary().len())
+                .map_err(|error| Error::backend(error.to_string()))?;
         let primary_sequence = if same_group {
             continuation
                 .ok_or_else(|| Error::backend("Qwen3-VL continuation has no patch geometry"))?
@@ -593,7 +584,7 @@ where
             let mut values = values.into_iter();
             let hidden = values.next().expect("validated decoder boundary primary");
             let boundary = eredu_runtime::ArchitectureBoundary::decode(
-                &PipelineBoundarySchema::from_args(&self.kernel().args),
+                &PipelineBoundarySchema::from_args(&self.args),
                 values.collect(),
             )
             .map_err(|error| Error::backend(error.to_string()))?;
@@ -898,7 +889,8 @@ pub fn vision_partition_boundary_schema(
     continuation: bool,
     deepstack_count: usize,
 ) -> Result<eredu_runtime::BoundaryWireSchema, eredu_runtime::ArchitectureBoundaryError> {
-    use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+    use eredu_core::communication::BoundaryTensorDtype as Dtype;
+    use eredu_runtime::BoundaryTensorDimension as Dim;
     eredu_runtime::BoundaryWireSchema::new(
         if continuation {
             "qwen_vl.vision_continuation"
@@ -945,7 +937,8 @@ impl eredu_runtime::ArchitectureBoundary for PipelineBoundarySchema {
     }
 
     fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
-        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        use eredu_core::communication::BoundaryTensorDtype as Dtype;
+        use eredu_runtime::BoundaryTensorDimension as Dim;
         let mut specs = vec![
             eredu_runtime::BoundaryTensorSpec::new(
                 "cosine",

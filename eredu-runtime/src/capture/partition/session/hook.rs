@@ -1,29 +1,8 @@
 //! A prepaid status vote on the ranks that execute one observation boundary.
 use super::*;
 use eredu_core::{
-    BackendFailure, BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Submission,
+    BackendFailure, BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome,
 };
-
-/// Native status agreement on an exact architecture-declared invocation group.
-/// This is separate from world receipt transport: inactive pipeline ranks must
-/// never enter a hook collective. Implementations validate retained membership
-/// and the selected failure-agreement requirement before returning a cold bound.
-pub trait PartitionCaptureHookTransport: PartitionCaptureTransport {
-    /// Status whose host resolution is permitted only after exact completion.
-    type HookOutput;
-    /// Cold per-member logical bound, including completion and host resolution.
-    /// Called on every world rank, including nonmembers. Must submit no work.
-    fn estimate_capture_hook(&self, members: &[usize]) -> Result<CaptureUsage, CaptureError>;
-    /// Submits one payload-free success vote on the declared invocation group.
-    /// Runtime settles singleton groups locally without calling this method.
-    fn submit_capture_hook(
-        &self,
-        members: &[usize],
-        success: bool,
-    ) -> Result<Submission<Self::HookOutput, Self::Completion>, Self::Error>;
-    /// True only when every invocation-group member reported success.
-    fn resolve_capture_hook(&self, output: Self::HookOutput) -> Result<bool, Self::Error>;
-}
 
 /// Move-only error-vote credits, isolated from producer and receipt allowances.
 /// Membership is fixed before common pre-forward coordination. Replicated
@@ -108,13 +87,13 @@ impl CaptureSession {
             .into());
         }
         let transport = work.exchange.transport();
-        let wait = transport.capture_wait()?;
+        let wait = crate::capture::partition::capture_wait(transport)?;
         if !T::Completion::supports_cancellation(wait.cancellation()) {
             return Err(
                 CaptureError::Unsupported("partition hook cancellation policy".into()).into(),
             );
         }
-        let native = transport.estimate_capture_hook(&members)?;
+        let native = crate::capture::partition::estimate_hook(transport, &members)?;
         let metadata = CaptureUsage {
             host_bytes: add(1024, mul(members.len() as u64, 8)?)?,
             ..Default::default()
@@ -260,8 +239,8 @@ where
         }
         Ok(success)
     })();
-    if let Err(error) = &result {
-        transport.fail_capture_exchange(error);
+    if result.is_err() {
+        transport.fence_capture_exchange();
     }
     result
 }

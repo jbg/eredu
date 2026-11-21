@@ -6,9 +6,7 @@
 //! after its ordinary execution/completion transaction succeeds.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -191,7 +189,7 @@ impl SnapshotValue for AudioDecoderConfig {
     fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
         snapshot_value_estimate::<Self>([self.neural.estimate_snapshot_value()])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             quantizer: self.quantizer,
             spectral: self.spectral,
@@ -253,7 +251,7 @@ impl<T: Tensor + SnapshotValue, N: SnapshotValue> SnapshotValue for AudioDecoder
             self.spectral.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             config: self.config.copy_snapshot_value(retention)?,
             neural: self.neural.copy_snapshot_value(retention)?,

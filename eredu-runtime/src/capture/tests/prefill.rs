@@ -25,6 +25,7 @@ impl CaptureBackend for Rows {
         tensor: &Self::Tensor,
         _: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Infallible> {
         let values = (slice.starts[0]..slice.ends[0])
             .step_by(slice.strides[0] as usize)

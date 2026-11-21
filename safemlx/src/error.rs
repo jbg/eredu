@@ -129,6 +129,10 @@ cfg_safetensors! {
         #[error(transparent)]
         PodCastError(#[from] bytemuck::PodCastError),
 
+        /// Evaluated MLX storage could not be borrowed as contiguous tensor data.
+        #[error(transparent)]
+        ArrayData(#[from] AsSliceError),
+
         /// Error with creating a `safetensors::tensor::TensorView`.
         #[error(transparent)]
         SafeTensorError(#[from] safetensors::tensor::SafeTensorError),

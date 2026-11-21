@@ -10,7 +10,7 @@ pub(super) fn register(
     local: &LocalModelLayout,
     execution: &crate::speculative_execution::SpeculativeActivationExecution,
 ) -> Result<(), ComponentPartitionError> {
-    if spec.units.len() != execution.depth {
+    if spec.units.len() != execution.depth() {
         return Err(CaptureError::Invalid(
             "prediction capture depth differs from prepared modules".into(),
         )

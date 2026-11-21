@@ -6,6 +6,7 @@ use super::{
         RnntPredictorKernel, RnntPredictorRuntimeState,
     },
 };
+use eredu_core::communication::{BoundaryTensorDtype, CommunicationRouteId};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::*;
 use std::{collections::BTreeMap, ops::Range};

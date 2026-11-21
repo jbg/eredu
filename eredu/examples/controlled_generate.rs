@@ -56,9 +56,13 @@ pub fn run_example(
 ) -> anyhow::Result<()> {
     let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0")?)
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true));
-    let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), artifact, &execution)?
-            .into_parts();
+    let (mut model, _) = LoadedModel::load_execution_plan(
+        &MlxBackendFactory::default(),
+        artifact,
+        &execution,
+        None,
+    )?
+    .into_parts();
     let discovery = model.intervention_discovery()?;
     let target = discovery
         .points

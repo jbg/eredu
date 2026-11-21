@@ -1,10 +1,12 @@
 //! Common invocation access without changing layered traversal or residency policy.
 
+use eredu_core::SubmissionBackend;
+
 use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
-    ParallelLayeredArchitecture, ResidentRuntime, RuntimeState, SubmissionBackend,
+    ParallelLayeredArchitecture, ResidentRuntime, RuntimeState,
 };
 
 /// Invokes an existing runtime while allowing architecture-owned ingress and readout.

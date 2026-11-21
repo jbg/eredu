@@ -1,5 +1,7 @@
 //! Bound RNNT execution through shared parameter and traversal mechanisms.
 
+use eredu_core::SubmissionBackend;
+
 use super::{
     rnnt::{
         RnntDimensions, RnntError, RnntExecution, RnntPredictionState, RnntProjectionExecution,
@@ -9,7 +11,7 @@ use super::{
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     BoundStatelessComponent, ComponentAdapter, ComponentDefinition, LayeredTensorCohort,
-    LayerwisePolicy, SubmissionBackend,
+    LayerwisePolicy,
 };
 
 /// Bound RNNT phases with optional recurrent parameter ownership.

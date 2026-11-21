@@ -123,7 +123,7 @@ pub fn prepared_semantic_tokens<T: Tensor>(
             };
             match plan {
                 QwenInputPartPlan::TextTokens { .. } => match part.payload() {
-                    eredu_runtime::PreparedInputPayload::TokenIds(ids) => Ok(ids.clone()),
+                    eredu_core::PreparedInputPayload::TokenIds(ids) => Ok(ids.clone()),
                     _ => Err(Error::backend("admitted text part lost token IDs")),
                 },
                 QwenInputPartPlan::Projected { positions, .. } => {
@@ -192,7 +192,7 @@ pub fn prepare_input<T: Tensor>(
                 projected.push(None);
             }
             QwenInputPartPlan::Projected { .. } => {
-                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Embeddings(value) = part.payload() else {
                     return Err(Error::backend("Qwen projected part lost its embeddings"));
                 };
 
@@ -200,7 +200,7 @@ pub fn prepare_input<T: Tensor>(
                 projected.push(Some(value.clone()));
             }
             QwenInputPartPlan::Media { ingress, .. } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Qwen admitted media lost its tensor payload",
                     ));

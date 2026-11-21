@@ -7,38 +7,47 @@ use std::sync::{
     Arc, Mutex,
 };
 
-/// Native persistent-state mechanisms for ordinary text generation.
+mod snapshot_native;
+mod snapshot_value;
+pub use snapshot_native::{SamplingGrowthCosts, TextSnapshotNative};
+pub use snapshot_value::{
+    snapshot_value_estimate, SnapshotCostOverflow, SnapshotRetention, SnapshotValue,
+};
+
+/// Persistent execution state owned by an installed text session.
 ///
 /// These operations cover the model's complete mutable execution state and
 /// native metadata, not the sampler, pending input or facade semantic state.
 /// Portable composition must reserve known costs before copying and combine all
-/// of those owners before advertising a complete generation snapshot. Backends
-/// cooperate with their existing submission authority and recovery owner.
-pub trait NativeTextStateBackend: crate::TextGenerationBackend {
+/// of those owners before advertising a complete generation snapshot. The session
+/// owns admission and uses its native mechanisms to settle outstanding work.
+pub trait NativeTextStateSession<B: crate::BackendProvider>:
+    crate::BackendSession<B> + Sized
+{
     /// Independently writable, opaque, in-process native state slot. Sharing
     /// immutable weights is allowed; cloning mutable storage handles is not.
     type NativeTextState;
 
     /// Side-effect-free support facts for this exact loaded execution. This is
     /// a primitive report, not full generation-snapshot capability discovery.
-    fn native_text_state_support(runtime: &crate::ModelRuntime<Self>) -> ControlSupport;
+    fn native_text_state_support(runtime: &crate::ModelRuntime<B, Self>) -> ControlSupport;
 
     /// Estimates copying installed state (`None`) or a compatible saved slot.
     /// Unknown costs remain explicit and must be rejected before copying.
     fn estimate_native_text_state(
-        runtime: &crate::ModelRuntime<Self>,
+        runtime: &crate::ModelRuntime<B, Self>,
         saved: Option<&Self::NativeTextState>,
-    ) -> Result<Option<SnapshotEstimate>, Self::Error>;
+    ) -> Result<Option<SnapshotEstimate>, B::Error>;
 
     /// Conservative additional logical retention through at most this many new
     /// input tokens, starting from the saved state. Includes cache capacity growth
     /// and initially absent recurrent/convolution components, without executing
     /// input. Unknown growth disables runnable branches, not immutable snapshots.
     fn estimate_native_text_growth(
-        _runtime: &crate::ModelRuntime<Self>,
+        _runtime: &crate::ModelRuntime<B, Self>,
         _saved: &Self::NativeTextState,
         _additional_input_tokens: u64,
-    ) -> Result<Option<u64>, Self::Error> {
+    ) -> Result<Option<u64>, B::Error> {
         Ok(None)
     }
 
@@ -46,30 +55,30 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
     /// only after successful exact native completion. Failure never changes
     /// the logical source state; unresolved work remains retained and fenced.
     fn capture_native_text_state(
-        runtime: &mut crate::ModelRuntime<Self>,
-    ) -> Result<Self::NativeTextState, Self::Error>;
+        runtime: &mut crate::ModelRuntime<B, Self>,
+    ) -> Result<Self::NativeTextState, B::Error>;
 
     /// Copies a reusable saved slot without installing it or replaying input.
     /// The source remains unchanged even if allocation or completion fails.
     fn copy_native_text_state(
-        runtime: &mut crate::ModelRuntime<Self>,
+        runtime: &mut crate::ModelRuntime<B, Self>,
         saved: &Self::NativeTextState,
-    ) -> Result<Self::NativeTextState, Self::Error>;
+    ) -> Result<Self::NativeTextState, B::Error>;
 
     /// Validates exact executable identity, geometry and safe native boundary
     /// before any state mutation. A different compatible-looking model fails.
     fn validate_native_text_state(
-        runtime: &crate::ModelRuntime<Self>,
+        runtime: &crate::ModelRuntime<B, Self>,
         saved: &Self::NativeTextState,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), B::Error>;
 
     /// Atomically exchanges installed and saved state, without copying tensor
     /// data. The old installed state is returned in `slot`. On error neither
     /// logical state changes; unresolved native failure may fence the engine.
     fn exchange_native_text_state(
-        runtime: &mut crate::ModelRuntime<Self>,
+        runtime: &mut crate::ModelRuntime<B, Self>,
         slot: &mut Self::NativeTextState,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), B::Error>;
 }
 
 /// Version of execution-control metadata and lifecycle records.

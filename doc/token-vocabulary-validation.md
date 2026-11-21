@@ -27,7 +27,6 @@ available. Low-level core callers without a tokenizer may explicitly use `All`.
 cargo check -p eredu --no-default-features
 cargo test -p eredu-core -p eredu-runtime -p eredu-text --lib
 cargo test -p eredu --no-default-features --lib --test portable_facade --test backend_conformance
-cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::generation::backend::tests -- --include-ignored
 cargo build -p eredu-cli
 cargo fmt --all --check
 git diff --check

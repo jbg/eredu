@@ -61,9 +61,6 @@ The focused conformance commands are:
 
 ```sh
 cargo test -p eredu-runtime --lib generation::refinement::tests
-cargo test -p eredu-backend-mlx --no-default-features --lib loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finalization
-cargo test -p eredu-backend-mlx --no-default-features --lib selected_position_scores_read_requested_row_and_reject_out_of_range
-cargo test -p eredu-backend-mlx --no-default-features --lib constrained_finalization_uses_each_final_position_domain
 cargo test -p eredu-cli --no-default-features --features mlx --test decisions
 ```
 

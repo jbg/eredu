@@ -1,6 +1,6 @@
 //! One prospective canonical choice through the existing ordinary sampler.
 use super::SnapshotTokenController;
-use crate::TokenDomain;
+use eredu_core::sampling::TokenDomain;
 use eredu_core::{TokenFilter, TokenFilterController};
 
 /// Rejected canonical choice or error from the original grammar controller.

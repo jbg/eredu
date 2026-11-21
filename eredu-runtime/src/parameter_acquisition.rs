@@ -4,9 +4,10 @@ use std::collections::BTreeSet;
 
 use crate::{
     AddressableBankMemberError, BindingPlacementError, ReplicatedTextContractError,
-    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, ResidencyDeclarationError,
+    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner,
 };
 use eredu_checkpoint::recipe::RecipeError;
+use eredu_core::residency::parameter_binding::ResidencyDeclarationError;
 
 /// Invalid resource ownership, selected geometry or parameter accounting.
 #[derive(Debug, thiserror::Error)]
@@ -263,8 +264,10 @@ pub fn local_parameter_acquisition_units(
         source: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<RecipeMetadata, ParameterAcquisitionError> {
         let bytes = recipe.infer(source)?.byte_len();
-        let binding =
-            crate::WeightBinding::from_recipe(name, recipe, bytes)?.with_logical_target(name)?;
+        let binding = eredu_core::residency::parameter_binding::WeightBinding::from_recipe(
+            name, recipe, bytes,
+        )?
+        .with_logical_target(name)?;
         let mut placed = crate::place_weight_bindings(vec![binding], source, layout)?;
         placed
             .pop()
@@ -343,8 +346,11 @@ pub fn local_parameter_acquisition_units(
 /// No source payload is read and independent resources remain separately leased.
 pub fn partition_parameter_acquisition_bindings(
     units: &[ParameterAcquisitionUnit],
-    bindings: Vec<crate::WeightBinding>,
-) -> Result<Vec<Vec<crate::WeightBinding>>, ParameterAcquisitionError> {
+    bindings: Vec<eredu_core::residency::parameter_binding::WeightBinding>,
+) -> Result<
+    Vec<Vec<eredu_core::residency::parameter_binding::WeightBinding>>,
+    ParameterAcquisitionError,
+> {
     let mut owners = std::collections::BTreeMap::new();
     for (index, unit) in units.iter().enumerate() {
         for target in unit.outputs() {
@@ -386,7 +392,7 @@ pub fn partition_parameter_acquisition_bindings(
         });
     }
     for (unit, bindings) in units.iter().zip(&partitioned) {
-        let actual = crate::physical_binding_bytes(bindings)?;
+        let actual = eredu_core::residency::parameter_binding::physical_binding_bytes(bindings)?;
         if actual != unit.parameter_bytes() {
             return Err(ParameterAcquisitionError::Extent {
                 owner: unit.owner().clone(),

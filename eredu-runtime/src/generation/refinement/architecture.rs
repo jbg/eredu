@@ -13,6 +13,27 @@ pub struct BlockRefinementGeometry {
     pub vocabulary_size: NonZeroU32,
 }
 
+impl BlockRefinementGeometry {
+    pub(crate) fn canvas_shape(self) -> [i32; 2] {
+        [1, self.canvas_length.get() as i32]
+    }
+
+    pub(crate) fn feedback_shape(self) -> [i32; 3] {
+        [
+            1,
+            self.canvas_length.get() as i32,
+            self.vocabulary_size.get() as i32,
+        ]
+    }
+
+    pub(crate) fn position_score_shape(self) -> [i32; 2] {
+        [
+            self.canvas_length.get() as i32,
+            self.vocabulary_size.get() as i32,
+        ]
+    }
+}
+
 /// Shared context and refinement execution over one retained model state.
 ///
 /// The architecture supplies each borrowed input, visibility and score geometry;

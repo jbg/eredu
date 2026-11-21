@@ -1,16 +1,20 @@
 //! Family-blind construction of a selected layered realtime model.
 
+use eredu_core::checkpoint_mechanisms::CheckpointParameterBackend;
+use eredu_core::SubmissionBackend;
+
 use std::{collections::BTreeMap, marker::PhantomData};
 
+use eredu_checkpoint::quantization::BoundedQuantizationTarget;
 use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeMetadata};
 use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
-    LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, ParameterBackend,
-    ParameterGroupOwner, RealtimeWeightComponentRequirement, RealtimeWeightComponentRole,
+    LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime, ParameterGroupOwner,
+    RealtimeWeightComponentRequirement, RealtimeWeightComponentRole,
     RealtimeWeightLoweringRequirement, RuntimeState, SelectedRealtimeRealization,
-    SubmissionBackend, WeightBinding, WeightBindingPlan,
 };
+use eredu_core::residency::parameter_binding::{WeightBinding, WeightBindingPlan};
 
 /// Architecture-issued identities that bind concrete modules to one selection.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -52,24 +56,6 @@ where
         &self,
     ) -> Result<RealtimeArchitectureConstructionIdentity, String> {
         self.kernel().realtime_construction_identity()
-    }
-}
-
-/// Concrete layer storage paired with the exact residency it implemented.
-pub struct RealizedRealtimePolicy<P> {
-    policy: P,
-    residency: LayerWeightResidency,
-}
-
-impl<P> RealizedRealtimePolicy<P> {
-    /// Attaches the implemented residency report to a concrete policy.
-    pub fn new(policy: P, residency: LayerWeightResidency) -> Self {
-        Self { policy, residency }
-    }
-
-    /// Consumes concrete storage and its exact residency report.
-    pub fn into_parts(self) -> (P, LayerWeightResidency) {
-        (self.policy, self.residency)
     }
 }
 
@@ -199,29 +185,60 @@ impl RealtimeMaterializationTask {
 }
 
 /// Canonical owner-partitioned bindings derived from exact realtime tasks.
-#[derive(Debug, Clone)]
-pub struct RealtimeTaskBindingPlan {
+struct RealtimeTaskBindingPlan {
     pinned: Vec<WeightBinding>,
     units: BTreeMap<ParameterGroupOwner, Vec<WeightBinding>>,
 }
 
-impl RealtimeTaskBindingPlan {
-    /// Consumes the pinned and execution-unit binding partitions.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<WeightBinding>,
-        BTreeMap<ParameterGroupOwner, Vec<WeightBinding>>,
-    ) {
-        (self.pinned, self.units)
+/// Projects the selected transforms into exact checkpoint recipes and output names.
+fn realtime_quantization_targets(
+    tasks: &[RealtimeMaterializationTask],
+    quantization: eredu_checkpoint::WeightQuantization,
+) -> Result<Vec<BoundedQuantizationTarget>, String> {
+    let mut targets = BTreeMap::new();
+    for lowering in tasks
+        .iter()
+        .map(RealtimeMaterializationTask::lowering)
+        .filter(|lowering| lowering.kind().transforms_payload())
+    {
+        let target = lowering.target().as_str();
+        if lowering.descriptor().executable().weight_quantization() != Some(quantization) {
+            return Err(format!(
+                "selected realtime transform {target:?} does not match its executable format"
+            ));
+        }
+        let scale = lowering.scale().ok_or_else(|| {
+            format!("selected realtime transform {target:?} has no scale component")
+        })?;
+        let recipe = lowering.primary().recipe().ok_or_else(|| {
+            format!("selected realtime transform {target:?} has no source recipe")
+        })?;
+        let binding = BoundedQuantizationTarget::from_recipe(
+            target,
+            scale.target().as_str(),
+            lowering
+                .affine_bias()
+                .map(|component| component.target().as_str()),
+            recipe.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        if targets.insert(target, binding).is_some() {
+            return Err(format!(
+                "selected realtime transform {target:?} appears more than once"
+            ));
+        }
     }
+    if targets.is_empty() {
+        return Err("selected realtime transform contains no packed matrix tasks".into());
+    }
+    Ok(targets.into_values().collect())
 }
 
 /// Validates every exact realtime task and backend recipe capability without payload access.
 ///
 /// This gate is valid against the original checkpoint even when later transform
 /// work publishes authoritative packed outputs.
-pub fn preflight_realtime_materialization_tasks<B: ParameterBackend>(
+fn preflight_realtime_materialization_tasks<B: CheckpointParameterBackend>(
     tasks: &[RealtimeMaterializationTask],
     source: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<(), RealtimeModelContractError> {
@@ -288,7 +305,7 @@ pub fn preflight_realtime_materialization_tasks<B: ParameterBackend>(
 }
 
 /// Derives the singular canonical binding partitions from exact realtime tasks.
-pub fn realtime_task_binding_plan(
+fn realtime_task_binding_plan(
     tasks: &[RealtimeMaterializationTask],
     source: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<RealtimeTaskBindingPlan, RealtimeModelContractError> {
@@ -439,7 +456,8 @@ impl PreparedRealtimeModelContract {
 }
 
 /// Generic mechanisms used only to materialize and store a selected model.
-pub trait RealtimeModelConstructionMechanisms<A, B>
+pub trait RealtimeModelConstructionMechanisms<A, B>:
+    eredu_core::checkpoint_mechanisms::unit_binding::ParameterStorageBinding<B>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     A: LayeredArchitecture<B, Self::State>,
@@ -452,44 +470,43 @@ where
     /// Shared resident/bounded policy failure.
     type PolicyError;
     /// Fully resident unit storage.
-    type ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>;
+    type ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>
+        + crate::bounded_execution::units::BindResidentPolicy<
+            B,
+            A::Unit,
+            crate::ParameterUnitStorage<B, Self>,
+        >;
     /// Host-windowed or disk-streamed unit storage.
-    type BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>;
+    type BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>
+        + crate::bounded_execution::units::BindBoundedPolicy<
+            A::Unit,
+            crate::ParameterUnitStorage<B, Self>,
+        >;
     /// Mechanism failure.
-    type Error;
+    type Error: From<eredu_core::BackendFailure>;
 
-    /// Materializes and binds every resident static/unit component exactly once.
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_resident_materialization(
-        &mut self,
-        architecture: &mut A,
-        units: &mut [A::Unit],
-        source_architecture: Option<&mut A>,
-        source_units: Option<&mut [A::Unit]>,
-        tasks: &[RealtimeMaterializationTask],
-        selected: &SelectedRealtimeRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<(), Self::Error>;
+    /// Native storage geometry and encoding for exact portable targets.
+    type ParameterEncoding: eredu_core::checkpoint_mechanisms::ExactParameterMaterializer<B>;
+}
 
-    /// Builds fully resident storage around populated units.
-    fn resident_policy(
-        &mut self,
-        architecture: &mut A,
-        units: Vec<A::Unit>,
-        selected: &SelectedRealtimeRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<RealizedRealtimePolicy<Self::ResidentPolicy>, Self::Error>;
-
-    /// Builds selected bounded storage without eagerly constructing every unit.
-    #[allow(clippy::too_many_arguments)]
-    fn bounded_policy(
-        &mut self,
-        architecture: &mut A,
-        source_architecture: Option<&mut A>,
-        tasks: &[RealtimeMaterializationTask],
-        selected: &SelectedRealtimeRealization,
-        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
-    ) -> Result<RealizedRealtimePolicy<Self::BoundedPolicy>, Self::Error>;
+impl<A, B, M> RealtimeModelConstructionMechanisms<A, B> for M
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    B: eredu_core::backend::LocalComponentStorage<
+        CacheStorage: eredu_core::cache::mechanisms::ResidentKeyValueStorage
+                          + eredu_core::cache::mechanisms::PagedKeyValueStorage,
+    >,
+    A: LayeredArchitecture<B, crate::state::KeyValueState<B::CacheStorage>, Unit: 'static>,
+    M: crate::ParameterUnitMechanisms<B>,
+    M::Parameters: eredu_core::checkpoint_mechanisms::ExactParameterMaterializer<B>,
+    M::UnitPolicy<A::Unit>: LayerwisePolicy<B, A::Unit, Error: From<eredu_core::BackendFailure>>,
+{
+    type State = crate::state::KeyValueState<B::CacheStorage>;
+    type PolicyError = <M::UnitPolicy<A::Unit> as LayerwisePolicy<B, A::Unit>>::Error;
+    type ResidentPolicy = M::UnitPolicy<A::Unit>;
+    type BoundedPolicy = M::UnitPolicy<A::Unit>;
+    type Error = Self::PolicyError;
+    type ParameterEncoding = M::Parameters;
 }
 
 /// Retained portable construction that can be bound by native mechanisms.
@@ -507,7 +524,7 @@ pub trait PreparedRealtimeBinding<B, State, M>: Sized {
 }
 
 /// Realized transport for a selected tensor group.
-pub struct RealtimeTensorResources<B: crate::CommunicationBackend, G, R, I>
+pub struct RealtimeTensorResources<B: eredu_core::communication::CommunicationBackend, G, R, I>
 where
     B::ParallelContext: Sized,
 {
@@ -519,101 +536,8 @@ where
     pub executor: B::OwnedExecutor,
 }
 
-/// Native mechanisms for binding a portable layered realtime construction.
-pub trait RealtimeBindingMechanisms<B, State>
-where
-    B: crate::CommunicationBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    B::ParallelContext: Sized,
-    State: RuntimeState<B>,
-{
-    /// Retained native execution handle.
-    type Execution;
-    /// Native binding or policy error.
-    type Error: std::fmt::Display;
-    /// Retained communication group.
-    type Group: std::borrow::Borrow<B::CommunicationGroup>;
-    /// Realized communication route.
-    type Route: std::borrow::Borrow<B::CommunicationRoute>;
-    /// Native tensor metadata used in transfer admission.
-    type TensorMetadata: crate::CommunicationTensorMetadata<B>;
-    /// Sampling primitives for a bound executor.
-    type Sampling: crate::SamplingBackend<
-        Logits = B::Tensor,
-        Token = B::Tensor,
-        Context = B::Executor,
-    >;
-    /// Sampler supported by this binding.
-    type Sampler: crate::Sampler<Self::Sampling>;
-    /// Native materializer specialized to the declared architecture units.
-    type Materializer<A>: RealtimeModelConstructionMechanisms<
-            A,
-            B,
-            State = State,
-            PolicyError = Self::Error,
-            Error = Self::Error,
-            ResidentPolicy: RealtimeResidencyTelemetry<Error = Self::Error>,
-            BoundedPolicy: RealtimeResidencyTelemetry<Error = Self::Error>,
-        > + 'static
-    where
-        A: LayeredArchitecture<B, State> + 'static,
-        A::Unit: 'static;
-
-    /// Borrowed context for architecture module construction.
-    fn context(&self) -> &B::Executor;
-
-    /// Realizes the exact group declared by portable construction.
-    fn realize_tensor(
-        &self,
-        manifest: crate::CommunicationManifest,
-        group: eredu_core::CollectiveGroupId,
-    ) -> Result<
-        RealtimeTensorResources<B, Self::Group, Self::Route, Self::TensorMetadata>,
-        Self::Error,
-    >;
-
-    /// Supplies native weight storage for the retained source and local layout.
-    fn materializer<A>(
-        &self,
-        source: eredu_checkpoint::store::SharedCheckpointSource,
-        residency: LayerWeightResidency,
-        transform: Option<eredu_checkpoint::WeightQuantization>,
-        layout: Option<&crate::LocalModelLayout>,
-    ) -> Self::Materializer<A>
-    where
-        A: LayeredArchitecture<B, State> + 'static,
-        A::Unit: 'static;
-
-    /// Reads native materialization metadata after construction.
-    fn materialization_metadata<A>(
-        &self,
-        materializer: &Self::Materializer<A>,
-    ) -> Result<crate::LayerwiseModelMetadata, Self::Error>
-    where
-        A: LayeredArchitecture<B, State> + 'static,
-        A::Unit: 'static;
-
-    /// Erases the portable executor while retaining its native resources.
-    fn bind_executor<E, F, R>(
-        &self,
-        executor: E,
-        metadata: crate::LayerwiseModelMetadata,
-        source: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Self::Execution
-    where
-        E: crate::PreparedRealtimeFrameExecutor<
-                Self::Sampling,
-                Self::Sampler,
-                State,
-                Error = F,
-                Retained = R,
-            > + RealtimeResidencyTelemetry<Error = Self::Error>
-            + 'static,
-        F: std::fmt::Display,
-        R: eredu_nn::RetainedTensorRoots<B::Tensor> + 'static;
-}
-
-/// Live telemetry of the policy serving a bound realtime execution.
-pub trait RealtimeResidencyTelemetry {
+/// Live telemetry of installed parameter-unit residency.
+pub trait UnitResidencyTelemetry {
     /// Failure reading the native policy.
     type Error;
 
@@ -651,7 +575,6 @@ where
 {
     selected: SelectedRealtimeRealization,
     execution: RealtimeLayerwiseRuntime<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
-    mechanisms: M,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -680,16 +603,6 @@ where
         &mut self.execution
     }
 
-    /// Returns generic construction mechanisms for reports or later composition.
-    pub const fn mechanisms(&self) -> &M {
-        &self.mechanisms
-    }
-
-    /// Mutably borrows generic construction mechanisms.
-    pub fn mechanisms_mut(&mut self) -> &mut M {
-        &mut self.mechanisms
-    }
-
     /// Decomposes selected construction for installation in the exact
     /// topology-specific neutral execution runtime.
     #[allow(clippy::type_complexity)]
@@ -698,31 +611,37 @@ where
     ) -> (
         SelectedRealtimeRealization,
         RealtimeLayerwiseRuntime<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
-        M,
     ) {
-        (self.selected, self.execution, self.mechanisms)
+        (self.selected, self.execution)
     }
 }
 
 /// Constructs static modules, selected units and their exact parameter storage.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn construct_realtime_execution<A, B, M>(
     mut architecture: A,
-    mut source_architecture: Option<A>,
+    source_architecture: Option<A>,
     prepared: PreparedRealtimeModelContract,
-    mut mechanisms: M,
+    source: eredu_checkpoint::store::SharedCheckpointSource,
+    local_layout: Option<&crate::LocalModelLayout>,
+    transform: Option<eredu_checkpoint::WeightQuantization>,
+    mechanisms: &M,
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
-    ConstructedRealtimeExecution<A, B, M>,
+    (
+        ConstructedRealtimeExecution<A, B, M>,
+        crate::LayerwiseModelMetadata,
+    ),
     RealtimeModelConstructionError<A::Error, M::PolicyError, M::Error>,
 >
 where
-    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + CheckpointParameterBackend,
     M: RealtimeModelConstructionMechanisms<A, B>,
     A: LayeredArchitecture<B, M::State> + RealtimeArchitectureIdentity,
     A::Error: std::fmt::Display,
     M::PolicyError: std::fmt::Display,
-    M::Error: std::fmt::Display,
+    M::Error: std::fmt::Display + From<eredu_core::BackendFailure>,
 {
     let (selected, tasks) = prepared.into_parts();
     let requires_source_architecture = selected
@@ -740,62 +659,137 @@ where
         validate_architecture::<A, B, M::State>(source, &selected, true, context)
             .map_err(widen_error)?;
     }
-    let execution = match selected.residency() {
-        LayerWeightResidency::FullyResident => {
-            let mut units = construct_units::<A, B, M::State>(&architecture, &selected, context)
-                .map_err(widen_error)?;
-            let mut source_units = source_architecture
-                .as_ref()
-                .map(|source| construct_units::<A, B, M::State>(source, &selected, context))
-                .transpose()
-                .map_err(widen_error)?;
-            mechanisms
-                .prepare_resident_materialization(
-                    &mut architecture,
-                    &mut units,
-                    source_architecture.as_mut(),
-                    source_units.as_deref_mut(),
-                    &tasks,
-                    &selected,
-                    context,
-                )
-                .map_err(RealtimeModelConstructionError::Mechanism)?;
-            let (policy, residency) = mechanisms
-                .resident_policy(&mut architecture, units, &selected, context)
-                .map_err(RealtimeModelConstructionError::Mechanism)?
-                .into_parts();
-            if residency != selected.residency() {
-                return Err(RealtimeModelConstructionError::Contract(
-                    "realized realtime weight residency differs from selection".into(),
-                ));
-            }
-            RealtimeLayerwiseRuntime::Resident(LayerwiseRuntime::new(architecture, policy))
+    let invocations = architecture
+        .execution_unit_storage_map()
+        .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))?;
+    invocations
+        .validate_layout(selected.execution_units())
+        .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))?;
+    let units = if selected.residency().is_fully_resident() || requires_source_architecture {
+        construct_units::<A, B, M::State>(&architecture, &invocations, context)
+            .map_err(widen_error)?
+    } else {
+        Vec::new()
+    };
+    preflight_realtime_materialization_tasks::<B>(&tasks, source.as_ref())
+        .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))?;
+    let (source, materialization) = match (requires_source_architecture, transform) {
+        (true, Some(quantization)) => {
+            let targets = realtime_quantization_targets(&tasks, quantization)
+                .map_err(RealtimeModelConstructionError::Contract)?;
+            let targets =
+                crate::exact_parameter_materialization::bind_packed_transform_targets::<
+                    B,
+                    M::ParameterEncoding,
+                    _,
+                    _,
+                >(architecture.static_modules(), &units, quantization, targets)
+                .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))?;
+            let (source, report) =
+                crate::exact_parameter_materialization::materialize_exact_quantization::<
+                    B,
+                    M::ParameterEncoding,
+                >(source, quantization, targets, context)
+                .map_err(|error| RealtimeModelConstructionError::Mechanism(error.into()))?;
+            (source, Some(report))
         }
-        LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
-            let (policy, residency) = mechanisms
-                .bounded_policy(
-                    &mut architecture,
-                    source_architecture.as_mut(),
-                    &tasks,
-                    &selected,
-                    context,
-                )
-                .map_err(RealtimeModelConstructionError::Mechanism)?
-                .into_parts();
-            if residency != selected.residency() {
-                return Err(RealtimeModelConstructionError::Contract(
-                    "realized realtime weight residency differs from selection".into(),
-                ));
-            }
-            RealtimeLayerwiseRuntime::Bounded(LayerwiseRuntime::new(architecture, policy))
+        (false, None) => (source, None),
+        _ => {
+            return Err(RealtimeModelConstructionError::Contract(
+                "selected realtime lowering differs from the weight transform".into(),
+            ))
         }
     };
-    Ok(ConstructedRealtimeExecution {
-        selected,
-        execution,
-        mechanisms,
-        backend: PhantomData,
+    let RealtimeTaskBindingPlan {
+        mut pinned,
+        units: mut unit_bindings,
+    } = realtime_task_binding_plan(&tasks, source.as_ref())
+        .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))?;
+    if let Some(layout) = local_layout {
+        let place = |bindings| {
+            crate::place_weight_bindings(bindings, source.as_ref(), layout)
+                .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))
+        };
+        pinned = place(pinned)?;
+        for bindings in unit_bindings.values_mut() {
+            *bindings = place(std::mem::take(bindings))?;
+        }
+    }
+    let layout = invocations.storage_layout();
+    let bindings = (0..layout.len())
+        .map(|ordinal| {
+            let address = layout.address(ordinal).expect("admitted storage ordinal");
+            let group = layout
+                .group_id(address.group())
+                .expect("admitted storage group");
+            unit_bindings
+                .remove(&ParameterGroupOwner::execution_unit(
+                    group.clone(),
+                    address.index(),
+                ))
+                .ok_or_else(|| {
+                    RealtimeModelConstructionError::Contract(format!(
+                        "selected unit bindings are missing for {address:?}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !unit_bindings.is_empty() {
+        return Err(RealtimeModelConstructionError::Contract(
+            "selected realtime task bindings contain unowned units".into(),
+        ));
+    }
+
+    crate::checkpoint_quantization::realize_prepared_quantization(&source, || {
+        mechanisms.unit_quantizer()
     })
+    .map_err(RealtimeModelConstructionError::Storage)?;
+    let resources = crate::prepare_parameter_resources(
+        source.as_ref(),
+        &invocations,
+        selected.residency(),
+        pinned,
+        bindings,
+        Vec::new(),
+        |_| false,
+        |bindings| mechanisms.unit_host_capacity(bindings),
+    )
+    .map_err(|error| RealtimeModelConstructionError::Contract(error.to_string()))?;
+    let (storage, mut metadata) = crate::parameter_units::materialize_parameter_units(
+        mechanisms,
+        source,
+        architecture.static_modules_mut(),
+        resources,
+        None,
+        None,
+        None,
+    )
+    .map_err(RealtimeModelConstructionError::Storage)?;
+    metadata.set_materialization(materialization);
+
+    let execution = if selected.residency().is_fully_resident() {
+        let policy = <M::ResidentPolicy as crate::bounded_execution::units::BindResidentPolicy<
+            B,
+            A::Unit,
+            crate::ParameterUnitStorage<B, M>,
+        >>::bind_resident(storage, units, context)
+        .map_err(|error| RealtimeModelConstructionError::Mechanism(error.into()))?;
+        RealtimeLayerwiseRuntime::Resident(LayerwiseRuntime::new(architecture, policy))
+    } else {
+        let policy = <M::BoundedPolicy as crate::bounded_execution::units::BindBoundedPolicy<
+            A::Unit,
+            crate::ParameterUnitStorage<B, M>,
+        >>::bind_bounded(storage);
+        RealtimeLayerwiseRuntime::Bounded(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok((
+        ConstructedRealtimeExecution {
+            selected,
+            execution,
+            backend: PhantomData,
+        },
+        metadata,
+    ))
 }
 
 fn widen_error<A, P, M>(
@@ -815,12 +809,15 @@ where
         }
         RealtimeModelConstructionError::Mechanism(error) => match error {},
         RealtimeModelConstructionError::Policy(error) => match error {},
+        RealtimeModelConstructionError::Storage(error) => {
+            RealtimeModelConstructionError::Storage(error)
+        }
     }
 }
 
 fn construct_units<A, B, S>(
     architecture: &A,
-    selected: &SelectedRealtimeRealization,
+    invocations: &crate::ExecutionUnitAddressMap,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<
     Vec<A::Unit>,
@@ -832,14 +829,13 @@ where
     A: LayeredArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
-    (0..selected.execution_units().len())
+    (0..invocations.storage_layout().len())
         .map(|ordinal| {
-            let address = selected
-                .execution_units()
-                .address(ordinal)
-                .expect("selected execution ordinal has an address");
+            let storage = invocations
+                .storage_location(ordinal)
+                .expect("admitted physical storage ordinal");
             architecture
-                .build_unit(address.group(), address.index(), context)
+                .build_storage_unit(storage, context)
                 .map_err(RealtimeModelConstructionError::Architecture)
         })
         .collect()
@@ -1000,6 +996,9 @@ where
     /// Generic materialization, state, or storage mechanism failed.
     #[error("realtime model mechanism failed: {0}")]
     Mechanism(M),
+    /// Native parameter storage preparation failed.
+    #[error("realtime parameter storage failed: {0}")]
+    Storage(#[source] eredu_core::BackendFailure),
     /// Resident/bounded policy failure reserved for execution-time composition.
     #[error("realtime residency policy failed: {0}")]
     Policy(P),

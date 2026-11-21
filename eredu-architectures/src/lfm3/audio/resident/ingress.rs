@@ -131,11 +131,12 @@ impl<S: SnapshotValue, T: Tensor + SnapshotValue> IsolatedStateCopy for IngressS
     }
 
     fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        let retention = retention.authority();
         Ok(Self {
             mel: self.mel.clone(),
-            encoder: self.encoder.copy_snapshot_value(retention)?,
-            language: self.language.copy_snapshot_value(retention)?,
-            hidden: self.hidden.copy_snapshot_value(retention)?,
+            encoder: self.encoder.copy_snapshot_value(&retention)?,
+            language: self.language.copy_snapshot_value(&retention)?,
+            hidden: self.hidden.copy_snapshot_value(&retention)?,
             origin: self.origin.clone(),
             progress: self.progress,
         })
@@ -266,7 +267,7 @@ where
             .map_err(IsolatedStateError::Admission)?;
         let random_state = self
             .random
-            .copy_snapshot_value(&retention)
+            .copy_snapshot_value(&retention.authority())
             .map_err(IsolatedStateError::Backend)?;
         let mut state = self
             .state
@@ -387,15 +388,15 @@ where
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<AudioIngressProgress, AudioIngressError> {
-        H::with_input_recovery(|| {
-            self.advance(samples, sample_rate, false)?;
-            Ok(self.progress())
-        })
+        let _scope = H::open_input_recovery()?;
+        self.advance(samples, sample_rate, false)?;
+        Ok(self.progress())
     }
 
     /// Flushes the trailing input and appends the text suffix, then enters the ordinary response driver.
     pub fn finish(self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
-        H::with_input_recovery(|| self.finish_input())
+        let _scope = H::open_input_recovery()?;
+        self.finish_input()
     }
 
     fn finish_input(mut self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
@@ -438,13 +439,12 @@ where
         sample_rate: u32,
         final_chunk: bool,
     ) -> Result<(), AudioIngressError> {
-        if let Some(fork) = &self.fork {
-            H::with_fork_retention(fork.growth.clone(), || {
-                self.advance_input(samples, sample_rate, final_chunk)
-            })?
-        } else {
-            self.advance_input(samples, sample_rate, final_chunk)
-        }
+        let _retention = self
+            .fork
+            .as_ref()
+            .map(|fork| H::hold_fork_retention(fork.growth.clone()))
+            .transpose()?;
+        self.advance_input(samples, sample_rate, final_chunk)
     }
 
     fn advance_input(

@@ -17,12 +17,16 @@ use eredu_core::{
         ArtifactCompanionRole, ArtifactError, ArtifactFile, ArtifactIdentity,
         DeferredArtifactIdentity,
     },
+    checkpoint_mechanisms::{ModelBindingResources, TextBindingContext, TextBindingResources},
     ArtifactFormat, ModelArtifact, ModelPreparationPlan,
+};
+use eredu_runtime::executable_binding::{
+    BoundExecutionRoutes, PreparedExecutableConstruction, PreparedModelBinding, TextRankRoutes,
 };
 
 use crate::{
-    configuration::PredictionExtensionPlan, processor_plan::ArtifactArchitecturePlan,
-    SelectedPreparation,
+    configuration::PredictionExtensionPlan, processor_execution::PreparedProcessor,
+    processor_plan::ArtifactArchitecturePlan, SelectedPreparation,
 };
 
 pub(crate) mod prediction;
@@ -94,6 +98,56 @@ pub struct PreparedModelSources {
     graph: PreparedModelSourceGraph,
 }
 
+impl PreparedModelBinding for PreparedModelSources {
+    fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        self.selected.session_capabilities()
+    }
+
+    fn communication_manifest(&self) -> Option<&eredu_core::communication::CommunicationManifest> {
+        self.selected.communication_manifest()
+    }
+}
+
+impl<B: eredu_core::ModelLoadingBackend> eredu_core::BindModelSources<B> for PreparedModelSources
+where
+    B: ModelBindingResources<
+            Placement = B::Binding,
+            BindingError = B::Error,
+            TextValues: eredu_core::backend::NativeTextValues<Error = B::Error>,
+        > + for<'a> TextBindingContext<'a, RankPlacement: TextRankRoutes<'a, B>>
+        + TextBindingResources<
+            Neural: eredu_nn::BlockwiseAttentionBackend,
+            CacheStorage: eredu_runtime::state::HybridCacheStorage<
+                Value = <<B as TextBindingResources>::Neural as eredu_nn::NeuralBackend>::Tensor,
+            > + eredu_core::cache::mechanisms::PoolingCacheStorage,
+        >,
+    B::Error: From<eredu_core::BackendFailure>,
+    Self: for<'a> PreparedExecutableConstruction<
+        B::Communication,
+        eredu_runtime::executable_binding::BoundExecutableFor<B>,
+        B::Error,
+        BoundExecutionRoutes<'a, B>,
+        Processor = PreparedProcessor,
+        Discovery = PreparedModelDiscovery,
+    >,
+{
+    type Model = eredu_runtime::executable_binding::BoundModelFor<B>;
+
+    fn construct_model(
+        self,
+        backend: &B,
+        placement: B::Binding,
+    ) -> Result<eredu_core::PreparedModel<Self::Model>, eredu_core::BackendFailure> {
+        eredu_runtime::executable_binding::construct_prepared_model(backend, self, placement)
+            .map_err(|error| match error {
+                eredu_runtime::executable_binding::PreparedExecutionError::Binding(failure) => {
+                    failure
+                }
+                error => eredu_core::BackendFailure::from_error(error),
+            })
+    }
+}
+
 /// Exact source roles released only by consuming their paired total selection.
 pub struct PreparedModelSourceGraph {
     source_identity: DeferredArtifactIdentity,
@@ -126,12 +180,9 @@ pub struct PreparedModelDiscovery {
     target_static: Result<Option<crate::external_assistant::TargetStaticDescription>, String>,
     partition_parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
     partition_parameter_index: Option<Arc<eredu_runtime::ParameterMemberIndex>>,
-    #[cfg(feature = "tensor-capture")]
     partition_hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
     support: eredu_core::ObservationSupportReport,
-    #[cfg(feature = "tensor-capture")]
     observation_context: eredu_runtime::inspection::ObservationExecutionContext,
-    #[cfg(feature = "tensor-capture")]
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
     prediction: Option<PreparedPredictionDiscovery>,
 }
@@ -140,10 +191,200 @@ pub struct PreparedModelDiscovery {
 struct PreparedPredictionDiscovery {
     resources: Result<eredu_runtime::prediction_resources::EmbeddedPredictionTopology, String>,
     placement: crate::prediction_extension::PredictionPlacementSlot,
-    #[cfg(feature = "tensor-capture")]
     descriptor: Result<eredu_core::ArchitectureDescriptor, String>,
-    #[cfg(feature = "tensor-capture")]
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
+}
+
+impl eredu_runtime::capture::SpeculativePartitionCaptureDiscovery for PreparedModelDiscovery {
+    fn speculative_layout(
+        self: std::sync::Arc<Self>,
+        execution: &eredu_runtime::speculative::SpeculativeActivationExecution,
+        max_ranks: usize,
+    ) -> Result<
+        Option<eredu_runtime::capture::SpeculativePartitionLayout>,
+        eredu_core::capture::CaptureError,
+    > {
+        let Some(layout) = self
+            .speculative_component_partition_layouts(execution, max_ranks)
+            .map_err(|error| eredu_core::capture::CaptureError::Unsupported(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let layout = std::sync::Arc::new(layout);
+        let execution = execution.clone();
+        Ok(Some(
+            eredu_runtime::capture::SpeculativePartitionLayout::new(
+                layout.clone(),
+                move |mechanisms, session_identity, overlay, collector| {
+                    self.speculative_activations_with_partition_support(
+                        &execution,
+                        mechanisms,
+                        session_identity,
+                        overlay,
+                        &layout,
+                        collector,
+                    )
+                },
+            ),
+        ))
+    }
+
+    fn execution_identity(&self) -> &str {
+        self.execution_identity()
+    }
+
+    fn tensor_parallel_communication(
+        &self,
+    ) -> Option<(
+        eredu_core::CollectiveGroupId,
+        &eredu_core::communication::CommunicationManifest,
+    )> {
+        self.tensor_parallel_communication()
+    }
+}
+
+impl eredu_runtime::capture::partition::PartitionCaptureDiscovery for PreparedModelDiscovery {
+    type Layout = crate::component_partition::ComponentPartitionLayouts;
+
+    fn capture_layout(
+        &self,
+        max_ranks: usize,
+    ) -> Result<Option<Self::Layout>, eredu_core::capture::CaptureError> {
+        self.component_partition_layouts(max_ranks)
+            .map_err(|error| eredu_core::capture::CaptureError::Unsupported(error.to_string()))
+    }
+
+    fn project_capture_support(
+        &self,
+        layout: &Self::Layout,
+        collector: &mut dyn FnMut(
+            &eredu_core::ObservationPoint,
+        ) -> eredu_core::ObservationSupportStatus,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
+        self.capture_declarations_with_partition_support(layout, collector)
+    }
+
+    fn capture_artifact_identity(&self) -> &DeferredArtifactIdentity {
+        &self.identity
+    }
+
+    fn capture_execution_identity(&self) -> &str {
+        self.execution_identity()
+    }
+}
+
+impl eredu_runtime::executable_binding::discovery::LoadedModelDiscovery for PreparedModelDiscovery {
+    fn capture_declarations(&self) -> eredu_core::capture::CaptureDeclarations {
+        self.capture_declarations()
+    }
+
+    fn capture(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        self.capture()
+    }
+
+    fn identity_is_resolved(&self) -> bool {
+        self.identity_is_resolved()
+    }
+
+    fn intervention(
+        &self,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+    ) -> Result<eredu_core::intervention::InterventionDiscovery, eredu_core::capture::CaptureError>
+    {
+        self.intervention(mechanisms)
+    }
+
+    fn speculative_activations(
+        &self,
+        execution: &eredu_runtime::speculative::SpeculativeActivationExecution,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+        session_identity: &str,
+        overlay: Option<&str>,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        self.speculative_activations(execution, mechanisms, session_identity, overlay)
+    }
+
+    fn bind_partition_capture(
+        &self,
+        collector: &dyn eredu_runtime::capture::partition::PartitionCaptureCollectorFacts,
+        setup: eredu_core::communication::CommunicationSessionIdentity,
+    ) -> Result<
+        eredu_runtime::capture::partition::LoadedPartitionCapture,
+        eredu_core::capture::CaptureError,
+    > {
+        eredu_runtime::capture::partition::PartitionCaptureDiscovery::bind_partition_capture(
+            self, collector, setup,
+        )
+    }
+
+    fn generation_memory(
+        &self,
+    ) -> Result<&eredu_runtime::memory_forecast::LoadedMemoryGeometry, eredu_core::CapabilityError>
+    {
+        self.generation_memory()
+    }
+
+    fn embedded_prediction_topology(
+        &self,
+    ) -> Result<
+        Option<&eredu_runtime::prediction_resources::EmbeddedPredictionTopology>,
+        eredu_core::resources::ResourceDescriptionError,
+    > {
+        self.embedded_prediction_topology()
+    }
+
+    fn partition_parameter_tasks(
+        &self,
+    ) -> Option<(
+        &[eredu_runtime::ReplicatedTextMaterializationTask],
+        &[eredu_runtime::ReplicatedTextMaterializationTask],
+    )> {
+        self.partition_parameter_task_slices()
+    }
+
+    fn parameter_partition_layout_for_rank(
+        &self,
+        parameter: &str,
+        global_rank: usize,
+        reservation: &mut dyn eredu_core::capture::CaptureReservation,
+    ) -> Result<
+        Option<eredu_runtime::ParameterPartitionLayout>,
+        eredu_core::parameters::ParameterError,
+    > {
+        self.parameter_partition_layout_for_rank(parameter, global_rank, reservation)
+    }
+
+    fn prepare_target_capture_placement(
+        &self,
+        paths: &[String],
+    ) -> Result<
+        Option<
+            Box<dyn eredu_runtime::executable_binding::discovery::ExternalTargetCapturePlacement>,
+        >,
+        eredu_core::BackendFailure,
+    > {
+        self.prepare_target_capture_placement(paths)
+            .map(|placement| placement.map(|placement| Box::new(placement) as Box<_>))
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    fn prepare_target_static_placement(
+        &self,
+        kind: eredu_runtime::speculative::ExternalPredictionTargetOperationKind,
+    ) -> Result<
+        Option<
+            Box<dyn eredu_runtime::executable_binding::discovery::ExternalTargetStaticPlacement>,
+        >,
+        eredu_nn::Error,
+    > {
+        self.prepare_target_static_placement(kind)
+            .map(|placement| placement.map(|placement| Box::new(placement) as Box<_>))
+    }
 }
 
 impl PreparedModelDiscovery {
@@ -153,7 +394,7 @@ impl PreparedModelDiscovery {
         &self,
     ) -> Option<(
         eredu_core::CollectiveGroupId,
-        &eredu_runtime::CommunicationManifest,
+        &eredu_core::communication::CommunicationManifest,
     )> {
         let selected = self.partition_selection.as_ref()?;
         Some((
@@ -173,7 +414,6 @@ impl PreparedModelDiscovery {
     }
     /// Retains hook facts projected from the actual constructed executor and
     /// architecture. Backend collectors cannot infer these from parameter shapes.
-    #[cfg(feature = "tensor-capture")]
     pub fn bind_partition_observation_hooks(
         mut self,
         hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
@@ -296,13 +536,22 @@ impl PreparedModelDiscovery {
         &self,
     ) -> Option<impl Iterator<Item = &eredu_runtime::ReplicatedTextMaterializationTask> + Clone>
     {
+        let (target, auxiliary) = self.partition_parameter_task_slices()?;
+        Some(target.iter().chain(auxiliary))
+    }
+
+    fn partition_parameter_task_slices(
+        &self,
+    ) -> Option<(
+        &[eredu_runtime::ReplicatedTextMaterializationTask],
+        &[eredu_runtime::ReplicatedTextMaterializationTask],
+    )> {
         self.partition_parameters.as_ref()?;
         let text = self.partition_selection.as_ref()?.text_realization();
-        Some(
-            text.materialization_tasks()
-                .iter()
-                .chain(text.auxiliary_materialization_tasks()),
-        )
+        Some((
+            text.materialization_tasks(),
+            text.auxiliary_materialization_tasks(),
+        ))
     }
 
     /// Resolves one global parameter through the retained executable task,
@@ -312,7 +561,7 @@ impl PreparedModelDiscovery {
         &self,
         parameter: &str,
         global_rank: usize,
-        reservation: &mut impl eredu_core::capture::CaptureReservation,
+        reservation: &mut (impl eredu_core::capture::CaptureReservation + ?Sized),
     ) -> Result<
         Option<eredu_runtime::ParameterPartitionLayout>,
         eredu_core::parameters::ParameterError,
@@ -435,7 +684,6 @@ impl PreparedModelDiscovery {
     /// Combines target ownership with the actual prepared prediction modules.
     /// Each prediction scope keeps its independent head and invocation geometry;
     /// this projection performs no native work and grants no capture authority.
-    #[cfg(feature = "tensor-capture")]
     pub fn speculative_component_partition_layouts(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -473,7 +721,6 @@ impl PreparedModelDiscovery {
     }
 
     /// Projects retained architecture and collector facts without hashing sources.
-    #[cfg(feature = "tensor-capture")]
     pub fn capture_declarations(&self) -> eredu_core::capture::CaptureDeclarations {
         eredu_core::capture::CaptureDeclarations {
             catalog: self.descriptor.observations.clone(),
@@ -487,7 +734,6 @@ impl PreparedModelDiscovery {
     }
 
     /// Resolves the exact content identity for a caller using capture features.
-    #[cfg(feature = "tensor-capture")]
     pub fn capture(
         &self,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
@@ -503,7 +749,6 @@ impl PreparedModelDiscovery {
     /// Refines partition support using retained architecture placement and exact
     /// native collector facts. Existing selection/phase/mechanism gates still
     /// apply; a callback cannot enable a disabled instrumented execution route.
-    #[cfg(feature = "tensor-capture")]
     pub fn capture_with_partition_support(
         &self,
         layouts: &crate::component_partition::ComponentPartitionLayouts,
@@ -517,7 +762,6 @@ impl PreparedModelDiscovery {
     }
 
     /// Projects partition support using retained layouts and collector facts only.
-    #[cfg(feature = "tensor-capture")]
     pub fn capture_declarations_with_partition_support(
         &self,
         layouts: &crate::component_partition::ComponentPartitionLayouts,
@@ -540,7 +784,6 @@ impl PreparedModelDiscovery {
     }
 
     /// Combines retained semantic points with current native intervention facts.
-    #[cfg(feature = "tensor-capture")]
     pub fn intervention(
         &self,
         mechanisms: &eredu_core::intervention::InterventionMechanisms,
@@ -556,7 +799,6 @@ impl PreparedModelDiscovery {
     /// Projects invocation-scoped support from actual typed prediction hooks.
     /// Only the declared prediction condition is discharged; media, collector,
     /// phase and partition requirements retain their own admission gates.
-    #[cfg(feature = "tensor-capture")]
     pub fn speculative_activations(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -585,7 +827,6 @@ impl PreparedModelDiscovery {
     /// native collector facts. Prediction hooks come from the sealed execution
     /// contract; target hooks retain their ordinary constructed-executor gate.
     #[allow(clippy::too_many_arguments)]
-    #[cfg(feature = "tensor-capture")]
     pub fn speculative_activations_with_partition_support(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -609,7 +850,6 @@ impl PreparedModelDiscovery {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg(feature = "tensor-capture")]
     fn speculative_activations_inner(
         &self,
         execution: &crate::speculative_execution::SpeculativeActivationExecution,
@@ -741,7 +981,6 @@ impl PreparedModelDiscovery {
 
 impl PreparedModelSources {
     /// Retains architecture-owned mutable hooks with actual selected-session facts.
-    #[cfg(feature = "tensor-capture")]
     pub fn intervention_discovery(
         &self,
         capture: &eredu_core::capture::CaptureDiscovery,
@@ -803,15 +1042,11 @@ impl PreparedModelSources {
             ),
             partition_parameters: None,
             partition_parameter_index: None,
-            #[cfg(feature = "tensor-capture")]
             partition_hooks: None,
             support,
-            #[cfg(feature = "tensor-capture")]
             observation_context,
-            #[cfg(feature = "tensor-capture")]
             intervention_points: self.architecture().intervention_points(),
             prediction: self.selected().prediction_realization().map(|_| {
-                #[cfg(feature = "tensor-capture")]
                 let complete = self
                     .selected()
                     .retained_architecture()
@@ -826,7 +1061,6 @@ impl PreparedModelSources {
                                 .ok_or_else(|| "selected prediction topology is missing".to_owned())
                         }),
                     placement: Arc::clone(&self.graph.prediction_placement),
-                    #[cfg(feature = "tensor-capture")]
                     descriptor: match self.selected().qwen4_construction() {
                         Some(construction) => construction
                             .prediction_discovery()
@@ -844,7 +1078,6 @@ impl PreparedModelSources {
                             }),
                         None => Ok(complete.architecture_descriptor()),
                     },
-                    #[cfg(feature = "tensor-capture")]
                     intervention_points: complete.intervention_points(),
                 }
             }),
@@ -852,7 +1085,6 @@ impl PreparedModelSources {
     }
 
     /// Resolves exact model identity for explicitly requested capture discovery.
-    #[cfg(feature = "tensor-capture")]
     pub fn capture_discovery(
         &self,
         mechanisms: eredu_core::ObservationMechanisms,
@@ -1066,6 +1298,22 @@ pub enum PreparedModelSourcesError {
     /// An exact checkpoint source or logical view could not be constructed.
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl eredu_core::ModelSourcePreparation<ArtifactArchitecturePlan> for SelectedPreparation {
+    type Prepared = PreparedModelSources;
+    type Error = PreparedModelSourcesError;
+
+    fn admission(&self) -> eredu_core::PreparationAdmission {
+        self.admission()
+    }
+
+    fn prepare(
+        self,
+        plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    ) -> Result<Self::Prepared, Self::Error> {
+        prepare_model_sources(plan, self)
+    }
 }
 
 /// Consumes one admitted artifact into the only architecture-aware prepared source graph.

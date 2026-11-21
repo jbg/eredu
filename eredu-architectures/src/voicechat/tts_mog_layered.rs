@@ -1,5 +1,7 @@
 //! Mixture prediction and selected-component evaluation on shared unit traversal.
 
+use eredu_core::SubmissionBackend;
+
 use super::tts_mog::{
     f32_shape, MogBlock, MogComponentBank, MogDimensions, MogPrediction, MogPredictionHead,
     MogSample, TtsError,
@@ -18,7 +20,7 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayeredTraversalHook,
     LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
     ParallelComponentKernel, ParameterGroupOwner, ParameterGroupSpec, ParameterRole,
-    StatelessComponentState, SubmissionBackend,
+    StatelessComponentState,
 };
 use std::marker::PhantomData;
 

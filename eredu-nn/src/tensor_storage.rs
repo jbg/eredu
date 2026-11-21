@@ -163,7 +163,11 @@ fn value_metadata<Role>(
     })
 }
 
-fn logical_bytes(shape: &[i32], element: Option<TensorElementType>) -> Result<Option<u64>, Error> {
+/// Computes the logical byte extent from shape and element type.
+pub fn logical_bytes(
+    shape: &[i32],
+    element: Option<TensorElementType>,
+) -> Result<Option<u64>, Error> {
     if shape.iter().any(|axis| *axis < 0) {
         return Err(Error::backend(
             "tensor storage logical shape contains a negative axis",

@@ -11,33 +11,6 @@ use eredu_nn::mechanism_memory::{MechanismBacking, MechanismPlacement, StorageRe
 
 use crate::mechanism_resources::{invocation_storage_identity, MechanismResourceDescription};
 
-/// The event that ends one reference to an allocation. Namespaces are disjoint.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ResourceLifetime {
-    /// A submitted native operation completes.
-    NativeCompletion(ResourceIdentity),
-    /// Evaluation of a lazy graph completes, including its dependencies.
-    Evaluation(ResourceIdentity),
-    /// The owner of a returned value, state or parameter releases it.
-    Owner(ResourceIdentity),
-    /// No safe release boundary is known. Never silently released.
-    Unknown,
-}
-
-/// Described allocations and the references that keep them live.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceLifetimeDescription {
-    /// Ordinary prepared or mechanism resources, preserving coverage and bounds.
-    pub resources: ResourceDescription,
-    /// All retention references for each backing. Missing/empty entries are unknown.
-    pub lifetimes: BTreeMap<ResourceIdentity, Vec<ResourceLifetime>>,
-    /// Whether the current extents coexist at acquisition. Set false for a
-    /// mechanism's internal envelope whose intermediates need not coexist.
-    /// Fixed extents with known retention remain guaranteed live until release;
-    /// context-dependent current extents are guaranteed only at acquisition.
-    pub live_at_acquire: bool,
-}
-
 /// Schedule-owned bindings for a mechanism's declared retention classes.
 #[derive(Debug, Clone)]
 pub struct MechanismLifetimeBindings {

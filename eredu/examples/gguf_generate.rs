@@ -3,11 +3,15 @@ mod device_selection;
 use std::path::PathBuf;
 
 use eredu::{api::LoadedModel, runtime::chat::ChatTemplateRequest};
-use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::TokenOutput as _;
 use eredu_core::{ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig};
 
-fn generate(
-    model: &mut LoadedModel<MlxBackend<'_>>,
+fn generate<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
@@ -58,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         &MlxBackendFactory::default(),
     )?);
     let planned =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &gguf_file, &plan)?;
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &gguf_file, &plan, None)?;
     let (mut model, _) = planned.into_parts();
 
     println!("model family: {}", model.model_family().canonical_name());

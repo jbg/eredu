@@ -1,7 +1,12 @@
 //! Backend-neutral activation, target-state, and routed-expert observation contracts.
 
+mod recorder;
+pub use recorder::{ActivationRecorder, RecordedActivation};
+
 use std::collections::{BTreeMap, BTreeSet};
 
+mod tensor_mapping;
+pub use tensor_mapping::MappedActivationObserver;
 mod error_bridge;
 pub use error_bridge::ObserverErrorBridge;
 mod speculative;
@@ -81,7 +86,6 @@ impl ObservationHookSupport {
 /// Combines explicit architecture intervention declarations with exact loaded
 /// observation support and backend arithmetic facts. Read-only catalog values
 /// never acquire intervention capabilities through this projection.
-#[cfg(feature = "tensor-capture")]
 pub fn intervention_support(
     mut points: Vec<eredu_core::intervention::InterventionPoint>,
     capture: &eredu_core::capture::CaptureDiscovery,

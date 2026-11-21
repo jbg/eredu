@@ -2,7 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use eredu_core::cache::{CacheBlockId, CacheTier};
+use eredu_core::cache::{
+    mechanisms::{
+        CacheHostDemotionOperation, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    },
+    CacheBlockId, CacheTier,
+};
 
 /// Stable phase of one cache block's physical resources.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -33,42 +38,6 @@ impl CacheStoragePhase {
             Self::DiskReady | Self::DiskReading => CacheTier::Disk,
         }
     }
-}
-
-/// Kind of asynchronous backing-store operation.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheIoOperationKind {
-    /// Publish host resources to a durable backing.
-    Write,
-    /// Reconstruct host resources from a durable backing.
-    Read,
-}
-
-/// Exact identity of one backing-store operation.
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
-pub struct CacheIoOperationKey {
-    /// Cache generation in which the operation was submitted.
-    pub generation: u64,
-    /// Block whose resources the operation owns.
-    pub id: CacheBlockId,
-    /// Direction of the operation.
-    pub kind: CacheIoOperationKind,
-}
-
-/// Opaque backend host-demotion completion with stable identity.
-pub trait CacheHostDemotionOperation {
-    /// Block whose device resources the operation owns.
-    fn block_id(&self) -> &CacheBlockId;
-
-    /// Monotonic operation identity within the backend cache session.
-    fn operation_id(&self) -> u64;
-}
-
-/// Opaque backend I/O completion with an exact neutral key.
-pub trait CacheIoOperation {
-    /// Returns the operation identity owned by this completion.
-    fn key(&self) -> &CacheIoOperationKey;
 }
 
 /// Exact rollback ownership returned by a host-to-device promotion.

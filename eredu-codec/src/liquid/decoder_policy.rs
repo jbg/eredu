@@ -90,22 +90,18 @@ pub struct PolicyDecoder<B: NeuralBackend, P> {
 
 impl Declaration {
     /// Constructs the synthesis traversal through a generic parameter materializer.
-    pub fn bind_decoder<B, P>(
+    pub fn bind_decoder<B, M>(
         self,
         source: eredu_checkpoint::store::SharedCheckpointSource,
         invocations: ExecutionUnitAddressMap,
-        units: Vec<Vec<eredu_runtime::WeightBinding>>,
+        units: Vec<Vec<eredu_core::residency::parameter_binding::WeightBinding>>,
         context: &<B::Tensor as Tensor>::Context,
-        bind_units: impl FnOnce(
-            eredu_checkpoint::store::SharedCheckpointSource,
-            ExecutionUnitAddressMap,
-            Vec<Vec<eredu_runtime::WeightBinding>>,
-            &dyn Fn() -> Result<Vec<DecoderModule<B>>, BackendFailure>,
-        ) -> Result<P, BackendFailure>,
-    ) -> Result<PolicyDecoder<B, P>, BackendFailure>
+        residency: eredu_runtime::LayerWeightResidency,
+        mechanisms: &M,
+    ) -> Result<PolicyDecoder<B, M::UnitPolicy<DecoderModule<B>>>, BackendFailure>
     where
         B: NeuralBackend,
-        P: LayerwisePolicy<B, DecoderModule<B>>,
+        M: eredu_runtime::ParameterUnitMechanisms<B>,
     {
         B::require_operator_capabilities(
             "LiquidCodec neural decoder",
@@ -122,12 +118,19 @@ impl Declaration {
                 "LiquidCodec bindings differ from the retained decoder",
             )));
         }
-        let policy = bind_units(source, invocations.clone(), units, &|| {
-            self.decoder_units()
-                .map(|unit| build(&self, unit, context))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(BackendFailure::from_error)
-        })?;
+        let (policy, _) = eredu_runtime::bind_parameter_units(
+            mechanisms,
+            source,
+            invocations.clone(),
+            units,
+            residency,
+            || {
+                self.decoder_units()
+                    .map(|unit| build(&self, unit, context))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(BackendFailure::from_error)
+            },
+        )?;
         let unweighted_quantizer = if self.quantizer.output.is_none() {
             Some(ScalarDecoder::new(&self.quantizer, context).map_err(BackendFailure::from_error)?)
         } else {

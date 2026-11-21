@@ -1,50 +1,13 @@
 //! Bounded observations of detached work; observation never grants release authority.
 use crate::resource_lifetimes::{
-    compose_resource_peaks, ResourceLifetimeDescription, ResourceLifetimeEvent,
-    ResourceLifetimePlan,
+    compose_resource_peaks, ResourceLifetimeEvent, ResourceLifetimePlan,
 };
-use eredu_core::resources::{ResourceCoverage, ResourceDescriptionError};
+use eredu_core::resources::{
+    ResourceCoverage, ResourceDescriptionError, ResourceLifetimeDescription,
+};
 
-/// Limits on diagnostic traversal and returned allocation records, including aliases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DetachedResourceLimits {
-    nodes: usize,
-    allocations: usize,
-}
-impl DetachedResourceLimits {
-    /// Both limits must be positive. These bound reporting, not native execution.
-    pub fn new(nodes: usize, allocations: usize) -> Result<Self, ResourceDescriptionError> {
-        if nodes == 0 || allocations == 0 {
-            return Err(invalid(
-                "detached resource reporting limits must be positive",
-            ));
-        }
-        Ok(Self { nodes, allocations })
-    }
-    /// Maximum detached records visited.
-    pub const fn nodes(self) -> usize {
-        self.nodes
-    }
-    /// Maximum allocation records returned across all descriptions, before deduplication.
-    pub const fn allocations(self) -> usize {
-        self.allocations
-    }
-}
-
-/// Whether the declared producer's detached list was fully inspected.
-/// This says nothing about physical resource coverage or completion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DetachedResourceScan {
-    /// No unvisited list entries remained at observation time.
-    Complete,
-    /// More entries remained after the reporting limit.
-    Truncated,
-    /// The list could not be observed without blocking or reentrant mutation.
-    Unavailable {
-        /// Why an observation could not safely inspect the list.
-        reason: String,
-    },
-}
+use eredu_core::resources::detached::DetachedResourceObservation;
+pub use eredu_core::resources::detached::{DetachedResourceLimits, DetachedResourceScan};
 
 /// Immutable, validated snapshot of one producer's detached holdings.
 /// Multiple records may retain the same backing/owner. Consumers must compose
@@ -60,10 +23,32 @@ pub struct DetachedResourceInventory {
     descriptions: Vec<ResourceLifetimeDescription>,
 }
 impl DetachedResourceInventory {
+    /// Validates and composes the observation from one native producer.
+    pub fn from_observation(
+        limits: DetachedResourceLimits,
+        observation: DetachedResourceObservation,
+    ) -> Result<Self, ResourceDescriptionError> {
+        let DetachedResourceObservation {
+            source,
+            inspected_nodes,
+            undescribed_nodes,
+            scan,
+            descriptions,
+        } = observation;
+        Self::new(
+            source,
+            limits,
+            inspected_nodes,
+            undescribed_nodes,
+            scan,
+            descriptions,
+        )
+    }
+
     /// Validates reporting bounds, counts, descriptions and shared backing facts.
     /// Each description preserves its coexistence declaration; retaining owners
     /// may also be held elsewhere.
-    pub fn new(
+    fn new(
         source: String,
         limits: DetachedResourceLimits,
         inspected_nodes: usize,
@@ -72,7 +57,7 @@ impl DetachedResourceInventory {
         descriptions: Vec<ResourceLifetimeDescription>,
     ) -> Result<Self, ResourceDescriptionError> {
         if source.trim().is_empty()
-            || inspected_nodes > limits.nodes
+            || inspected_nodes > limits.nodes()
             || undescribed_nodes.checked_add(descriptions.len()) != Some(inspected_nodes)
         {
             return Err(invalid(
@@ -90,7 +75,7 @@ impl DetachedResourceInventory {
             n.checked_add(d.resources.allocations.len())
                 .ok_or_else(|| invalid("detached allocation count overflowed"))
         })?;
-        if allocations > limits.allocations {
+        if allocations > limits.allocations() {
             return Err(invalid(
                 "detached descriptions exceed the allocation reporting limit",
             ));

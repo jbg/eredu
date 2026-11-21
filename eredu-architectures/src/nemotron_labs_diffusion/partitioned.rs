@@ -38,7 +38,7 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
         vec![eredu_runtime::BoundaryTensorSpec::new(
             "invocation",
             [eredu_runtime::BoundaryTensorDimension::Fixed(3)],
-            eredu_runtime::BoundaryTensorDtype::Int32,
+            eredu_core::communication::BoundaryTensorDtype::Int32,
         )]
     }
     fn encode<T>(

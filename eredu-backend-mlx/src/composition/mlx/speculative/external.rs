@@ -1,140 +1,38 @@
-//! Family-neutral MLX mechanisms for architecture-owned external assistants.
+//! MLX tensor primitives for externally conditioned prediction.
 
-use eredu_architectures::{
-    composite_execution::{
-        ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
-        ExternalPredictionTargetOperation,
-    },
-    external_assistant::{
-        ExternalAssistantCache, ExternalAssistantExecutionMechanisms,
-        ExternalAssistantTensorPlacement, ExternalAssistantTransfer,
-    },
-    ExternalAssistantArchitecture,
-};
-use safemlx::{
-    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
-};
-
+use super::{assistant::MlxAssistantBinder, MlxSpeculativeCompletion};
 use crate::{
-    backend::{
-        nn::shared::MlxNeuralBackend,
-        runtime::{cache::kv::ConcatKeyValueCache, media::input::ModelInput},
-    },
-    composition::mlx::{
-        replicated_text::{ErasedExternalPredictionExecutable, MlxPredictionTargetState},
-        speculative::{
-            scheduler::SpeculativeComponentTimings, MlxExternalAssistant, MlxSpeculativeCompletion,
-            SpeculativeExecutionStreams,
-        },
-        MlxModelInput,
-    },
+    backend::{nn::shared::MlxNeuralBackend, runtime::cache::MlxCacheBackend},
+    composition::mlx::{capability::MlxAllocatorObservations, replicated_text::MlxTextValues},
     MlxTensor,
 };
+use eredu_core::speculative::assistant::ExternalAssistantOperators;
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
-/// The single MLX mechanism adapter used by every architecture-owned external lifecycle.
-pub(crate) struct MlxExternalAssistantMechanisms;
+/// Native resource binding shared by all conditioned assistants.
+pub struct MlxExternalAssistantMechanisms;
 
-/// Architecture-owned semantic envelope over opaque native target storage.
-pub(crate) type MlxExternalPredictionCache = ExternalAssistantCache<MlxPredictionTargetState>;
-
-impl<A> ExternalAssistantExecutionMechanisms<A> for MlxExternalAssistantMechanisms
-where
-    A: ExternalAssistantArchitecture,
-{
-    fn coordinate_speculative_step(
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-        context: Self::Context<'_>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
-        context.coordinate_speculative_step(local)
-    }
-
-    fn agree_text_preparation(
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-        context: Self::Context<'_>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
-        context.agree_text_preparation(stage, status)
-    }
-
-    fn coordinate_decoding_control(
-        local: eredu_core::decoding::DecodingCoordination,
-        context: Self::Context<'_>,
-    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
-        context.coordinate_decoding_control(local)
-    }
-
+impl ExternalAssistantOperators for MlxExternalAssistantMechanisms {
     fn control_logits_estimate(
         logits: &Self::Logits,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         super::state_snapshot::estimate_array(logits)
     }
+    type Capture =
+        crate::composition::mlx::session::bounded_capture::MlxSpeculativeCaptureMechanisms;
     type NeuralBackend = MlxNeuralBackend;
-    type ParameterPolicy =
-        super::parameter_policy::MlxAssistantParameterPolicy<A::Unit<MlxNeuralBackend>>;
-    type AttentionCache = ConcatKeyValueCache;
-    type Target = dyn ErasedExternalPredictionExecutable;
-    type Assistant = MlxExternalAssistant<A>;
-    type Input = MlxModelInput;
-    type NativeCache = MlxPredictionTargetState;
-    type NativeCacheCheckpoint = MlxPredictionTargetState;
+    type Binder = MlxAssistantBinder;
+    type Memory = MlxAllocatorObservations;
+    type Cache = MlxCacheBackend;
+    type Text = MlxTextValues;
     type Tensor = MlxTensor;
     type Logits = Array;
-    type Context<'a> = SpeculativeExecutionStreams<'a>;
     type Completion = MlxSpeculativeCompletion;
-    type Telemetry = SpeculativeComponentTimings;
+    type Telemetry = super::scheduler::SpeculativeComponentTimings;
     type Error = Exception;
 
-    fn trim_parameter_conversions(
-        target: &mut Self::Target,
-        assistant: &mut Self::Assistant,
-    ) -> Result<
-        eredu_core::residency::ExecutionConversionRetentionTrimReport,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        Ok(
-            eredu_core::residency::ExecutionConversionRetentionTrimReport {
-                target: target.trim_parameter_conversions()?,
-                external_drafter: Some(assistant.trim_parameter_conversions()?),
-            },
-        )
-    }
-
-    fn parameter_conversion_retention(
-        target: &Self::Target,
-        assistant: &Self::Assistant,
-    ) -> Result<
-        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
-        eredu_core::BackendFailure,
-    > {
-        Ok(Some(
-            eredu_core::residency::ExecutionConversionRetentionReport {
-                target: target.parameter_conversion_retention()?,
-                external_drafter: Some(assistant.parameter_conversion_retention()?),
-            },
-        ))
-    }
-
-    fn target_memory_observation(
-        target: &Self::Target,
-        cache: &Self::NativeCache,
-        additional: u64,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeModelMemoryObservation>,
-        eredu_core::BackendFailure,
-    > {
-        target
-            .continuation_memory_observation(cache, additional)
-            .map(Some)
-    }
-
-    fn assistant_memory_observation(
-        assistant: &Self::Assistant,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
-        eredu_core::BackendFailure,
-    > {
-        assistant.parameter_memory_observation()
+    fn target_input(tokens: &MlxTensor) -> Array {
+        tokens.as_array().clone()
     }
 
     fn tensor_backing_bytes(
@@ -143,41 +41,25 @@ where
         super::memory_observation::tensor_backing(tensors)
     }
 
-    fn config(assistant: &Self::Assistant) -> &A::Config {
-        &assistant.config
-    }
-
-    fn module(
-        assistant: &mut Self::Assistant,
-    ) -> &mut A::Execution<Self::NeuralBackend, Self::ParameterPolicy> {
-        &mut assistant.module.inner
-    }
-
-    fn assistant_parallel_context<'a>(
-        context: Self::Context<'a>,
-        requirements: &eredu_runtime::CommunicationGroupRequirements,
-    ) -> Result<Option<&'a crate::backend::runtime::distributed::Group>, Self::Error> {
-        context
-            .assistant_parallel_context(requirements)
-            .map_err(Exception::from_source)
-    }
-
-    fn neural_error(error: eredu_nn::Error) -> Self::Error {
-        Exception::custom(error.to_string())
-    }
-
-    fn error(message: String) -> Self::Error {
-        Exception::custom(message)
-    }
-
-    fn prepared_input_cache_identity(
-        input: &Self::Input,
-    ) -> Result<eredu_runtime::PreparedInputCacheIdentity, Self::Error> {
-        input.cache_identity().cloned().ok_or_else(|| {
-            Exception::custom(
-                "external speculative input is missing its prepared-input cache identity",
-            )
+    fn bound_assistant_group<'a>(
+        transport: &'a crate::backend::distributed::MlxDistributedSession,
+        group: eredu_core::CollectiveGroupId,
+        manifest: &eredu_core::communication::CommunicationManifest,
+    ) -> Result<&'a crate::backend::runtime::distributed::Group, Self::Error> {
+        transport
+            .validate_selected_manifest(manifest)
+            .map_err(Exception::from_source)?;
+        transport.selected_group(group).ok_or_else(|| {
+            Exception::custom("retained target tensor communicator has no native binding")
         })
+    }
+
+    fn failure(error: impl std::error::Error + Send + Sync + 'static) -> Exception {
+        Exception::from_source(error)
+    }
+
+    fn invalid(message: String) -> Exception {
+        Exception::custom(message)
     }
 
     fn tensor_shape(value: &Self::Tensor) -> Result<Vec<usize>, Self::Error> {
@@ -193,129 +75,24 @@ where
             .collect()
     }
 
-    fn prefill_target_native<'a>(
-        target: &mut Self::Target,
-        request: &ExternalPredictionCaptureRequest,
-        input: Self::Input,
-        cache: &mut Self::NativeCache,
-        _context: Self::Context<'a>,
-    ) -> Result<(Self::Tensor, ExternalPredictionTargetCapture<Self::Tensor>), Self::Error> {
-        input.with_borrowed(|input: ModelInput<'_>| {
-            target
-                .prefill_external_prediction_target(input, request, cache)
-                .map_err(|error| Exception::custom(error.to_string()))
-        })
-    }
-
-    fn verify_target_native<'a>(
-        target: &mut Self::Target,
-        request: &ExternalPredictionCaptureRequest,
-        tokens: &Self::Tensor,
-        cache: &mut Self::NativeCache,
-        _context: Self::Context<'a>,
-    ) -> Result<(Self::Tensor, ExternalPredictionTargetCapture<Self::Tensor>), Self::Error> {
-        target
-            .verify_external_prediction_target(tokens, request, cache)
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    fn control_cache_estimate(
-        cache: &Self::NativeCache,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        cache.control_estimate()
-    }
     fn control_tensor_bytes(tensor: &Self::Tensor) -> Option<u64> {
         (tensor.as_array().nbytes() as u64)
             .checked_mul(2)?
             .checked_add(4096)
     }
-    fn control_checkpoint<'a>(
-        cache: &Self::NativeCache,
-        context: Self::Context<'a>,
-    ) -> Result<Self::NativeCacheCheckpoint, Self::Error> {
-        cache.control_copy(context.target())
-    }
-    fn control_restore<'a>(
-        cache: &mut Self::NativeCache,
-        saved: &Self::NativeCacheCheckpoint,
-        context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
-        let replacement = saved.control_copy(context.target())?;
-        *cache = replacement;
-        Ok(())
-    }
-    fn control_copy_tensor<'a>(
-        tensor: &Self::Tensor,
-        placement: ExternalAssistantTensorPlacement,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error> {
-        safemlx::transforms::async_eval_with_event([tensor.as_array()])?.synchronize()?;
-        let stream = match placement {
-            ExternalAssistantTensorPlacement::Target => context.target(),
-            ExternalAssistantTensorPlacement::Draft => context.draft(),
-        };
-        let copy = tensor.as_array().copy(stream)?;
-        safemlx::transforms::async_eval_with_event([&copy])?.synchronize()?;
-        Ok(MlxTensor::from_array(copy))
-    }
-
-    fn checkpoint_native(
-        cache: &Self::NativeCache,
-    ) -> Result<Self::NativeCacheCheckpoint, Self::Error> {
-        cache.deep_clone()
-    }
-
-    fn restore_checkpoint_native<'a>(
-        cache: &mut Self::NativeCache,
-        checkpoint: &Self::NativeCacheCheckpoint,
-        context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
-        cache.restore(checkpoint, context.target())
-    }
-
-    fn native_cache_len(cache: &Self::NativeCache) -> Result<i32, Self::Error> {
-        i32::try_from(
-            cache
-                .generation()
-                .map_err(|error| Exception::custom(error.to_string()))?,
-        )
-        .map_err(|_| Exception::custom("external target cache frontier exceeds i32"))
-    }
-
-    fn observe_tensor(
-        assistant: &mut Self::Assistant,
-        path: &str,
-        value: Self::Tensor,
-    ) -> Result<Self::Tensor, Self::Error> {
-        assistant.observers.observe_tensor(path, &value)
-    }
-
-    fn observe_logits(
-        assistant: &mut Self::Assistant,
-        path: &str,
-        value: Self::Logits,
-    ) -> Result<Self::Logits, Self::Error> {
-        assistant.observers.observe_logits(path, &value)
-    }
-
     fn sequence_len(value: &Self::Tensor) -> Result<usize, Self::Error> {
         usize::try_from(value.as_array().dim(1))
             .map_err(|_| Exception::custom("external assistant sequence length exceeds usize"))
     }
 
-    fn sequence_row<'a>(
+    fn sequence_row(
         value: &Self::Tensor,
         row: usize,
         retain_dimension: bool,
-        placement: ExternalAssistantTensorPlacement,
-        context: Self::Context<'a>,
+        stream: &Stream,
     ) -> Result<Self::Tensor, Self::Error> {
         let row = i32::try_from(row)
             .map_err(|_| Exception::custom("external assistant row exceeds i32"))?;
-        let stream = match placement {
-            ExternalAssistantTensorPlacement::Target => context.target(),
-            ExternalAssistantTensorPlacement::Draft => context.draft(),
-        };
         let array = if retain_dimension {
             value
                 .as_array()
@@ -330,10 +107,10 @@ where
         value.into_array()
     }
 
-    fn sequence_suffix<'a>(
+    fn sequence_suffix(
         value: &Self::Tensor,
         maximum: i32,
-        context: Self::Context<'a>,
+        stream: &Stream,
     ) -> Result<Self::Tensor, Self::Error> {
         let length = value.as_array().dim(1);
         if length <= maximum {
@@ -341,96 +118,55 @@ where
         } else {
             value
                 .as_array()
-                .try_index_device((.., length - maximum.., ..), context.target())
+                .try_index_device((.., length - maximum.., ..), stream)
                 .map(MlxTensor::from_array)
         }
     }
 
-    fn shared_prefix<'a>(
+    fn shared_prefix(
         value: &Self::Tensor,
         cache_len: i32,
-        context: Self::Context<'a>,
+        stream: &Stream,
     ) -> Result<Self::Tensor, Self::Error> {
         let retained = value.as_array().dim(-2).min(cache_len);
         value
             .as_array()
-            .try_index_device((.., .., ..retained, ..), context.target())
+            .try_index_device((.., .., ..retained, ..), stream)
             .map(MlxTensor::from_array)
     }
 
-    fn token_prefix<'a>(
+    fn token_prefix(
         value: &Self::Tensor,
         end: usize,
-        context: Self::Context<'a>,
+        stream: &Stream,
     ) -> Result<Self::Tensor, Self::Error> {
         let end = i32::try_from(end)
             .map_err(|_| Exception::custom("external assistant prefix exceeds i32"))?;
         value
             .as_array()
-            .try_index_device((.., ..end), context.target())
+            .try_index_device((.., ..end), stream)
             .map(MlxTensor::from_array)
     }
 
-    fn target_tokens<'a>(
+    fn target_tokens(
         tokens: &[u32],
-        context: Self::Context<'a>,
+        destination: Option<&Stream>,
     ) -> Result<Self::Tensor, Self::Error> {
         let width = i32::try_from(tokens.len())
             .map_err(|_| Exception::custom("external assistant token count exceeds i32"))?;
         let mut value = Array::from_slice(tokens, &[1, width]);
-        if context.crosses_devices() {
-            value = value.copy(context.target())?;
+        if let Some(stream) = destination {
+            value = value.copy(stream)?;
         }
         Ok(MlxTensor::from_array(value))
     }
 
-    fn transfer<'a>(
-        value: &Self::Tensor,
-        direction: ExternalAssistantTransfer,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error> {
-        if !context.is_split() {
-            return Ok(value.clone());
-        }
-        if !context.crosses_devices() {
-            match direction {
-                ExternalAssistantTransfer::TargetToDraft => {
-                    let _completion = context.wait_for_target_outputs([value.as_array()])?;
-                }
-                ExternalAssistantTransfer::DraftToTarget => {
-                    let _completion = context.wait_for_draft_outputs([value.as_array()])?;
-                }
-            }
-            return Ok(value.clone());
-        }
-        async_eval_with_event([value.as_array()])?.synchronize()?;
-        let destination = match direction {
-            ExternalAssistantTransfer::TargetToDraft => context.draft(),
-            ExternalAssistantTransfer::DraftToTarget => context.target(),
-        };
-        let copied = value.as_array().copy(destination)?;
-        async_eval_with_event([&copied])?.synchronize()?;
-        Ok(MlxTensor::from_array(copied))
+    fn tensor_root(value: &MlxTensor) -> &Array {
+        value.as_array()
     }
 
-    fn target_operation<'a>(
-        target: &mut Self::Target,
-        operation: ExternalPredictionTargetOperation<'_, Self::Tensor>,
-        _context: Self::Context<'a>,
-    ) -> Result<Self::Tensor, Self::Error> {
-        target
-            .apply_external_prediction_target_operation(operation)
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    fn neural_context<'a>(
-        context: Self::Context<'a>,
-        placement: ExternalAssistantTensorPlacement,
-    ) -> &'a Stream {
-        match placement {
-            ExternalAssistantTensorPlacement::Target => context.target(),
-            ExternalAssistantTensorPlacement::Draft => context.draft(),
-        }
+    fn copy_tensor(value: &MlxTensor, destination: &Stream) -> Result<MlxTensor, Exception> {
+        super::state_snapshot::copy_array(value.as_array(), destination).map(MlxTensor::from_array)
     }
 
     fn submit_completion<'a>(

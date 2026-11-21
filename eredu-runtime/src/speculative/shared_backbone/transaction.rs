@@ -36,7 +36,7 @@ pub enum SharedBackboneTransactionError<E: std::error::Error + 'static> {
 pub struct SharedBackboneTransaction<M: SharedBackboneMechanisms> {
     baseline: M::Checkpoint,
     verified: M::Checkpoint,
-    proposal: SharedBackboneProposal<M::DraftOptions, M::ProposalRandomness>,
+    proposal: SharedBackboneProposal<SharedBackboneDraftOptions, M::ProposalRandomness>,
     verification: CausalVerification<M::Output>,
     tokens: Vec<u32>,
     cursor: eredu_core::generation::VerificationCursor,
@@ -66,7 +66,7 @@ impl<M: SharedBackboneMechanisms> SharedBackboneTransaction<M> {
         executor: &mut SharedBackboneExecutor<'context, M>,
         cache: &mut M::State,
         last: u32,
-        options: M::DraftOptions,
+        options: SharedBackboneDraftOptions,
         randomness: M::ProposalRandomness,
         wait: BoundedCompletionWait,
         context: M::Context<'context>,

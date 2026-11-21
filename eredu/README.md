@@ -29,9 +29,9 @@ crates; the facade does not duplicate those types at its root or under `api`.
 
 ## Loading a model
 
-`LoadedModel<B>` is the canonical model API. It owns one backend session with
+`LoadedModel<B, S>` is the canonical model API. It owns one backend session with
 tokenizer, EOS, generation-default, and chat-template metadata. Pass a concrete
-backend factory to infer `B`; the same API also works with mock backends:
+backend factory to infer the backend and installed session types. The same API works with mock backends:
 
 ```rust,no_run
 # #[cfg(feature = "mlx")]
@@ -43,7 +43,7 @@ use eredu_backend_mlx::MlxBackendFactory;
 let device = DevicePlan::new("mlx", "cpu:0")?;
 let plan = ExecutionPlan::fully_resident(device);
 let factory = MlxBackendFactory::default();
-let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan)?;
+let planned = LoadedModel::load_execution_plan(&factory, "/path/to/model", &plan, None)?;
 let (mut model, drafting) = planned.into_parts();
 # Ok::<(), Box<dyn std::error::Error>>(())
 # }
@@ -57,13 +57,15 @@ ID or select one from the factory's hardware discovery report. The CLI resolves
 prefers a discovered GPU, then a discovered CPU.
 
 Model-family architecture modules are owned by `eredu-architectures`.
-Reusable MLX tensors, operators, caches, streams, and family composition live
-in `eredu-backend-mlx`. Application clients import the backend factory from that
-crate and use the generic facade types in `eredu::api`.
+Reusable MLX tensors, operators, cache storage, and streams live in
+`eredu-backend-mlx`. The portable facade composes model families with the
+chosen backend. Application clients import the backend factory from its crate
+and use the generic facade types in `eredu::api`.
 
 Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` for
 portable plan-to-backend realization. These entry points return
-`PlannedModel<B, D>`, which owns the target and `RealizedDrafting<D>`. Automatic
+`PlannedModel<B, S, RealizedDrafting<D>>`, which owns the target and its
+realized drafting source. Automatic
 planning retains an artifact inspection for
 `PreparedTextModel::from_artifact`; its `select_execution_plan` result supports
 inspection and consuming `load()` without rediscovery. Prepared-chat requests, controlled

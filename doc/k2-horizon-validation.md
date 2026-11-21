@@ -101,7 +101,7 @@ Reproducible commands, with `$K2` pointing to the external artifact directory:
 HF_MODULES_CACHE="$K2/modules" /private/tmp/eredu-qwen-reference-env/bin/python \
   eredu-backend-mlx/validation/k2_horizon_reference.py \
   "$K2/artifacts/dense" "$K2/dense-reference.safetensors"
-cargo run --release -p eredu-backend-mlx --features metal \
+cargo run --release -p eredu --no-default-features --features mlx,metal \
   --example k2_checkpoint_parity --offline -- \
   "$K2/artifacts/dense" "$K2/dense-reference.safetensors"
 EREDU_VALIDATION_DEVICE=gpu target/release/examples/k2_checkpoint_parity \
@@ -152,7 +152,7 @@ With `$K2` pointing to an external directory containing that pinned release:
 python eredu-backend-mlx/validation/k2_horizon_reference.py \
   "$K2/artifact" "$K2/transfer-reference.safetensors" --dtype float32
 EREDU_VALIDATION_DEVICE=gpu EREDU_VALIDATION_PAGED_CACHE=1 \
-  cargo run -p eredu-backend-mlx --features metal --example k2_checkpoint_parity -- \
+  cargo run -p eredu --no-default-features --features mlx,metal --example k2_checkpoint_parity -- \
   "$K2/artifact" "$K2/transfer-reference.safetensors" float32
 ```
 

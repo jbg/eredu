@@ -3,8 +3,7 @@
 use std::path::Path;
 
 use eredu_core::{
-    DraftingPlan, ExecutionPlanBackendFactory, ExternalDraftArtifact, ModelInspectionReport,
-    ModelLoadingBackend, TextGenerationBackend, TokenizerCompatibilityProof,
+    ExecutionPlanBackendFactory, ModelInspectionReport, ModelLoadingBackend, TextGenerationBackend,
 };
 use eredu_text::tokenizer::Tokenizer;
 
@@ -27,7 +26,7 @@ pub type ArtifactInspection =
 /// Admits a local artifact and its explicitly selected or discovered companions.
 /// No tensor payloads, native devices, or execution streams are created.
 pub fn inspect_artifact(source: &ArtifactSource) -> Result<ArtifactInspection, ArtifactError> {
-    eredu_architectures::configuration::inspect_artifact_source(source)
+    crate::runtime::model_loading::inspect(source)
 }
 
 /// Checks complete SafeTensors headers and exact index membership without MLX.
@@ -102,65 +101,34 @@ impl PreparedTextModel {
         &self.config
     }
 
-    /// Validates one complete execution plan without realizing native resources.
+    /// Validates the execution plan and per-rank options without opening native resources.
     /// The resulting value retains the factory, plan, target selection and
     /// drafting selection; loading accepts no replacement options.
-    pub fn select_execution_plan<'a, F, B>(
+    pub fn select_execution_plan<'a, F>(
         self,
         factory: &'a F,
         plan: &eredu_core::ExecutionPlan,
+        parallel: F::TargetOptions,
     ) -> Result<SelectedTextModel<'a, F>, PlannedModelLoadError>
     where
         F: ExecutionPlanBackendFactory<
-            Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         >,
-        B: ModelLoadingBackend + TextGenerationBackend,
-        B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
+        F::Backend: TextGenerationBackend,
     {
         let Self {
             artifact,
             tokenizer,
             config,
         } = self;
-        let external = match plan.drafting() {
-            DraftingPlan::External { model, .. } => {
-                let preparation = eredu_architectures::prepare_external_draft(model)
-                    .map_err(LoadedModelLoadError::Artifact)?;
-                let target_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
-                let draft_fingerprint = match preparation.tokenizer_source() {
-                    eredu_architectures::external_draft::ExternalDraftTokenizerSource::Target => {
-                        target_fingerprint
-                    }
-                    eredu_architectures::external_draft::ExternalDraftTokenizerSource::Artifact {
-                        model_type,
-                    } => {
-                        let draft_tokenizer = super::tokenizer::load_tokenizer_for_model_type(
-                            model_type,
-                            Path::new(model),
-                        )
-                        .map_err(LoadedModelLoadError::Metadata)?;
-                        eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer)
-                    }
-                };
-                let compatibility =
-                    TokenizerCompatibilityProof::prove(target_fingerprint, draft_fingerprint)
-                        .map_err(|error| {
-                            eredu_core::AutomaticPlanningError::Invalid(error.to_string())
-                        })?;
-                Some(ExternalDraftArtifact {
-                    preparation,
-                    tokenizer_compatibility: compatibility,
-                })
-            }
-            DraftingPlan::Disabled | DraftingPlan::Embedded { .. } => None,
-            _ => return Err(LoadedModelLoadError::UnsupportedDraftingPlan.into()),
-        };
-        let target = eredu_core::select_execution_plan_target(factory, plan, artifact)?;
-        let drafting =
-            eredu_core::select_execution_plan_drafting(factory, plan, &target, external)?;
+        let (target, drafting) = crate::runtime::model_loading::select_text(
+            factory, plan, artifact, &tokenizer, parallel,
+        )?;
         Ok(SelectedTextModel {
             factory,
             target,
@@ -172,41 +140,60 @@ impl PreparedTextModel {
 
     /// Loads the retained artifact and text state on an already created backend.
     /// Backend construction and placement are owned by the caller on this path.
-    pub fn load_on<B>(
+    pub fn load_on<B, A>(
         self,
         backend: B,
-        options: B::LoadOptions,
-    ) -> Result<LoadedModel<B>, LoadedModelLoadError>
+        options: eredu_core::ModelLoadOptions<A::Request, B::LoadPlacement>,
+    ) -> Result<LoadedModel<B, B::Installed>, LoadedModelLoadError>
     where
-        B: ModelLoadingBackend + TextGenerationBackend,
-        B::ConfigurationResolver: eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
+        B: ModelLoadingBackend + super::TextSessionComposition,
+        A: eredu_core::backend::DirectLoadFacts<Mechanisms = B::LoadMechanisms>
+            + eredu_core::ModelLoadAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                SourcePreparation: eredu_core::ModelSourcePreparation<
+                    eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                    Prepared: eredu_core::BindModelSources<B, Model = B::Model>,
+                >,
+            >,
     {
-        LoadedModel::from_inspected(backend, self.artifact, options, self.tokenizer, self.config)
+        let runtime =
+            crate::runtime::model_loading::load_on::<B, A>(backend, self.artifact, options)?;
+        Ok(LoadedModel::from_runtime(
+            runtime,
+            self.tokenizer,
+            self.config,
+        ))
     }
 }
 
 /// Complete cold execution admission with the exact text state and factory.
 /// Native realization consumes this value and cannot substitute another plan.
-pub struct SelectedTextModel<'a, F: ExecutionPlanBackendFactory>
-where
+pub struct SelectedTextModel<
+    'a,
+    F: ExecutionPlanBackendFactory<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
+> where
     F::Backend: TextGenerationBackend,
 {
     factory: &'a F,
-    target: eredu_core::SelectedExecutionPlanTarget<F::Backend>,
-    drafting: eredu_core::SelectedExecutionPlanDrafting<F::SelectedDrafterPreparation>,
+    target: eredu_core::SelectedExecutionPlanTargetFor<
+        F,
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    drafting: eredu_core::SelectedExecutionPlanDrafting<
+        eredu_core::DraftSelectionFor<
+            F,
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        >,
+    >,
     tokenizer: Tokenizer,
     config: LoadedTextModelConfig,
 }
 
-impl<F: ExecutionPlanBackendFactory> SelectedTextModel<'_, F>
+impl<
+        F: ExecutionPlanBackendFactory<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
+    > SelectedTextModel<'_, F>
 where
     F::Backend: TextGenerationBackend,
-    <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
-        eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
 {
     /// Exact execution plan whose target and drafting admission are retained.
     pub fn execution_plan(&self) -> &eredu_core::ExecutionPlan {
@@ -234,21 +221,27 @@ where
     pub fn load(
         self,
     ) -> Result<
-        PlannedModel<F::Backend, eredu_core::RealizedDrafting<F::Drafter>>,
+        PlannedModel<
+            F::Backend,
+            <F::Backend as super::TextSessionComposition>::Installed,
+            eredu_core::RealizedDrafting<F::Drafter>,
+        >,
         PlannedModelLoadError,
-    > {
-        let plan = self.target.execution_plan().clone();
-        let realized = eredu_core::realize_execution_plan_target(self.factory, &plan, self.target)?;
-        let runtime = realized
-            .into_runtime()
-            .map_err(super::loaded::map_model_load_error)?;
-        let model = LoadedModel::from_runtime(runtime, self.tokenizer, self.config);
-        let drafting = eredu_core::realize_execution_plan_drafting(
+    >
+    where
+        F::Backend: super::TextSessionComposition<
+            Model = crate::runtime::model_loading::PreparedTextProduct<
+                F::Backend,
+                F::SourcePreparation,
+            >,
+        >,
+    {
+        crate::runtime::model_loading::realize_text(
             self.factory,
-            &plan,
-            model.runtime(),
+            self.target,
             self.drafting,
-        )?;
-        Ok(PlannedModel::new(model, drafting, plan.drafting().clone()))
+            self.tokenizer,
+            self.config,
+        )
     }
 }

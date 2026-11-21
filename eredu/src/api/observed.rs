@@ -12,7 +12,7 @@ use eredu_core::{
     generation::{
         FinishReason, GenerationCancellationToken, ResolvedGenerationConfig, SemanticEvent,
     },
-    TextGenerationBackend,
+    TextExecutionSession, TextGenerationBackend,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -48,11 +48,11 @@ pub use eredu_runtime::execution_control::TraceLimits;
 /// Generation consumes it, preventing accidental reuse with different settings.
 /// [`LoadedModel::start_controlled`] accepts this value, including intervened
 /// requests, and selects semantic or literal text through [`super::OutputMode`].
-pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
+pub struct PreparedObservedGeneration<P> {
     pub(super) cancellation: Option<GenerationCancellationToken>,
     pub(super) preparation_elapsed: std::time::Duration,
     pub(super) control_handle: Option<eredu_core::execution_control::GenerationControlHandle>,
-    pub(super) prompt: Option<B::Prompt>,
+    pub(super) prompt: Option<P>,
     pub(super) chat: PreparedChat,
     pub(super) prompt_token_ids: Vec<u32>,
     pub(super) settings: PreparedChatGenerationSettings,
@@ -68,7 +68,7 @@ pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
     pub(super) trace_limits: TraceLimits,
 }
 
-impl<B: TextGenerationBackend> PreparedObservedGeneration<B> {
+impl<P> PreparedObservedGeneration<P> {
     /// Supplies mode commands to the same physical driver used by controlled runs.
     pub fn with_control_handle(
         mut self,
@@ -320,11 +320,11 @@ impl<F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>> Delivery<F> {
     }
 }
 
-impl<B: TextGenerationBackend> LoadedModel<B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
     /// Returns genuine mutable points and actual loaded-session support.
     #[cfg(feature = "tensor-capture")]
     pub fn intervention_discovery(&self) -> Result<InterventionDiscovery, CaptureError> {
-        B::intervention_discovery(&self.runtime)
+        self.runtime.session().intervention_discovery()
     }
 
     /// Admits capture and intervention together before any native work. Plans apply
@@ -340,7 +340,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         capture: CapturePlan,
         intervention: InterventionPlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         let prepared = self.prepare_observed_chat(chat, settings, capture, trace_limits)?;
         self.admit_prepared_interventions(prepared, intervention)
     }
@@ -357,7 +357,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         capture: CapturePlan,
         intervention: InterventionPlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         let prepared =
             self.prepare_observed_token_ids(chat, prefix, settings, capture, trace_limits)?;
         self.admit_prepared_interventions(prepared, intervention)
@@ -366,9 +366,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     #[cfg(feature = "tensor-capture")]
     pub(super) fn admit_prepared_interventions(
         &self,
-        mut prepared: PreparedObservedGeneration<B>,
+        mut prepared: PreparedObservedGeneration<S::Prompt>,
         intervention: InterventionPlan,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         if intervention.schema_version != eredu_core::intervention::INTERVENTION_SCHEMA_VERSION {
             return Err(CaptureError::Invalid("unsupported intervention schema".into()).into());
         }
@@ -386,12 +386,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )
             .into());
         }
-        let admitted = intervention.admit(
-            &discovery,
-            prepared.capture_plan().request(),
-            &self.session_identity,
-        )?;
-        B::validate_text_interventions(&self.runtime, prepared.capture_plan(), &admitted)?;
+        let admitted =
+            intervention.admit(&discovery, prepared.plan.request(), &self.session_identity)?;
+        self.runtime
+            .session()
+            .validate_text_interventions(&prepared.plan, &admitted)?;
         prepared.artifact_identity = Some(discovery.artifact_identity);
         prepared.intervention = Some(admitted);
         Ok(prepared)
@@ -402,13 +401,13 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     pub fn capture_declarations(
         &self,
     ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
-        B::capture_declarations(&self.runtime)
+        self.runtime.session().capture_declarations()
     }
 
     /// Resolves content-exact provenance together with loaded observation facts.
     #[cfg(feature = "tensor-capture")]
     pub fn capture_discovery(&self) -> Result<CaptureDiscovery, CaptureError> {
-        B::capture_discovery(&self.runtime)
+        self.runtime.session().capture_discovery()
     }
 
     #[cfg(feature = "tensor-capture")]
@@ -417,7 +416,10 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         plan: CapturePlan,
         request: CaptureRequestShape,
     ) -> Result<(AdmittedCapturePlan, Option<String>), PreparedChatError> {
-        let bounds = B::text_capture_invocation_bounds(&self.runtime, request)?;
+        let bounds = self
+            .runtime
+            .session()
+            .text_capture_invocation_bounds(request)?;
         let provenance = plan.provenance;
         let declarations = if plan.selections.is_empty() {
             eredu_core::capture::CaptureDeclarations {
@@ -449,7 +451,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 request,
             )?,
         };
-        B::validate_text_capture(&self.runtime, &admitted)?;
+        self.runtime.session().validate_text_capture(&admitted)?;
         let artifact_identity = match provenance {
             eredu_core::capture::CaptureProvenance::Session => None,
             eredu_core::capture::CaptureProvenance::ContentExact => {
@@ -464,7 +466,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         &self,
         chat: &PreparedChat,
         settings: PreparedChatGenerationSettings,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         let prompt_token_ids = self
             .tokenizer
             .encode(chat.rendered_prompt(), false)
@@ -485,7 +487,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         prompt_token_ids: Vec<u32>,
         settings: PreparedChatGenerationSettings,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         self.prepare_generation(
             chat,
             prompt_token_ids,
@@ -505,7 +507,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         let prompt_token_ids = self
             .tokenizer
             .encode(chat.rendered_prompt(), false)
@@ -527,7 +529,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         self.prepare_generation(chat, prompt_token_ids, settings, trace_limits, plan)
     }
 
@@ -538,7 +540,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         trace_limits: TraceLimits,
         #[cfg(feature = "tensor-capture")] plan: CapturePlan,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         if self.prompt_cache_store.is_some() {
             return Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store for observed execution".into()).into());
         }
@@ -582,7 +584,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             intervention: None,
             session_identity: self.session_identity.clone(),
             artifact_identity,
-            parameter_overlay_id: B::active_parameter_overlay(&self.runtime).map(str::to_owned),
+            parameter_overlay_id: self
+                .runtime
+                .session()
+                .active_parameter_overlay()
+                .map(str::to_owned),
             trace_limits,
         })
     }
@@ -596,12 +602,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     pub fn prepare_observed_input(
         &self,
         chat: &PreparedChat,
-        prompt: B::Prompt,
+        prompt: S::Prompt,
         original_token_ids: Vec<u32>,
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
         let mut prepared = self.prepare_observed_token_ids(
             chat,
             original_token_ids,
@@ -618,7 +624,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Delivery is bounded and synchronous; callback Break cancels the existing driver.
     pub fn generate_observed<F>(
         &mut self,
-        prepared: PreparedObservedGeneration<B>,
+        prepared: PreparedObservedGeneration<S::Prompt>,
         caller_stop_sequences: &[String],
         cancellation: GenerationCancellationToken,
         on_record: F,
@@ -677,7 +683,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             prediction: 0,
             drafts: super::draft::DraftJournal::new(prepared.settings.draft_events),
             position: Default::default(),
-            iterative: B::supports_block_refinement(&self.runtime),
+            iterative: self.runtime.session().supports_block_refinement(),
         });
         delivery
             .borrow_mut()
@@ -792,9 +798,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 output_mode: mode,
                 control_handle: prepared.control_handle.as_ref(),
                 input: match prepared.prompt {
-                    Some(prompt) => {
-                        PreparedChatInput::prepared_backend_input(&prepared.chat, prompt)
-                    }
+                    Some(prompt) => PreparedChatInput::prepared_input(&prepared.chat, prompt),
                     None => PreparedChatInput::token_ids(&prepared.chat, prepared.prompt_token_ids),
                 },
                 settings: prepared.settings,

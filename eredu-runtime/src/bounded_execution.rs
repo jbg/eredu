@@ -2,7 +2,11 @@
 //!
 //! These limits carry no model geometry. Architecture preparation lowers them to
 //! exact mechanisms and rejects insufficient byte allowances before construction.
-use crate::{AppendStreamLimits, ParameterBankLoadOptions, RowLookupLimits};
+pub mod units;
+
+use eredu_core::cache::append_stream::AppendStreamLimits;
+
+use crate::{ParameterBankLoadOptions, RowLookupLimits};
 
 /// Invalid or conflicting finite execution policy, before source acquisition.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -302,10 +306,9 @@ impl BoundedExecutionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        CommunicationCompletionPolicy, NormalizedLoadRequest, ParallelLoadRequest,
-        PipelineActivationDtype, PipelineWireContract,
-    };
+    use crate::{NormalizedLoadRequest, ParallelLoadRequest, PipelineWireContract};
+    use eredu_core::communication::CommunicationCompletionPolicy;
+    use eredu_core::communication::PipelineActivationDtype;
     use eredu_core::{
         residency::OffloadConfig, CompletionCancellationMode, ParallelRankTopology,
         ParallelTopology,

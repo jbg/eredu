@@ -41,19 +41,21 @@ pub struct SpeculativeMemoryProfile {
 
 /// Backend projection borrowed from the exact target and selected draft. A report
 /// must not load artifacts, allocate caches, submit work or consume the drafter.
-pub trait SpeculativeForecastBackend<D>: GenerationForecastBackend {
+pub trait SpeculativeForecastSession<B: eredu_core::TextGenerationBackend, D>:
+    GenerationForecastSession<B>
+{
     /// Target selection for an isolated speculative lane. Backends with separate
     /// lane caches override this to avoid treating unrelated installed ordinary
     /// state as this lane's state. This never resets or creates a cache.
     fn speculative_target_memory_profile(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
         Self::loaded_memory_profile(runtime)
     }
 
     /// Retains unknown coverage for backends without speculative resource facts.
     fn speculative_memory_profile(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
         _draft: &SpeculativeDraft<'_, D>,
     ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
         Ok(None)

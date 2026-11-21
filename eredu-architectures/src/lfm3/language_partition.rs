@@ -28,8 +28,8 @@ pub struct SelectedLanguagePartition {
 pub struct PreparedLanguagePartition {
     selected: SelectedLanguagePartition,
     source: eredu_checkpoint::store::SharedCheckpointSource,
-    units: Vec<Vec<eredu_runtime::WeightBinding>>,
-    pinned: Vec<eredu_runtime::WeightBinding>,
+    units: Vec<Vec<eredu_core::residency::parameter_binding::WeightBinding>>,
+    pinned: Vec<eredu_core::residency::parameter_binding::WeightBinding>,
 }
 
 impl SelectedLanguagePartition {
@@ -223,8 +223,8 @@ impl PreparedLanguagePartition {
     pub fn bindings(
         &self,
     ) -> (
-        &[Vec<eredu_runtime::WeightBinding>],
-        &[eredu_runtime::WeightBinding],
+        &[Vec<eredu_core::residency::parameter_binding::WeightBinding>],
+        &[eredu_core::residency::parameter_binding::WeightBinding],
     ) {
         (&self.units, &self.pinned)
     }
@@ -238,8 +238,8 @@ impl PreparedLanguagePartition {
             crate::lfm3::PartitionedLayeredModel<B>,
             eredu_checkpoint::store::SharedCheckpointSource,
             eredu_runtime::ExecutionUnitAddressMap,
-            Vec<eredu_runtime::WeightBinding>,
-            Vec<Vec<eredu_runtime::WeightBinding>>,
+            Vec<eredu_core::residency::parameter_binding::WeightBinding>,
+            Vec<Vec<eredu_core::residency::parameter_binding::WeightBinding>>,
         ),
         BackendFailure,
     >

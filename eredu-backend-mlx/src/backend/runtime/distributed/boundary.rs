@@ -1,28 +1,31 @@
 //! Native allocation and dtype conversion for architecture-declared pipeline values.
 
 use crate::{backend::nn::shared::MlxNeuralBackend, MlxTensor};
+use eredu_core::communication::{
+    BoundaryTensorDtype, PartitionTensorAllocator, PipelineActivationDtype,
+};
 use safemlx::{Dtype, Stream};
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct MlxPartitionTensorAllocator;
+pub struct MlxPartitionTensorAllocator;
 
-impl eredu_runtime::PartitionTensorAllocator<MlxNeuralBackend> for MlxPartitionTensorAllocator {
+impl PartitionTensorAllocator<MlxNeuralBackend> for MlxPartitionTensorAllocator {
     fn tensor_to_wire(
         &mut self,
         tensor: MlxTensor,
-        logical_dtype: eredu_runtime::BoundaryTensorDtype,
-        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        logical_dtype: BoundaryTensorDtype,
+        activation_dtype: PipelineActivationDtype,
         context: &Stream,
     ) -> Result<MlxTensor, eredu_nn::Error> {
         let dtype = mlx_boundary_dtype(logical_dtype, activation_dtype)?;
         let source = tensor.as_array().dtype();
         let valid = match logical_dtype {
-            eredu_runtime::BoundaryTensorDtype::Activation => {
+            BoundaryTensorDtype::Activation => {
                 matches!(source, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32)
             }
-            eredu_runtime::BoundaryTensorDtype::Uint32 => source == Dtype::Uint32,
-            eredu_runtime::BoundaryTensorDtype::Int32 => source == Dtype::Int32,
-            eredu_runtime::BoundaryTensorDtype::Float32 => source == Dtype::Float32,
+            BoundaryTensorDtype::Uint32 => source == Dtype::Uint32,
+            BoundaryTensorDtype::Int32 => source == Dtype::Int32,
+            BoundaryTensorDtype::Float32 => source == Dtype::Float32,
             _ => false,
         };
         if !valid {
@@ -40,8 +43,8 @@ impl eredu_runtime::PartitionTensorAllocator<MlxNeuralBackend> for MlxPartitionT
     fn tensor_placeholder(
         &mut self,
         shape: &[i32],
-        logical_dtype: eredu_runtime::BoundaryTensorDtype,
-        activation_dtype: eredu_runtime::PipelineActivationDtype,
+        logical_dtype: BoundaryTensorDtype,
+        activation_dtype: PipelineActivationDtype,
         context: &Stream,
     ) -> Result<MlxTensor, eredu_nn::Error> {
         let dtype = mlx_boundary_dtype(logical_dtype, activation_dtype)?;
@@ -52,14 +55,14 @@ impl eredu_runtime::PartitionTensorAllocator<MlxNeuralBackend> for MlxPartitionT
 }
 
 pub(crate) fn mlx_boundary_dtype(
-    logical: eredu_runtime::BoundaryTensorDtype,
-    activation: eredu_runtime::PipelineActivationDtype,
+    logical: BoundaryTensorDtype,
+    activation: PipelineActivationDtype,
 ) -> Result<Dtype, eredu_nn::Error> {
     match logical {
-        eredu_runtime::BoundaryTensorDtype::Activation => mlx_pipeline_activation_dtype(activation),
-        eredu_runtime::BoundaryTensorDtype::Uint32 => Ok(Dtype::Uint32),
-        eredu_runtime::BoundaryTensorDtype::Int32 => Ok(Dtype::Int32),
-        eredu_runtime::BoundaryTensorDtype::Float32 => Ok(Dtype::Float32),
+        BoundaryTensorDtype::Activation => mlx_pipeline_activation_dtype(activation),
+        BoundaryTensorDtype::Uint32 => Ok(Dtype::Uint32),
+        BoundaryTensorDtype::Int32 => Ok(Dtype::Int32),
+        BoundaryTensorDtype::Float32 => Ok(Dtype::Float32),
         _ => Err(eredu_nn::Error::backend(
             "MLX pipeline boundary uses an unsupported logical dtype",
         )),
@@ -67,12 +70,12 @@ pub(crate) fn mlx_boundary_dtype(
 }
 
 pub(crate) fn mlx_pipeline_activation_dtype(
-    dtype: eredu_runtime::PipelineActivationDtype,
+    dtype: PipelineActivationDtype,
 ) -> Result<Dtype, eredu_nn::Error> {
     match dtype {
-        eredu_runtime::PipelineActivationDtype::Float16 => Ok(Dtype::Float16),
-        eredu_runtime::PipelineActivationDtype::Bfloat16 => Ok(Dtype::Bfloat16),
-        eredu_runtime::PipelineActivationDtype::Float32 => Ok(Dtype::Float32),
+        PipelineActivationDtype::Float16 => Ok(Dtype::Float16),
+        PipelineActivationDtype::Bfloat16 => Ok(Dtype::Bfloat16),
+        PipelineActivationDtype::Float32 => Ok(Dtype::Float32),
         _ => Err(eredu_nn::Error::backend(
             "unsupported MLX pipeline wire dtype",
         )),

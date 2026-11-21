@@ -13,10 +13,11 @@ pub use coordination::{
 use eredu_core::BackendFailure;
 use eredu_nn::RetainedTensorRoots;
 
+use eredu_core::sampling::{SamplingBackend, TokenDomain};
 use eredu_nn::{Tensor, TensorElementType};
 use eredu_runtime::{
-    PredictionDirective, RealtimeGenerationBranch, RealtimeScheduleState, SamplingBackend,
-    SequentialDecisionError, SequentialDecisionPlan, SequentialDecisionPlanError, TokenDomain,
+    PredictionDirective, RealtimeGenerationBranch, RealtimeScheduleState, SequentialDecisionError,
+    SequentialDecisionPlan, SequentialDecisionPlanError,
 };
 
 use super::{

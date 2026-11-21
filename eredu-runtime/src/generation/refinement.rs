@@ -1,7 +1,7 @@
 //! Shared feedback and masked-token refinement over immutable numerical values.
 
 use super::TokenDomain;
-use eredu_core::refinement::{MaskedRefinementConfig, RefinementPolicy, RefinementPolicyError};
+use eredu_core::refinement::{RefinementBackend, RefinementPolicy, RefinementPolicyError};
 use std::num::NonZeroU32;
 
 /// Architecture-owned input equations for shared iterative execution.
@@ -16,186 +16,15 @@ pub mod finalization;
 pub mod masked;
 
 /// Immutable values produced by one masked-token transition.
-pub struct MaskedRefinementStep<B: RefinementBackend> {
+pub(crate) struct MaskedRefinementStep<B: RefinementBackend> {
     /// Complete canvas preserving every previously unmasked token.
-    pub canvas: B::Token,
+    pub(crate) canvas: B::Token,
     /// Position scores retained from the invocation selecting each token.
-    pub scores: B::Logits,
+    scores: B::Logits,
     /// Positions selected during this invocation.
-    pub transfer: B::Mask,
+    transfer: B::Mask,
     /// Positions still containing the architecture's mask identity.
-    pub remaining: u32,
-}
-
-/// Numerical mechanisms used by a single-sequence refinement policy.
-///
-/// Operations return new immutable values. They never mutate supplied tensors,
-/// retained model context, or the random stream except for explicit draw calls.
-/// The owning session retains submission authority through settlement.
-pub trait RefinementBackend {
-    /// Immutable backend-native position scores.
-    type Logits: Clone;
-    /// Immutable backend-native token block.
-    type Token: Clone;
-    /// Independently copyable explicit random stream.
-    type RandomState;
-    /// Native execution context.
-    type Context: ?Sized;
-    /// Native mechanism failure.
-    type Error;
-    /// Native boolean position mask.
-    type Mask: Clone;
-    /// Architecture-selected embedding arithmetic used for retained feedback.
-    type ConditioningFormat: Clone;
-
-    /// Creates a mask-filled canvas and installs seeded positions without draws.
-    /// The count describes the actual initially masked positions. `None` means
-    /// the mechanism does not implement masked-token refinement.
-    fn initialize_masked_canvas(
-        _canvas: NonZeroU32,
-        _mask_token: u32,
-        _layout: Option<&eredu_core::refinement::RefinementCanvas>,
-        _context: &Self::Context,
-    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
-        Ok(None)
-    }
-
-    /// Builds immutable masked-token outputs. Numerical sampling and confidence
-    /// selection follow [`masked`]; prior unmasked values and their score rows
-    /// remain fixed. Categorical confidence uses temperature-scaled logits;
-    /// Gumbel-power confidence uses the original logits. No cache is changed.
-    fn masked_refinement_step(
-        _canvas: &Self::Token,
-        _previous_scores: Option<&Self::Logits>,
-        _logits: &Self::Logits,
-        _mask_token: u32,
-        _config: MaskedRefinementConfig,
-        _scheduled: u32,
-        _random: &mut Self::RandomState,
-        _context: &Self::Context,
-    ) -> Result<Option<MaskedRefinementStep<Self>>, Self::Error>
-    where
-        Self: Sized,
-    {
-        Ok(None)
-    }
-
-    /// Preserves the committed prefix, replaces its final token, and remasks the
-    /// dependent suffix. Explicit pinned seeds remain fixed. No cache is changed.
-    fn invalidate_masked_suffix(
-        _canvas: &Self::Token,
-        _position: usize,
-        _token: &Self::Token,
-        _mask_token: u32,
-        _pins: Option<(&Self::Token, &Self::Mask)>,
-        _context: &Self::Context,
-    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
-        Ok(None)
-    }
-
-    /// Installs explicit seed values and returns the fixed-position mask.
-    fn seed_canvas(
-        noise: &Self::Token,
-        layout: &eredu_core::refinement::RefinementCanvas,
-        context: &Self::Context,
-    ) -> Result<(Self::Token, Self::Mask), Self::Error>;
-    /// Fixed positions have one-hot conditioning: zero at their seed and negative infinity elsewhere.
-    fn pin_scores(
-        scores: &Self::Logits,
-        tokens: &Self::Token,
-        pins: &Self::Mask,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Rejects NaN, positive infinity and rows without a finite candidate, then
-    /// divides scores by a validated positive temperature.
-    fn scale_temperature(
-        logits: &Self::Logits,
-        temperature: f32,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Checks `[canvas, vocabulary]` score geometry without execution or draws.
-    fn validate_refinement_logits(
-        logits: &Self::Logits,
-        canvas: NonZeroU32,
-        domain: TokenDomain,
-    ) -> Result<(), Self::Error>;
-
-    /// Uniform categorical token IDs for the complete canvas.
-    fn uniform_tokens(
-        canvas: NonZeroU32,
-        domain: TokenDomain,
-        random: &mut Self::RandomState,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Per-position categorical draws from already temperature-scaled logits.
-    fn categorical_tokens(
-        logits: &Self::Logits,
-        random: &mut Self::RandomState,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Highest-scoring token at every canvas position.
-    fn argmax_tokens(
-        logits: &Self::Logits,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Selects lowest-entropy positions with `cumsum(entropy) - entropy <= bound`.
-    /// Ties are ordered by increasing original position.
-    fn entropy_bound_mask(
-        logits: &Self::Logits,
-        bound: f32,
-        context: &Self::Context,
-    ) -> Result<Self::Mask, Self::Error>;
-
-    /// Selects `accepted` at true mask positions and `other` elsewhere.
-    fn select_tokens(
-        mask: &Self::Mask,
-        accepted: &Self::Token,
-        other: &Self::Token,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-
-    /// Converts processed logits to the decoder's self-conditioning dtype.
-    fn retain_self_conditioning(
-        logits: &Self::Logits,
-        format: &Self::ConditioningFormat,
-        context: &Self::Context,
-    ) -> Result<Self::Logits, Self::Error>;
-
-    /// Observes one stop flag: mean entropy below the threshold and all supplied
-    /// preceding argmax canvases identical to the current one.
-    fn stable_and_confident(
-        logits: &Self::Logits,
-        argmax: &Self::Token,
-        preceding: &[Self::Token],
-        confidence_threshold: f32,
-        pins: Option<&Self::Mask>,
-        context: &Self::Context,
-    ) -> Result<bool, Self::Error>;
-
-    /// Establishes exact successful completion of all transition-local outputs.
-    /// A failed poll is not completion; native resources stay with the session's
-    /// recovery owner. No logical sampler state is published on error.
-    fn settle_refinement(
-        canvas: &Self::Token,
-        argmax: &Self::Token,
-        scores: &Self::Logits,
-        conditioning: &Self::Logits,
-        acceptance: &Self::Mask,
-        random: &Self::RandomState,
-        context: &Self::Context,
-    ) -> Result<(), Self::Error>;
-
-    /// Completes the initial noise and explicit key before publishing a block.
-    fn settle_initial_canvas(
-        canvas: &Self::Token,
-        random: &Self::RandomState,
-        context: &Self::Context,
-    ) -> Result<(), Self::Error>;
+    remaining: u32,
 }
 
 /// Policy or native failure while preparing a refinement transition.
@@ -210,9 +39,9 @@ pub enum RefinementError<E> {
     /// Vocabulary or canvas cannot be represented by the mechanism.
     #[error("refinement requires an addressable nonempty token domain")]
     Geometry,
-    /// The supplied mechanism has no masked-token numerical implementation.
-    #[error("masked-token refinement mechanism is unavailable")]
-    MaskedUnavailable,
+    /// Host equations rejected the supplied scores, geometry or draws.
+    #[error(transparent)]
+    MaskedNumerical(#[from] masked::MaskedNumericalError),
     /// The bounded schedule leaves unresolved mask positions.
     #[error(
         "masked-token refinement exhausted its schedule with {remaining} unresolved positions"
@@ -364,9 +193,7 @@ where
                 {
                     return Err(RefinementError::Geometry);
                 }
-                B::initialize_masked_canvas(canvas_length, mask_token_id, layout, context)
-                    .map_err(RefinementError::Backend)?
-                    .ok_or(RefinementError::MaskedUnavailable)?
+                masked::initialize_canvas::<B>(canvas_length, mask_token_id, layout, context)?
             }
         };
         if initial_masked > canvas_length.get() {
@@ -374,9 +201,29 @@ where
         }
         let (canvas, pinning) = match layout {
             Some(layout) => {
-                let (seeded, pins) =
-                    B::seed_canvas(&canvas, layout, context).map_err(RefinementError::Backend)?;
-                (seeded.clone(), Some((seeded, pins)))
+                let canvas = if matches!(config, RefinementPolicy::EntropyFeedback(_)) {
+                    let tokens: Vec<_> = layout
+                        .seed_tokens
+                        .iter()
+                        .map(|id| id.unwrap_or(0))
+                        .collect();
+                    let selected: Vec<_> = layout.seed_tokens.iter().map(Option::is_some).collect();
+                    let tokens = B::materialize_tokens(&tokens, context)
+                        .map_err(RefinementError::Backend)?;
+                    let selected = B::materialize_mask(&selected, context)
+                        .map_err(RefinementError::Backend)?;
+                    B::select_tokens(&selected, &tokens, &canvas, context)
+                        .map_err(RefinementError::Backend)?
+                } else {
+                    canvas
+                };
+                let mut pinned = vec![false; canvas_length.get() as usize];
+                for &position in &layout.pinned_positions {
+                    pinned[position as usize] = true;
+                }
+                let pinned =
+                    B::materialize_mask(&pinned, context).map_err(RefinementError::Backend)?;
+                (canvas.clone(), Some((canvas, pinned)))
             }
             None => (canvas, None),
         };
@@ -447,16 +294,14 @@ where
         let RefinementPolicy::MaskedUnmasking { mask_token_id, .. } = self.config else {
             return Ok(());
         };
-        let (canvas, count) = B::invalidate_masked_suffix(
+        let (canvas, count) = masked::invalidate_suffix::<B>(
             &self.canvas,
             position,
             token,
             mask_token_id,
             self.pinning.as_ref().map(|(tokens, pins)| (tokens, pins)),
             context,
-        )
-        .map_err(RefinementError::Backend)?
-        .ok_or(RefinementError::MaskedUnavailable)?;
+        )?;
         if count > self.canvas_length.get() {
             return Err(RefinementError::Geometry);
         }
@@ -522,7 +367,7 @@ where
                     .checked_add(1)
                     .ok_or(RefinementPolicyError::Iteration)?;
                 let mut random = self.random.clone();
-                let step = B::masked_refinement_step(
+                let step = masked::step::<B>(
                     &self.canvas,
                     self.scores.as_ref(),
                     raw_logits,
@@ -531,9 +376,7 @@ where
                     scheduled,
                     &mut random,
                     context,
-                )
-                .map_err(RefinementError::Backend)?
-                .ok_or(RefinementError::MaskedUnavailable)?;
+                )?;
                 if step.remaining > self.canvas_length.get() {
                     return Err(RefinementError::Geometry);
                 }

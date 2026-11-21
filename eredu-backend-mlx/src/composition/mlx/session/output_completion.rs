@@ -1,8 +1,5 @@
+use super::recovery::{ObservationRetention, Recovery, ScopeRetention, SubmissionResources};
 use super::*;
-use super::{
-    model_session::{ObservationRetention, ScopeRetention, SubmissionResources},
-    recovery::Recovery,
-};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 /// Backend-owned output of one MLX model-session submission.

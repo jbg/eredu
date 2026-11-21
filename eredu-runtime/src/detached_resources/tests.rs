@@ -1,5 +1,5 @@
 use super::*;
-use crate::resource_lifetimes::ResourceLifetime;
+use eredu_core::resources::ResourceLifetime;
 use eredu_core::{resources::*, Observed};
 use std::collections::BTreeMap;
 

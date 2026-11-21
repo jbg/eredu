@@ -23,7 +23,7 @@ use eredu_runtime::{
 
 use crate::{
     composite_execution::{
-        CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+        ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
         ExternalPredictionTargetOperation, PreparedCompositeInput,
     },
     media_plan::MuseInputPartPlan,
@@ -96,7 +96,8 @@ pub(crate) fn vision_partition_boundary_schema(
     args: &DecoderConfig,
     continuation: bool,
 ) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
-    use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+    use eredu_core::communication::BoundaryTensorDtype as Dtype;
+    use eredu_runtime::BoundaryTensorDimension as Dim;
     let vision = args
         .vision_config
         .as_ref()
@@ -138,7 +139,7 @@ pub fn external_assistant_capture_request(
         .map(|index| format!("model.layers.{index}.output"))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    Ok(ExternalPredictionCaptureRequest::Muse {
+    Ok(ExternalPredictionCaptureRequest::OrderedLayerOutputs {
         target_layers,
         target_paths,
     })
@@ -242,7 +243,7 @@ where
     for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
         match plan {
             MuseInputPartPlan::TextTokens { .. } => {
-                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::TokenIds(value) = part.payload() else {
                     return Err(Error::backend(
                         "Muse-Glimmer admitted text part lost its token payload",
                     ));
@@ -251,7 +252,7 @@ where
                 media.push(IngressKind::Text);
             }
             MuseInputPartPlan::Audio { ingress, .. } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Muse admitted waveform lost its tensor payload",
                     ));
@@ -267,7 +268,7 @@ where
                 });
             }
             MuseInputPartPlan::Vision { ingress, .. } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Muse-Glimmer admitted media part lost its tensor payload",
                     ));
@@ -303,7 +304,8 @@ where
     })
 }
 
-impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for MuseKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -311,7 +313,7 @@ where
 {
 }
 
-impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S> for MuseKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -349,7 +351,7 @@ where
         crate::composite_execution::DecoderPrefillRequest<B::Tensor, Self::InputPartPlan>;
 
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Self::Error> {
@@ -358,20 +360,18 @@ where
     type AdmissionConfig = DecoderConfig;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        let model = self.kernel();
+        let model = self;
         model.args.clone()
     }
 
-    fn external_assistant_target_profile(
-        config: &Self::AdmissionConfig,
-    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
-        Some(crate::external_assistant::ExternalAssistantTargetProfile::Muse(config.clone()))
+    fn supports_external_assistant(_config: &Self::AdmissionConfig) -> bool {
+        true
     }
 
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<
         crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         eredu_core::CapabilityError,
@@ -423,7 +423,7 @@ where
         };
         let continuation = if mode.is_active() {
             (|| -> Result<Option<CompositeContinuationGeometry>, String> {
-                let model = self.kernel();
+                let model = self;
                 if group == 2 {
                     let samples = input
                         .admitted()
@@ -517,9 +517,10 @@ where
         _groups: &[crate::composite_execution::CompositeGroupInvocation],
         continuation: Option<(i32, i32)>,
     ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
-        let model = self.kernel();
+        let model = self;
         if source_group == 2 && matches!(destination_group, 1 | 2) {
-            use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+            use eredu_core::communication::BoundaryTensorDtype as Dtype;
+            use eredu_runtime::BoundaryTensorDimension as Dim;
             let (sequence, width) =
                 continuation.unwrap_or((source_sequence, model.args.hidden_size));
             return eredu_runtime::BoundaryWireSchema::new(
@@ -554,7 +555,7 @@ where
         _unit: usize,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
-        let model = self.kernel();
+        let model = self;
         Ok(super::parallel::routed_tensor_reductions(
             &model.args,
             routed,
@@ -566,7 +567,7 @@ where
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
-        let model = self.kernel();
+        let model = self;
         if input
             .decoder_chunk()
             .is_some_and(|chunk| chunk.range.start > 0)
@@ -597,7 +598,7 @@ where
     fn external_prediction_capture_paths(
         request: &ExternalPredictionCaptureRequest,
     ) -> Result<Option<Vec<String>>, Self::Error> {
-        let ExternalPredictionCaptureRequest::Muse {
+        let ExternalPredictionCaptureRequest::OrderedLayerOutputs {
             target_layers,
             target_paths,
         } = request
@@ -622,7 +623,8 @@ where
         _forward: &Self::ForwardContext,
         observed: Vec<B::Tensor>,
     ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
-        let ExternalPredictionCaptureRequest::Muse { target_layers, .. } = request else {
+        let ExternalPredictionCaptureRequest::OrderedLayerOutputs { target_layers, .. } = request
+        else {
             return Ok(None);
         };
         if observed.len() != target_layers.len() {
@@ -632,7 +634,7 @@ where
                 observed.len()
             )));
         }
-        Ok(Some(ExternalPredictionTargetCapture::Muse {
+        Ok(Some(ExternalPredictionTargetCapture::OrderedLayerOutputs {
             target_states: observed,
         }))
     }
@@ -643,7 +645,7 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
-        let model = self.kernel_mut();
+        let model = self;
         let text = &mut model.static_modules.text;
         match operation {
             ExternalPredictionTargetOperation::TokenEmbeddings(tokens)
@@ -658,6 +660,7 @@ where
             ExternalPredictionTargetOperation::RawVocabularyProjection(hidden) => text
                 .raw_vocabulary_projection(hidden, parallel, context)
                 .map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -667,7 +670,7 @@ where
         combined: B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
-        let model = self.kernel();
+        let model = self;
         let text = &model.static_modules.text;
         match operation {
             ExternalPredictionTargetOperation::TokenEmbeddings(_) => {
@@ -678,6 +681,7 @@ where
             }
             ExternalPredictionTargetOperation::RawTokenEmbeddings(_)
             | ExternalPredictionTargetOperation::RawVocabularyProjection(_) => Ok(Some(combined)),
+            _ => Ok(None),
         }
     }
 }

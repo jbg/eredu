@@ -6,9 +6,9 @@ use eredu_core::{
     cache::{
         prompt_cache_token_fingerprint, PromptCacheDescriptor, PromptCacheOptions, PromptCacheStore,
     },
-    FinishReason, GenerationCancellationToken, PrefillChunkPolicy, SemanticEvent,
-    TextGenerationBackend, TextGenerationConfig, TextGenerationDriver, TokenFilter,
-    TokenFilterController,
+    AutomaticPromptCacheSession, FinishReason, GenerationCancellationToken, PrefillChunkPolicy,
+    SemanticEvent, TextExecutionSession, TextGenerationBackend, TextGenerationConfig,
+    TextGenerationDriver, TokenFilter, TokenFilterController,
 };
 use std::{
     convert::Infallible,
@@ -45,7 +45,9 @@ impl TokenFilterController for PrefillOnly {
 fn backend(error: impl std::error::Error + Send + Sync + 'static) -> PreparedChatError {
     PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
 }
-impl<B: TextGenerationBackend> LoadedModel<B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B> + AutomaticPromptCacheSession<B>>
+    LoadedModel<B, S>
+{
     /// Uses the same prompt-cache format and import/export path with any store.
     /// The fingerprint must identify the exact admitted checkpoint. It is also
     /// used for directory stores across loads; a model path alone is insufficient
@@ -64,7 +66,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )
             .into());
         }
-        B::prompt_cache_model_identity(&self.runtime).map_err(PreparedChatError::Backend)?;
+        S::prompt_cache_model_identity(&self.runtime).map_err(PreparedChatError::Backend)?;
         self.prompt_cache_store = Some((checkpoint, store));
         Ok(())
     }
@@ -79,7 +81,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     pub(super) fn generate_with_store<F: FnMut(SemanticEvent)>(
         &mut self,
-        mut request: GenerationRequest<'_, B, F>,
+        mut request: GenerationRequest<'_, S::Prompt, F>,
         started: Instant,
     ) -> Result<GenerationOutput, PreparedChatError> {
         let (checkpoint, store) = self
@@ -167,16 +169,20 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             || !matches!(
                 config
                     .decoding_mode()
-                    .unwrap_or_else(|| B::default_decoding_mode(&self.runtime)),
+                    .unwrap_or_else(|| self.runtime.session().default_decoding_mode()),
                 eredu_core::decoding::DecodingMode::Autoregressive
             )
-            || B::text_prefill_chunking_support(&self.runtime).is_err()
-            || B::supports_block_refinement(&self.runtime)
+            || self
+                .runtime
+                .session()
+                .text_prefill_chunking_support()
+                .is_err()
+            || self.runtime.session().supports_block_refinement()
         {
             store.clear()?;
             return Ok(tokens.to_vec());
         }
-        let identity = match B::prompt_cache_model_identity(&self.runtime) {
+        let identity = match S::prompt_cache_model_identity(&self.runtime) {
             Ok(i) => i,
             Err(e) => return Err(PreparedChatError::Backend(e)),
         };
@@ -191,7 +197,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 let descriptor = PromptCacheDescriptor::from_model_identity(
                     identity.clone(),
                     checkpoint,
-                    B::prompt_cache_prefix_fingerprint(&self.runtime, &tokens[..n])
+                    S::prompt_cache_prefix_fingerprint(&self.runtime, &tokens[..n])
                         .map_err(PreparedChatError::Backend)?,
                     1,
                 )
@@ -200,7 +206,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     .validate_compatibility(&descriptor, &tokens[..n])
                     .is_ok()
                 {
-                    B::load_prompt_cache(&mut self.runtime, store, &descriptor, &tokens[..n])
+                    S::load_prompt_cache(&mut self.runtime, store, &descriptor, &tokens[..n])
                         .map_err(PreparedChatError::Backend)?;
                     reused = n;
                 }
@@ -222,7 +228,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         if consumed == 0 {
             return Ok(tokens.to_vec());
         }
-        let prompt = B::prepare_text_prompt(self.runtime.backend(), tokens[..consumed].to_vec())
+        let prompt = S::prepare_text_prompt(self.runtime.backend(), tokens[..consumed].to_vec())
             .map_err(backend)?;
         let mut driver = TextGenerationDriver::new(&mut self.runtime);
         let mut state = driver.start(prompt, config, PrefillOnly).map_err(backend)?;
@@ -251,7 +257,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             return Ok(tokens.to_vec());
         }
         if consumed > 0 && !cancel.is_cancelled() {
-            if let Some(bytes) = B::estimate_prompt_cache_state(&self.runtime)
+            if let Some(bytes) = S::estimate_prompt_cache_state(&self.runtime)
                 .map_err(PreparedChatError::Backend)?
                 .and_then(eredu_runtime::prompt_cache_export_allowance)
             {
@@ -261,13 +267,13 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     let descriptor = PromptCacheDescriptor::from_model_identity(
                         identity,
                         checkpoint,
-                        B::prompt_cache_prefix_fingerprint(&self.runtime, prefix)
+                        S::prompt_cache_prefix_fingerprint(&self.runtime, prefix)
                             .map_err(PreparedChatError::Backend)?,
                         1,
                     )
                     .map_err(backend)?;
                     let options = PromptCacheOptions::new(None, true).map_err(backend)?;
-                    B::save_prompt_cache(&mut self.runtime, store, descriptor, prefix, &options)
+                    S::save_prompt_cache(&mut self.runtime, store, descriptor, prefix, &options)
                         .map_err(PreparedChatError::Backend)?;
                 }
             }

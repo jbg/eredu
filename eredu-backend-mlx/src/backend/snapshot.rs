@@ -1,10 +1,9 @@
 //! Completed independent host tensor copies for portable value snapshots.
 
 use eredu_core::{
-    execution_control::{ExecutionControlError, SnapshotEstimate},
+    execution_control::{SnapshotCostOverflow, SnapshotEstimate, SnapshotRetention, SnapshotValue},
     BackendFailure,
 };
-use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
 use safemlx::{Array, Stream};
 
 use super::{
@@ -17,7 +16,7 @@ struct CopyResources {
     copied: Option<Array>,
     contiguous: Option<Array>,
     stream: Stream,
-    _reservation: SnapshotReservation,
+    _retention: SnapshotRetention,
 }
 struct CopyRetention(OrdinaryRetirement<CopyResources>);
 impl Retention for CopyRetention {
@@ -33,7 +32,7 @@ pub(crate) fn estimate_array(source: &Array) -> Result<SnapshotEstimate, Backend
         .and_then(|bytes| bytes.checked_add((source.shape().len() as u64).checked_mul(16)?))
         .and_then(|bytes| bytes.checked_mul(3))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<CopyResources>() as u64))
-        .ok_or_else(|| BackendFailure::from_error(ExecutionControlError::Overflow))?;
+        .ok_or_else(|| BackendFailure::from_error(SnapshotCostOverflow))?;
     Ok(SnapshotEstimate {
         retained_bytes: bytes,
         copy_bytes: bytes,
@@ -42,7 +41,7 @@ pub(crate) fn estimate_array(source: &Array) -> Result<SnapshotEstimate, Backend
 
 pub(crate) fn copy_array(
     source: &Array,
-    retention: &SnapshotReservation,
+    retention: &SnapshotRetention,
 ) -> Result<Array, BackendFailure> {
     submission_recovery::reap();
     ordinary_retirement::reclaim();
@@ -51,7 +50,7 @@ pub(crate) fn copy_array(
         copied: None,
         contiguous: None,
         stream: Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0)),
-        _reservation: retention.clone(),
+        _retention: retention.clone(),
     })))
     .map_err(BackendFailure::from_error)?;
     // Snapshot payloads use independent host storage. Explicit CPU compaction
@@ -97,7 +96,7 @@ impl SnapshotValue for crate::MlxTensor {
     fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
         estimate_array(self.as_array())
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         copy_array(self.as_array(), retention).map(Self::from_array)
     }
 }

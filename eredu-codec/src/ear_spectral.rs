@@ -6,9 +6,7 @@
 //! finite reconstruction and streamed output have different endpoint normalization.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -90,7 +88,7 @@ impl<T: Tensor + SnapshotValue> SnapshotValue for SpectralState<T> {
             self.imaginary.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             real: self.real.copy_snapshot_value(retention)?,
             imaginary: self.imaginary.copy_snapshot_value(retention)?,

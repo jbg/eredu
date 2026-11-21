@@ -203,18 +203,30 @@ fn singleton() -> HookTransport {
 
 #[test]
 fn skip_releases_partial_claim_without_refunding_reserved_work() {
-    let transport = singleton();
-    let generous = skip_plan(false, |_| {});
-    let mut priced = configured(generous, 1);
+    let ranks = 4;
+    let members = vec![0, 2];
+    let reference = HookTransport {
+        transport: transport(world(ranks), 0, Fault::None),
+        hook: None,
+        members: members.clone(),
+    };
+    let mut priced = configured(skip_plan(false, |_| {}), ranks);
     let epoch = DistributedCommitEpoch::FIRST;
     priced
         .prepare_step_transaction(epoch, crate::ExpertPass::Prefill, 0)
         .unwrap();
     let _work = priced
-        .prepare_partition_capture(&transport, 0, producers(priced.plan(), 1), LIMITS, estimate)
+        .prepare_partition_capture(
+            &reference,
+            0,
+            producers(priced.plan(), ranks),
+            LIMITS,
+            estimate,
+        )
         .unwrap();
-    let _coordination = priced.prepare_partition_coordination(&transport).unwrap();
+    let _coordination = priced.prepare_partition_coordination(&reference).unwrap();
     let before_hook = priced.ledger.step();
+
     for cumulative in [false, true] {
         let plan = skip_plan(false, |limits| {
             if cumulative {
@@ -223,50 +235,67 @@ fn skip_releases_partial_claim_without_refunding_reserved_work() {
                 limits.per_step.retained_bytes = before_hook.retained_bytes;
             }
         });
-        let mut session = configured(plan, 1);
+        let all = world(ranks);
         let layout = Layout {
-            ranks: 1,
-            members: vec![0],
+            ranks,
+            members: members.clone(),
         };
-        let mut observer = PartitionCaptureObserver::for_step(
-            &mut session,
-            Backend::default(),
-            &transport,
-            &layout,
-            0,
-            LIMITS,
-            estimate,
-            |error| error,
-        );
-        observer
-            .prepare_transaction(epoch, crate::ExpertPass::Prefill)
-            .unwrap();
-        observer.coordinate_transaction(epoch).unwrap();
-        observer
-            .observe_generated(
-                "block.output",
-                &global(),
-                &generated_source(4096),
-                &mut || -> Result<Value, PartitionCaptureObserverError<std::io::Error>> {
-                    panic!("skipped producer cannot run its factory")
-                },
-            )
-            .unwrap();
-        observer.complete_transaction(epoch).unwrap();
-        observer.finish_transaction(epoch, true);
-        drop(observer);
-        let step = session.take_step().unwrap();
-        assert_eq!(step.step_usage, before_hook);
-        assert_eq!(
-            step.records[0].outcome,
-            CaptureOutcome::Skipped {
-                reason: CaptureSkipReason::Limit {
-                    budget: CaptureBudget::Retention,
-                    cumulative
-                }
+        std::thread::scope(|scope| {
+            for rank in 0..ranks {
+                let plan = plan.clone();
+                let all = Arc::clone(&all);
+                let layout = &layout;
+                scope.spawn(move || {
+                    let transport = HookTransport {
+                        transport: transport(all, rank, Fault::None),
+                        hook: None,
+                        members: layout.members.clone(),
+                    };
+                    let mut session = configured(plan, ranks);
+                    let mut observer = PartitionCaptureObserver::for_step(
+                        &mut session,
+                        Backend::default(),
+                        &transport,
+                        layout,
+                        0,
+                        LIMITS,
+                        estimate,
+                        |error| error,
+                    );
+                    observer
+                        .prepare_transaction(epoch, crate::ExpertPass::Prefill)
+                        .unwrap();
+                    observer.coordinate_transaction(epoch).unwrap();
+                    if layout.members.contains(&rank) {
+                        observer
+                            .observe_generated(
+                                "block.output",
+                                &local_source(ranks, rank),
+                                &generated_source(4096),
+                                &mut || -> Result<Value, PartitionCaptureObserverError<std::io::Error>> {
+                                    panic!("skipped producer cannot run its factory")
+                                },
+                            )
+                            .unwrap();
+                    }
+                    observer.complete_transaction(epoch).unwrap();
+                    observer.finish_transaction(epoch, true);
+                    drop(observer);
+                    let step = session.take_step().unwrap();
+                    assert_eq!(step.step_usage, before_hook);
+                    assert_eq!(
+                        step.records[0].outcome,
+                        CaptureOutcome::Skipped {
+                            reason: CaptureSkipReason::Limit {
+                                budget: CaptureBudget::Retention,
+                                cumulative,
+                            },
+                        }
+                    );
+                    assert!(step.partitions.is_empty());
+                });
             }
-        );
-        assert!(step.partitions.is_empty());
+        });
     }
 }
 

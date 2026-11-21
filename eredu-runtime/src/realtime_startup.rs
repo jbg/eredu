@@ -1,94 +1,32 @@
 //! Native mechanisms consumed by portable realtime startup.
 
-use eredu_core::{BackendFailure, Completion};
-use eredu_nn::{AttentionCache, NeuralBackend, RetainedTensorRoots, Tensor};
+use eredu_core::sampling::DenseSamplingBackend;
+
+use crate::state::{HybridCacheStorage, HybridState};
+use eredu_core::BackendFailure;
+use eredu_core::{
+    backend::LocalComponentStorage, realtime_mechanisms::RealtimeGraphResources,
+    sampling::SamplingBackend,
+};
+use eredu_nn::{AttentionCache, NeuralBackend, Tensor};
 
 use crate::{
-    execution_control::SnapshotRetainedGrowth, DenseSamplingBackend, LayerRuntimeState,
-    ParameterUnitMechanisms, RuntimeStateComponents, StateLayout,
+    execution_control::SnapshotRetainedGrowth, LayerRuntimeState, ParameterUnitMechanisms,
+    RuntimeStateComponents, StateLayout,
 };
 
 type Context<B> = <<B as NeuralBackend>::Tensor as Tensor>::Context;
 
-/// Realizes an exact selected state plan.
-pub trait RealtimeStateMaterializer<P, S> {
-    /// Allocates independent state from the retained selection.
-    fn realize_state(&self, selected: &P) -> Result<S, BackendFailure>;
-}
-
-/// Finite copy limits for a joint state transaction.
-#[derive(Debug, Clone, Copy)]
-pub struct RealtimeCopyLimits {
-    /// Maximum storage and temporary copy bytes for one branch.
-    pub max_branch_bytes: u64,
-    /// Cumulative copy allowance shared by isolated descendants.
-    pub max_total_copy_bytes: u64,
-}
-
-/// Groups independently realized state under one copy budget and transaction.
-pub trait RealtimeStateGroup<L, R> {
-    /// Combined state owner.
-    type State;
-
-    /// Adopts both states into one transactional owner.
-    fn group_state(
-        &self,
-        left: L,
-        right: R,
-        limits: RealtimeCopyLimits,
-    ) -> Result<Self::State, BackendFailure>;
-}
-
-/// Disjoint access to two parts of one unpublished state transaction.
-pub trait RealtimeJointStateParts {
-    /// First state part.
-    type Left: ?Sized;
-    /// Second state part.
-    type Right: ?Sized;
-
-    /// Borrows the parts while the branch keeps transaction ownership.
-    fn parts_mut(&mut self) -> (&mut Self::Left, &mut Self::Right);
-}
-
-/// Native RNG and exact completion types for realtime generation.
-pub trait RealtimeStartupMechanisms {
-    /// Explicit random state adopted by the generation transaction.
-    type Random;
-    /// Exact completion attached to candidate execution.
-    type Completion: Completion;
-
-    /// Realizes an explicitly selected random seed.
-    fn realize_random(&self, seed: u64) -> Result<Self::Random, BackendFailure>;
-}
-
-/// Runs startup neural work and completes its retained outputs before returning.
-pub trait RealtimeStartupPreparation<C, T: Tensor> {
-    /// Enters native recovery and completes an architecture-owned operation.
-    fn prepare_startup<O: RetainedTensorRoots<T>>(
-        &self,
-        operation: impl FnOnce(&mut C, &T::Context) -> Result<O, BackendFailure>,
-    ) -> Result<O, BackendFailure>;
-}
-
-/// Opens the transport for a retained pipeline route and reports its native world identity.
-pub trait PipelineTransportProvider {
-    /// Native transport passed to the generic component binder.
-    type Transport;
-
-    /// Opens the selected native transport alongside its process identity.
-    fn open(&self) -> Result<(crate::PlacementRank, Self::Transport), BackendFailure>;
-}
-
-/// Native state ownership and component binding for a realtime layered graph.
-pub trait RealtimeGraphMechanisms<B: NeuralBackend>:
-    Sized + RealtimeStateMaterializer<StateLayout, Self::State>
-{
+/// Portable state ownership and component binding for a realtime layered graph.
+pub trait RealtimeGraphMechanisms<B: NeuralBackend>: Sized {
+    /// Creates portable state from the exact selected layout.
+    fn realize_state(&self, layout: &StateLayout) -> Result<Self::State, BackendFailure>;
     /// State used for every declared neural layout.
     type State: LayerRuntimeState<
         B,
         LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     >;
-    /// Native materialization mechanisms shared with other model adapters.
+    /// Materialization mechanisms shared with other model drivers.
     type Components: ParameterUnitMechanisms<B>;
     /// Borrows the component binder.
     fn components(&self) -> &Self::Components;
@@ -110,14 +48,72 @@ pub trait RealtimeGraphMechanisms<B: NeuralBackend>:
     /// Collects state roots that must complete before canonical publication.
     fn retained_values(state: &Self::State) -> Vec<&B::Tensor>;
 
-    /// Retains native work started by one streamed input operation through recovery.
-    fn with_input_recovery<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Result<T, E>
-    where
-        E: From<BackendFailure>;
+    /// Opens native recovery before portable streamed input work.
+    fn open_input_recovery() -> Result<impl Sized, BackendFailure>;
 
-    /// Holds retained branch accounting while native work can outlive an advance.
-    fn with_fork_retention<T>(
+    /// Keeps branch accounting alive through any native work started in this scope.
+    fn hold_fork_retention(retention: SnapshotRetainedGrowth)
+        -> Result<impl Sized, BackendFailure>;
+}
+
+/// Portable cache owner used by categorical startup.
+pub trait CategoricalRealtimeState: Sized {
+    /// Constructs resident state for the exact selected model layout.
+    fn resident_categorical_state(layout: &StateLayout) -> Result<Self, BackendFailure>;
+}
+
+impl<C> CategoricalRealtimeState for crate::state::KeyValueState<C>
+where
+    C: eredu_core::cache::mechanisms::ResidentKeyValueStorage
+        + eredu_core::cache::mechanisms::PagedKeyValueStorage,
+{
+    fn resident_categorical_state(layout: &StateLayout) -> Result<Self, BackendFailure> {
+        Self::device(layout.clone()).map_err(BackendFailure::from_error)
+    }
+}
+
+impl<B, M> RealtimeGraphMechanisms<B> for M
+where
+    B: LocalComponentStorage<CacheStorage: HybridCacheStorage>,
+    M: RealtimeGraphResources<Backend = B> + ParameterUnitMechanisms<B>,
+    <M::Sampling as SamplingBackend>::Error: 'static,
+{
+    type State = HybridState<B::CacheStorage>;
+    type Components = Self;
+    type SamplingError = <M::Sampling as SamplingBackend>::Error;
+    type Sampling = M::Sampling;
+
+    fn realize_state(&self, layout: &StateLayout) -> Result<Self::State, BackendFailure> {
+        HybridState::device(layout.clone(), &[]).map_err(BackendFailure::from_error)
+    }
+
+    fn components(&self) -> &Self {
+        self
+    }
+
+    fn context(&self) -> &Context<B> {
+        self.graph_context()
+    }
+
+    fn branch_state(state: &Self::State) -> Result<Self::State, BackendFailure> {
+        state.deep_clone_state().map_err(BackendFailure::from_error)
+    }
+
+    fn retained_values(state: &Self::State) -> Vec<&B::Tensor> {
+        state
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.retained_values())
+            .collect()
+    }
+
+    fn open_input_recovery() -> Result<impl Sized, BackendFailure> {
+        M::open_input_recovery()
+    }
+
+    fn hold_fork_retention(
         retention: SnapshotRetainedGrowth,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, BackendFailure>;
+    ) -> Result<impl Sized, BackendFailure> {
+        M::hold_fork_retention(retention.authority())
+    }
 }

@@ -14,14 +14,15 @@ use eredu_checkpoint::{
     },
     LinearFormat, SourceTensorEncoding, StoredDtype,
 };
+use eredu_core::checkpoint_mechanisms::ParameterBindingTarget;
 use eredu_nn::{
     ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
 };
 use eredu_runtime::{
     build_exact_replicated_text_bindings, BindingPlanError, LocalModelLayout, LocalTensorLayout,
-    ModuleBindingPlanError, ParameterBindingTarget, ParameterRole,
-    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, ReplicatedTextParameterRole,
-    ReplicatedTextPhysicalSource, TensorPlacement, WeightLoweringDescriptor, WeightLoweringKind,
+    ModuleBindingPlanError, ParameterRole, ReplicatedTextMaterializationTask,
+    ReplicatedTextParameterOwner, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+    TensorPlacement, WeightLoweringDescriptor, WeightLoweringKind,
 };
 
 struct Module(ParameterBindingTarget);
@@ -161,7 +162,7 @@ fn bind(
     task: &ReplicatedTextMaterializationTask,
     shape: Vec<usize>,
     layout: Option<&LocalModelLayout>,
-) -> Result<Vec<eredu_runtime::WeightBinding>, ModuleBindingPlanError> {
+) -> Result<Vec<eredu_core::residency::parameter_binding::WeightBinding>, ModuleBindingPlanError> {
     let module = Module(ParameterBindingTarget {
         shape,
         dtype: if source.overlay {

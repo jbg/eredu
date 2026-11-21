@@ -1,5 +1,6 @@
 use super::*;
-use crate::{establish_communication_session, CommunicationManifest, ExpertPass};
+use crate::{establish_communication_session, ExpertPass};
+use eredu_core::communication::CommunicationManifest;
 use eredu_core::consensus::ConsensusTransport;
 use eredu_core::{DescriptionCompleteness, ObservationCatalog, ObservationSupportReport};
 

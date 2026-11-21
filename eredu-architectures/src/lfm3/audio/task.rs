@@ -1,8 +1,11 @@
 //! Host operations for finite speech tasks over retained execution.
 
+use eredu_core::realtime_mechanisms::RealtimeStartupMechanisms;
+use eredu_core::SubmissionBackend;
+
+use eredu_core::sampling::SamplingBackend;
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, GroupedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{RealtimeStartupMechanisms, SamplingBackend, SubmissionBackend};
 
 use super::{
     AudioAdvance, AudioExecutionKernel, AudioIngress, AudioIngressError, AudioIngressRequest,

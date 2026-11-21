@@ -6,9 +6,7 @@
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_nn::RetainedTensorRoots;
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::{
     recurrent::{Lstm, LstmLayerState, LstmState},
@@ -310,7 +308,7 @@ impl<T: SnapshotValue> SnapshotValue for RnntPredictionState<T> {
             })),
         )
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         let mut layers = Vec::new();
         layers
             .try_reserve_exact(self.local.layers.len())
@@ -357,7 +355,7 @@ impl<T: SnapshotValue> SnapshotValue for RnntState<T> {
             self.hypothesis.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             dimensions: self.dimensions,
             predictor: self.predictor.copy_snapshot_value(retention)?,

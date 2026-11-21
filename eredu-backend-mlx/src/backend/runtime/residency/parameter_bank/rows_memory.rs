@@ -1,31 +1,36 @@
 //! Buffer facts for the synchronous compact row decoder, not its source cache.
+use eredu_core::{
+    preparation::rows::{RowDecodeRequest, RowEncoding},
+    BackendFailure, BackendFailureKind,
+};
 use eredu_nn::{mechanism_memory::*, TensorElementType};
-use eredu_runtime::{RowEncoding, RowLookupDescriptor, RowLookupError};
 
 pub(super) fn describe(
-    prepared: &RowLookupDescriptor,
-) -> Result<MechanismMemoryContract, RowLookupError> {
-    let mut result = prepared.decode_memory()?;
+    request: RowDecodeRequest<'_>,
+    mut result: MechanismMemoryContract,
+) -> Result<MechanismMemoryContract, BackendFailure> {
     result.missing = vec![
         "MLX allocator capacity and kernel-private workspace are undescribed".into(),
         "encoded row/scale owner backing and residency transfer buffers are described separately".into(),
         "portable lookup planning, concatenation/reordering and scalar preparation are separate invocations".into(),
     ];
-    let rows = prepared.maximum_acquisition_rows();
+    let rows = request.rows;
     let encoded = &result.values[0];
     let output = result
         .values
         .iter()
         .find(|v| v.name == "output")
         .expect("prepared output");
-    let output_bytes = output.logical_bytes()?;
+    let output_bytes = output.logical_bytes().map_err(BackendFailure::from_error)?;
     let float_bytes = rows
-        .checked_mul(prepared.spec().dimensions as u64)
+        .checked_mul(request.geometry.dimensions as u64)
         .and_then(|n| n.checked_mul(4))
-        .ok_or(RowLookupError::Geometry)?;
+        .ok_or_else(invalid_geometry)?;
     let mut compact = allocation(
         "encoded_compact",
-        encoded.logical_bytes()?,
+        encoded
+            .logical_bytes()
+            .map_err(BackendFailure::from_error)?,
         MechanismStorageRole::Scratch,
         StorageRetention::NativeCompletion,
     );
@@ -35,11 +40,11 @@ pub(super) fn describe(
     result.storage.push(compact);
     result.storage.push(allocation(
         "row_indices",
-        rows.checked_mul(4).ok_or(RowLookupError::Geometry)?,
+        rows.checked_mul(4).ok_or_else(invalid_geometry)?,
         MechanismStorageRole::Scratch,
         StorageRetention::NativeCompletion,
     ));
-    let decoded_element = match prepared.spec().encoding {
+    let decoded_element = match *request.geometry.encoding {
         RowEncoding::Dense => encoded.element,
         RowEncoding::ScalarE4M3 { .. } => {
             result.storage.push(allocation(
@@ -72,7 +77,7 @@ pub(super) fn describe(
             TensorElementType::F32
         }
         RowEncoding::Gguf { .. } => {
-            if super::scalar_decoder(&prepared.spec().encoding).is_some() {
+            if super::scalar_decoder(request.geometry.encoding).is_some() {
                 let mut host = allocation(
                     "decoded_host",
                     float_bytes,
@@ -119,12 +124,12 @@ pub(super) fn describe(
                     MechanismStorageRole::Output,
                     StorageRetention::Returned,
                 ));
-                result.validate()?;
+                result.validate().map_err(BackendFailure::from_error)?;
                 return Ok(result);
             }
         }
     };
-    if decoded_element != prepared.spec().output_type {
+    if decoded_element != request.geometry.output_type {
         result.storage.push(allocation(
             "cast_output",
             output_bytes,
@@ -138,7 +143,7 @@ pub(super) fn describe(
         MechanismStorageRole::Output,
         StorageRetention::Returned,
     ));
-    result.validate()?;
+    result.validate().map_err(BackendFailure::from_error)?;
     Ok(result)
 }
 fn allocation(
@@ -164,15 +169,16 @@ fn allocation(
 pub(super) fn workspace(
     rows: u64,
     encoded_row_bytes: u64,
-    spec: &eredu_runtime::RowLookupSpec,
-) -> Result<u64, RowLookupError> {
-    let dimensions = spec.dimensions as u64;
+    dimensions: i32,
+    encoding: &RowEncoding,
+) -> Result<u64, BackendFailure> {
+    let dimensions = dimensions as u64;
     if rows == 0 || rows > i32::MAX as u64 || dimensions == 0 || dimensions > i32::MAX as u64 {
-        return Err(RowLookupError::Geometry);
+        return Err(invalid_geometry());
     }
     // The scalar fallback additionally owns a host decode result and native
     // staging/copy. Keep the same bound in cold selection and live acquisition.
-    let floats = if super::scalar_decoder(&spec.encoding).is_some() {
+    let floats = if super::scalar_decoder(encoding).is_some() {
         24
     } else {
         16
@@ -182,5 +188,14 @@ pub(super) fn workspace(
         .and_then(|n| n.checked_add(encoded_row_bytes))
         .and_then(|n| n.checked_add(4))
         .and_then(|n| n.checked_mul(rows))
-        .ok_or(RowLookupError::Geometry)
+        .ok_or_else(invalid_geometry)
+}
+
+fn invalid_geometry() -> BackendFailure {
+    BackendFailure::new(
+        BackendFailureKind::InvalidInput,
+        safemlx::error::Exception::custom(
+            "row decoder dimensions or workspace exceed representable bounds",
+        ),
+    )
 }

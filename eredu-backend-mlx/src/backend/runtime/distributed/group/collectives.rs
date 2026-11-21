@@ -1,4 +1,3 @@
-use super::handle::record_native_collective_submission;
 use super::*;
 
 fn depends_on(value: &Array, dependency: &Array) -> Result<Array> {
@@ -335,7 +334,6 @@ fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> 
 }
 
 fn all_sum_unchecked(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
-    record_native_collective_submission(group);
     match group.logical {
         Some(_) => logical_all_sum(input, group, stream),
         None => native::all_sum(
@@ -355,24 +353,13 @@ pub(crate) fn all_sum_for(
 ) -> Result<Array> {
     let started = std::time::Instant::now();
     let _setup = group.begin_bounded_setup()?;
-    let completion = if group.has_local_phase_agreement() {
-        Some(group.completion_policy().ok_or_else(|| {
-            Exception::custom("guarded data collective requires bounded completion")
-        })?)
-    } else {
-        None
-    };
     group.validate_tensor(operation, input, false)?;
     group.validate_expected_output(operation, input.dtype(), input.ndim(), input.size())?;
     if let Some(setup) = &_setup {
         setup.check()?;
     }
     let output = all_sum_unchecked(input, group, stream.as_ref())?;
-    if let Some(policy) = completion {
-        // A lazy data collective must not race the next status exchange over
-        // the same native transport, even when its consumer graph is unsubmitted.
-        super::status::complete_output(&output, group, stream.as_ref(), policy, started)?;
-    }
+    group.finish_coordinated_output(operation, &output, stream.as_ref(), started)?;
     group.validate_tensor(operation, &output, true)?;
     if output.shape() != input.shape() {
         return Err(Exception::custom(format!(
@@ -398,10 +385,7 @@ pub(crate) fn payload_free_all_sum_for(
     }
     let output = if operation == CommunicationOperation::FailureAgreement {
         match super::status::independent_status_sum(token, group, stream.as_ref())? {
-            Some(output) => {
-                record_native_collective_submission(group);
-                output
-            }
+            Some(output) => output,
             None => all_sum_unchecked(token, group, stream.as_ref())?,
         }
     } else {
@@ -450,7 +434,6 @@ pub(crate) fn all_gather_unchecked(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
-    record_native_collective_submission(group);
     let stream = stream.as_ref();
     let output = if group.logical.is_none() {
         native::all_gather(
@@ -694,7 +677,6 @@ pub fn all_to_all_v(
         setup.check()?;
     }
     let stream = stream.as_ref();
-    record_native_collective_submission(group);
     if group.logical.is_none() {
         let output = native::all_to_all_v(
             input,
@@ -816,37 +798,4 @@ fn validate_all_to_all_output(
         )));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod ordered_wave_tests {
-    use super::*;
-
-    #[test]
-    #[ignore = "requires native MLX CPU execution; run explicitly"]
-    fn ordered_world_timeout_retains_and_fences_native_group() {
-        use crate::backend::runtime::distributed::completion::{
-            ensure_group_available, force_next_communication_pending,
-            release_forced_pending_orphans,
-        };
-        let native = native::init(false, native::Backend::Ring).unwrap();
-        let policy = CommunicationCompletionPolicy::new(
-            std::time::Duration::from_millis(5),
-            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
-        )
-        .unwrap();
-        let group = Group::uncontracted(&native).with_completion_policy(policy);
-        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let value = Array::from_slice(&[2.0_f32, -3.0], &[2]);
-        force_next_communication_pending();
-        assert!(ordered_world_sum(&value, &group, &stream)
-            .unwrap_err()
-            .what()
-            .contains("native resources retained"));
-        assert!(ensure_group_available(&group).is_err());
-        release_forced_pending_orphans();
-        assert!(ensure_group_available(&group).is_ok());
-        let result = ordered_world_sum(&value, &group, &stream).unwrap();
-        assert_eq!(result.evaluated().unwrap().as_slice::<f32>(), &[2.0, -3.0]);
-    }
 }

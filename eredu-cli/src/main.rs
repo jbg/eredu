@@ -50,16 +50,16 @@ use eredu::{
 #[cfg(test)]
 use eredu_backend_mlx::MlxBackendFactory;
 #[cfg(feature = "vision")]
-use eredu_core::MultimodalPreparationBackend as TextInputBackend;
+use eredu_core::MultimodalPreparationSession as TextInputSession;
 #[cfg(test)]
 use eredu_core::QuantizationRequest;
 #[cfg(not(feature = "vision"))]
-use eredu_core::TextGenerationBackend as TextInputBackend;
+use eredu_core::TextExecutionSession as TextInputSession;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, AutomaticPlanningBackend,
-    DeviceCapabilities, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan,
-    ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
+    BackendHardware, DeviceCapabilities, DevicePlan, DraftPlacementPlan, DraftingPlan,
+    ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, HardwareBackendProfile,
     HardwareDeviceKind, HardwareMemorySemantics, HardwareProfile, InspectionSeverity,
     ModelResourceProfile, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
@@ -1330,7 +1330,7 @@ fn candidate_is_loadable(
     model_path: &Path,
     plan: &ExecutionPlan,
 ) -> Result<bool> {
-    let inspection = inspect_execution(factory, model_path, plan)?;
+    let inspection = inspect_execution(factory, model_path, plan, None)?;
     Ok(inspection.report().is_loadable())
 }
 
@@ -1444,7 +1444,7 @@ fn automatic_observations(
     let hardware = factory.discover_hardware()?;
     validate_automatic_device(&hardware, device)?;
     let plan = ExecutionPlan::fully_resident(device.clone());
-    let resources = inspect_execution(factory, model_path, &plan)?
+    let resources = inspect_execution(factory, model_path, &plan, None)?
         .into_report()
         .resources;
     Ok(ExecutionPlanReport {
@@ -1487,7 +1487,9 @@ fn read_automatic_feedback(paths: &[PathBuf]) -> Result<Vec<ExecutionTelemetry>>
 }
 
 fn automatic_plan(
-    factory: &impl AutomaticPlanningBackend,
+    factory: &impl AutomaticPlanningBackend<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
     model_path: &Path,
     device: &DevicePlan,
     prior_telemetry: &[ExecutionTelemetry],
@@ -1500,7 +1502,10 @@ fn automatic_plan(
 }
 
 fn automatic_plan_with_overrides(
-    factory: &impl BackendInspection<Inspection = TextArtifactInspection>,
+    factory: &impl AutomaticPlanningBackend<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        Inspection = TextArtifactInspection,
+    >,
     model_path: &Path,
     device: &DevicePlan,
     devices: &HardwareBackendProfile,
@@ -1837,7 +1842,7 @@ fn exact_automatic_report(
     }
     let hardware = factory.discover_hardware()?;
     validate_automatic_device(&hardware, plan.device())?;
-    let inspection = inspect_execution(factory, model_path, &plan)?.into_report();
+    let inspection = inspect_execution(factory, model_path, &plan, None)?.into_report();
     if !inspection.is_loadable() {
         let detail = inspection
             .issues
@@ -1951,7 +1956,11 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
 }
 
 fn automatic_report_with_cache(
-    factory: &impl BackendInspection<Inspection = TextArtifactInspection>,
+    factory: &(impl BackendInspection
+          + AutomaticPlanningBackend<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+        Inspection = TextArtifactInspection,
+    >),
     model_path: &Path,
     device: &DevicePlan,
     devices: &HardwareBackendProfile,
@@ -2077,17 +2086,30 @@ fn run_text<F>(
     total_started: Instant,
 ) -> Result<()>
 where
-    F: BackendInspection<Inspection = TextArtifactInspection>
-        + eredu::api::decision::DecisionBackendFactory<
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
+    F: BackendInspection
+        + AutomaticPlanningBackend<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            Inspection = TextArtifactInspection,
+        > + eredu::api::decision::DecisionBackendFactory<
+            DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::Backend,
+                Inspection = eredu_architectures::ExternalDraftPreparation,
+            >,
         >,
-    F::Backend: eredu_core::SpeculativeGenerationBackend<Drafter = F::Drafter>
-        + TextInputBackend
-        + eredu::api::GenerationForecastBackend
-        + eredu::api::SpeculativeForecastBackend<F::Drafter>,
-    <F::Backend as eredu_core::ModelLoadingBackend>::ConfigurationResolver:
-        eredu_core::ModelConfigurationResolver<
-            ArtifactPlan = eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    <F::Backend as eredu::api::TextSessionComposition>::Installed:
+        eredu_core::AutomaticPromptCacheSession<F::Backend>
+            + TextInputSession<F::Backend>
+            + eredu::api::SpeculativeForecastSession<F::Backend, F::Drafter>,
+    F::Backend: eredu::runtime::speculative::SpeculativeBatchBackend<
+            <F::Backend as eredu::api::TextSessionComposition>::Installed,
+            Drafter = F::Drafter,
+        > + eredu::api::TextSessionComposition<
+            Model = eredu_core::backend::LoadedModelFor<
+                F::Backend,
+                eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+                F::SourcePreparation,
+            >,
         >,
 {
     if args.no_auto {
@@ -2385,7 +2407,7 @@ where
         Some(report.resources.clone())
     } else if args.telemetry_json.is_some() {
         Some(
-            inspect_execution(factory, &model_path, &execution_plan)?
+            inspect_execution(factory, &model_path, &execution_plan, None)?
                 .into_report()
                 .resources,
         )
@@ -2397,10 +2419,17 @@ where
         Some(inspection) => {
             eredu::api::PreparedTextModel::from_artifact(inspection, Default::default())
                 .map_err(eredu::api::PlannedModelLoadError::from)
-                .and_then(|prepared| prepared.select_execution_plan(factory, &execution_plan))
+                .and_then(|prepared| {
+                    prepared.select_execution_plan(factory, &execution_plan, Default::default())
+                })
                 .and_then(|selected| selected.load())
         }
-        None => LoadedModel::load_execution_plan(factory, &model_path, &execution_plan),
+        None => LoadedModel::load_execution_plan(
+            factory,
+            &model_path,
+            &execution_plan,
+            Default::default(),
+        ),
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let drafting_enabled = planned.drafting().is_enabled();
@@ -2910,7 +2939,7 @@ where
     Ok(())
 }
 
-fn discover_devices(factory: &impl AutomaticPlanningBackend) -> Result<HardwareBackendProfile> {
+fn discover_devices(factory: &impl BackendHardware) -> Result<HardwareBackendProfile> {
     let backend = factory.backend_id();
     let profile = factory
         .discover_hardware()?
@@ -3697,7 +3726,7 @@ fn select_revision<'a>(
 
 #[cfg(test)]
 mod tests {
-    use eredu_core::AutomaticPlanningBackend;
+    use eredu_core::BackendHardware;
     #[cfg(feature = "realtime")]
     #[test]
     fn root_cli_keeps_text_options_and_separates_realtime_options() {

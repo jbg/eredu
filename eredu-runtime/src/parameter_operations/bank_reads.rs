@@ -85,3 +85,59 @@ impl<'a> BankParameterReadPlan<'a> {
         })
     }
 }
+
+/// Native snapshots and copy operations for one already selected bank.
+pub trait BankParameterReadSource<T, C: ?Sized, E> {
+    /// Installed cache used for member loans.
+    type Residency: crate::residency::ResidencyAccess<
+        Error: Into<E>,
+        Transfer: eredu_core::residency::ResidencyTransferOrdering<C, Error: Into<E>>,
+    >;
+    /// Native scope that holds the exact loan through completion.
+    type Loan: eredu_core::residency::ParameterLoan<T, C, Error = E>;
+
+    /// Snapshots the installed cache and replacement handles at the same boundary.
+    fn read_resources(
+        &self,
+        selected: &BTreeSet<String>,
+    ) -> Result<(Self::Residency, std::collections::BTreeMap<String, T>), E>;
+
+    /// Opens native retention for the selected and ordered transfer.
+    fn begin_loan(
+        transfer: <Self::Residency as crate::residency::ResidencyAccess>::Transfer,
+    ) -> Result<Self::Loan, E>;
+
+    /// Assembles copied members in canonical order.
+    fn assemble_members(copies: Vec<T>, context: &C) -> Result<T, E>;
+}
+
+impl BankParameterReadPlan<'_> {
+    /// Acquires member leases in portable order and hands each to the copy mechanism.
+    pub fn with_resident_slots<T: Clone, C: ?Sized, E, S: BankParameterReadSource<T, C, E>>(
+        &self,
+        source: &S,
+        selected: &BTreeSet<String>,
+        context: &C,
+        operation: &mut ParameterSlotOperation<'_, T, E>,
+    ) -> Result<(), E> {
+        use crate::residency::ResidencyAccess;
+        use eredu_core::residency::{MemoryTier, ParameterLoan, ResidencyTransferOrdering};
+
+        let (residency, replacements) = source.read_resources(selected)?;
+        self.with_slots(
+            |id| replacements.get(id).cloned(),
+            |member| {
+                let transfer = residency
+                    .acquire_many_with_transfer(&[(member.key.unit_id(), 1)], MemoryTier::Device)
+                    .map_err(Into::into)?;
+                transfer.order_after(context).map_err(Into::into)?;
+                let mut loan = S::begin_loan(transfer)?;
+                let value = loan.copy_binding(&member.binding, context)?;
+                loan.finish(&value)?;
+                Ok(value)
+            },
+            |copies| S::assemble_members(copies, context),
+            operation,
+        )
+    }
+}

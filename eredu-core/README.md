@@ -30,9 +30,9 @@ defining a tensor algebra.
 
 ## Execution model
 
-A backend prepares a model and consumes it to create one stateful session.
-`ModelRuntime<B>` owns that backend and session, and submits prefill and decode
-work through the same interface for every implementation. Exact completion
+Portable composition prepares a model and installs a stateful session using
+the selected backend mechanisms. `ModelRuntime<B, S>` retains the backend and
+session, and submits prefill and decode through the session contract. Exact completion
 objects keep outputs and transactional resources alive until the submitted work
 is safe to observe or release.
 

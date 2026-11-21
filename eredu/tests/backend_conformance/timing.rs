@@ -10,7 +10,7 @@ fn terminal<S>(output: GenerationOutput<S>) -> (Vec<u32>, FinishReason, Option<D
     (output.token_ids, output.finish_reason, ttft)
 }
 
-fn chat(model: &mut LoadedModel<MockBackend>) -> PreparedChat {
+fn chat(model: &mut LoadedModel<MockBackend, MockSession>) -> PreparedChat {
     model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
@@ -50,7 +50,7 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
                 first_delivery.get_or_insert_with(|| started.elapsed());
                 events.push(event);
             };
-            let input = PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]);
+            let input = PreparedChatInput::prepared_input(&chat, vec![0; 7]);
             let (ids, reason, ttft) = if speculative {
                 let output = model
                     .drafting_session(SpeculativeDraft::Embedded, None)
@@ -113,7 +113,7 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
             }
             let cancel_on_event = cancellation.clone();
             let on_event = move |_| cancel_on_event.cancel();
-            let input = PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]);
+            let input = PreparedChatInput::prepared_input(&chat, vec![0; 7]);
             let (ids, reason, ttft) = if speculative {
                 let output = model
                     .drafting_session(SpeculativeDraft::Embedded, None)

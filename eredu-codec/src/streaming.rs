@@ -7,9 +7,7 @@
 //! convolution uses the architecture's declared tail policy.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -115,7 +113,7 @@ impl<T: Tensor + SnapshotValue> SnapshotValue for Conv1dState<T> {
     fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
         snapshot_value_estimate::<Self>([self.carry.estimate_snapshot_value()])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             carry: self.carry.copy_snapshot_value(retention)?,
             spec: self.spec,

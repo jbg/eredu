@@ -6,7 +6,7 @@ use eredu_runtime::execution_topology::{
 };
 
 /// Observe the fixture's actual claims, including their stable backing identities.
-pub(super) fn profile(runtime: &ModelRuntime<MockBackend>) -> LoadedMemoryProfile {
+pub(super) fn profile(runtime: &ModelRuntime<MockBackend, MockSession>) -> LoadedMemoryProfile {
     let mut profile = fixture_profile();
     let report = runtime.session().retention.report();
     let owner = ResourceIdentity {
@@ -121,7 +121,11 @@ fn controlled_forecasts_refresh_trimmed_claims_without_changing_request_or_budge
     use eredu_core::execution_control::SnapshotLimits;
     use std::ops::ControlFlow;
 
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().retention_forecast = true;
     super::super::conversion_retention::retain_fixture(&runtime);
     let mut model = unicode_model_with_runtime(None, 512, QWEN_TEMPLATE, runtime);

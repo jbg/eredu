@@ -3,50 +3,43 @@
 
 use super::*;
 
-#[cfg(feature = "tensor-capture")]
+use eredu_core::capture::PartitionCaptureNativeEstimate;
+
 mod assembly;
-#[cfg(feature = "tensor-capture")]
+mod discovery;
+pub use discovery::{
+    LoadedPartitionCapture, PartitionCaptureCollectorFacts, PartitionCaptureDiscovery,
+    PartitionCaptureDiscoveryLayout,
+};
 mod sum;
-#[cfg(feature = "tensor-capture")]
 pub use assembly::{assemble_reduced_fragments, assemble_tensor_fragments};
-#[cfg(feature = "tensor-capture")]
 mod exchange;
 mod observer;
 mod receipt;
 mod routed;
 pub use routed::PartitionRoutedCaptureProducer;
-#[cfg(feature = "tensor-capture")]
 mod vocabulary;
 pub use observer::{
     PartitionCapturePlacement, PartitionRoutedCapturePlacement, PartitionRoutedCaptureSource,
 };
-#[cfg(feature = "tensor-capture")]
 mod session;
-#[cfg(feature = "tensor-capture")]
 pub use exchange::{
     PartitionCaptureExchange, PartitionCaptureExchangeError, PartitionCaptureExchangeStage,
-    PartitionCaptureTransport,
 };
-#[cfg(feature = "tensor-capture")]
 pub use observer::{
     PartitionCaptureLayout, PartitionCaptureObserver, PartitionCaptureObserverError,
 };
-#[cfg(feature = "tensor-capture")]
 pub use receipt::{
     PartitionCaptureDelivery, PartitionCaptureReceiptPlan, ReceivedPartitionCapture,
 };
 pub use receipt::{PartitionCaptureProducer, PartitionCaptureReceiptLimits};
-#[cfg(feature = "tensor-capture")]
 pub(super) use session::PartitionCaptureRun;
-#[cfg(feature = "tensor-capture")]
 pub use session::{
-    PartitionCaptureHookTransport, PartitionCaptureIdentity, PartitionCaptureNativeEstimate,
-    SessionPartitionCapture, SessionPartitionCoordination, SessionPartitionHook,
-    SessionPartitionIntervention, SessionPartitionSource,
+    PartitionCaptureIdentity, SessionPartitionCapture, SessionPartitionCoordination,
+    SessionPartitionHook, SessionPartitionIntervention, SessionPartitionSource,
 };
 
 /// Exact capture operation and validated native geometry for one fragment.
-#[cfg(feature = "tensor-capture")]
 pub struct PartitionCaptureRequest<'a> {
     /// Original immutable global admission, never a rewritten local plan.
     pub plan: &'a AdmittedCapturePlan,
@@ -69,7 +62,6 @@ pub struct PartitionCaptureRequest<'a> {
 /// A local result with explicit global identity and placement. It cannot be
 /// mistaken for a complete global `CaptureRecord`; assembly checks coverage.
 #[derive(Debug, Clone)]
-#[cfg(feature = "tensor-capture")]
 pub struct CapturedPartitionFragment {
     combination: PartitionCaptureCombination,
     plan_identity: String,
@@ -85,7 +77,6 @@ pub struct CapturedPartitionFragment {
     record: CaptureRecord,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CapturedPartitionFragment {
     /// Original global capture admission identity.
     pub fn plan_identity(&self) -> &str {
@@ -111,7 +102,6 @@ impl CapturedPartitionFragment {
 
 /// Retained evidence for one producer's contribution to a global result.
 #[derive(Debug, Clone)]
-#[cfg(feature = "tensor-capture")]
 pub struct PartitionCaptureContribution {
     producer_rank: usize,
     geometry: CaptureFragmentGeometry,
@@ -119,7 +109,6 @@ pub struct PartitionCaptureContribution {
     routed: Option<RoutedUnitCaptureProvenance>,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl PartitionCaptureContribution {
     /// Producer of this exact selected region.
     pub const fn producer_rank(&self) -> usize {
@@ -142,7 +131,6 @@ impl PartitionCaptureContribution {
 /// Complete global tensor evidence, retaining producer coverage rather than
 /// silently dropping partition provenance when local buffers are consumed.
 #[derive(Debug, Clone)]
-#[cfg(feature = "tensor-capture")]
 pub struct AssembledPartitionCapture {
     combination: PartitionCaptureCombination,
     plan_identity: String,
@@ -152,7 +140,6 @@ pub struct AssembledPartitionCapture {
     contributions: Vec<PartitionCaptureContribution>,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl AssembledPartitionCapture {
     /// Whether regions cover disjoint coordinates or are measured additive terms.
     pub const fn combination(&self) -> PartitionCaptureCombination {
@@ -188,7 +175,6 @@ impl AssembledPartitionCapture {
 /// The caller owns the shared ledger and must reserve distributed transport and
 /// establish peer failure agreement separately. No fragment authorizes publication
 /// of a complete global result.
-#[cfg(feature = "tensor-capture")]
 pub fn capture_fragment<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
@@ -206,7 +192,6 @@ pub fn capture_fragment<B: CaptureBackend>(
 
 /// Captures an actual floating summand through a separately admitted sum receipt.
 /// Nonlinear transforms are deferred until all selected native terms are assembled.
-#[cfg(feature = "tensor-capture")]
 pub fn capture_sum_fragment<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
@@ -222,7 +207,6 @@ pub fn capture_sum_fragment<B: CaptureBackend>(
     )
 }
 
-#[cfg(feature = "tensor-capture")]
 fn validate_partition_request(request: &PartitionCaptureRequest<'_>) -> Result<(), CaptureError> {
     let PartitionCaptureRequest {
         plan,
@@ -263,7 +247,6 @@ fn validate_partition_request(request: &PartitionCaptureRequest<'_>) -> Result<(
     Ok(())
 }
 
-#[cfg(feature = "tensor-capture")]
 fn capture_fragment_combined<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
@@ -359,7 +342,6 @@ fn capture_fragment_combined<B: CaptureBackend>(
     })
 }
 
-#[cfg(feature = "tensor-capture")]
 fn fragment_metadata_usage(
     selection: &CaptureSelection,
     point: &eredu_core::ObservationPoint,
@@ -378,7 +360,6 @@ fn fragment_metadata_usage(
 /// a rejected/skipped fragment creates no tensor. The prototype declares shape,
 /// not the generated input's dtype. Distributed completion remains caller-owned.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "tensor-capture")]
 pub fn capture_generated_fragment<B: CaptureBackend, E>(
     backend: &mut B,
     prototype: &B::Tensor,
@@ -401,7 +382,6 @@ pub fn capture_generated_fragment<B: CaptureBackend, E>(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "tensor-capture")]
 fn capture_generated_fragment_combined<B: CaptureBackend, E>(
     backend: &mut B,
     prototype: &B::Tensor,
@@ -421,7 +401,6 @@ fn capture_generated_fragment_combined<B: CaptureBackend, E>(
 
 /// A global result cannot be published from these fragments.
 #[derive(Debug, thiserror::Error)]
-#[cfg(feature = "tensor-capture")]
 pub enum PartitionCaptureMergeError {
     /// One expected producer has not supplied its explicit receipt.
     #[error("partition capture producer {producer_rank} has no receipt")]
@@ -453,4 +432,35 @@ pub enum PartitionCaptureMergeError {
         /// Original typed local outcome.
         outcome: CaptureOutcome,
     },
+}
+
+pub use eredu_core::capture::{PartitionCaptureHookTransport, PartitionCaptureTransport};
+
+pub(crate) fn capture_wait(
+    transport: &impl PartitionCaptureTransport,
+) -> Result<eredu_core::BoundedCompletionWait, CaptureError> {
+    transport.capture_wait().ok_or_else(|| {
+        CaptureError::Unsupported("capture transport needs selected bounded completion".into())
+    })
+}
+
+pub(crate) fn estimate_hook(
+    transport: &impl PartitionCaptureHookTransport,
+    members: &[usize],
+) -> Result<CaptureUsage, CaptureError> {
+    if members.is_empty()
+        || members.windows(2).any(|pair| pair[0] >= pair[1])
+        || members
+            .iter()
+            .any(|rank| *rank >= transport.participant_count())
+    {
+        return Err(CaptureError::Invalid(
+            "capture hook membership exceeds selected world".into(),
+        ));
+    }
+    if members.len() == 1 {
+        Ok(CaptureUsage::default())
+    } else {
+        transport.estimate_capture_hook(members)
+    }
 }

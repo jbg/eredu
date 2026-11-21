@@ -28,10 +28,11 @@ impl MuseAssistantDefinition {
     /// normalized definitions conservatively admit all supported precisions.
     pub fn tensor_parallel_requirements(
         &self,
-    ) -> Result<Option<eredu_runtime::CommunicationGroupRequirements>, Error> {
-        use eredu_runtime::{
-            CommunicationGroupRequirements, CommunicationOperation,
-            CommunicationOperationRequirement, CommunicationTensorLimits,
+    ) -> Result<Option<eredu_core::communication::CommunicationGroupRequirements>, Error> {
+        use eredu_core::communication::CommunicationOperation;
+        use eredu_core::communication::{
+            CommunicationGroupRequirements, CommunicationOperationRequirement,
+            CommunicationTensorLimits,
         };
         if self.placement == MuseAssistantPlacement::Replicated {
             return Ok(None);

@@ -19,12 +19,12 @@ use eredu_core::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CommunicationCompletionPolicy, LayerWeightResidency, RealtimeFrameContract,
-    RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
-    RealtimeIdentity, RealtimePayloadContract, RealtimePayloadContractError,
-    RealtimePayloadGeneration, RealtimePayloadOwnerIdentity, RealtimeScheduleDescriptor,
-    RealtimeScheduleState, SelectedRealtimeRealization,
+    LayerWeightResidency, RealtimeFrameContract, RealtimeGenerationBranch, RealtimeGenerationState,
+    RealtimeGenerationTransactionError, RealtimeIdentity, RealtimePayloadContract,
+    RealtimePayloadContractError, RealtimePayloadGeneration, RealtimePayloadOwnerIdentity,
+    RealtimeScheduleDescriptor, RealtimeScheduleState, SelectedRealtimeRealization,
 };
+use eredu_core::communication::CommunicationCompletionPolicy;
 
 /// Admission metadata required by the shared realtime session scheduler.
 /// Architecture-specific input payloads retain their own types and work descriptors.
@@ -884,7 +884,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::{RealtimeGenerationContract, RealtimeIngressContract, TokenDomain};
+    use crate::{RealtimeGenerationContract, RealtimeIngressContract};
+    use eredu_core::sampling::TokenDomain;
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct ModelState(usize);

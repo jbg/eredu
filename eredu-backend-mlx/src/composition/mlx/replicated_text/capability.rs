@@ -1,8 +1,9 @@
 use super::*;
-use eredu_core::cache::{StateComponentPolicy, StateTensorDtype};
-use eredu_runtime::{
-    synthesize_replicated_text_capabilities, BackendMechanismFacts, ReplicatedTextMechanismSupport,
-    StateLifecycleCapabilities, StateStorageDtype,
+use eredu_core::cache::StateTensorDimension;
+use eredu_core::preparation::StateComponentPlacement;
+use eredu_core::preparation::{
+    BackendMechanismFacts, ReplicatedTextMechanismSupport, StateLifecycleCapabilities,
+    StateStorageDtype,
 };
 
 pub(crate) const GROUPED_OPERATION_CAPABILITIES: [GroupedOperationRequirement; 5] = [
@@ -17,7 +18,7 @@ pub(crate) const GROUPED_OPERATION_CAPABILITIES: [GroupedOperationRequirement; 5
 pub(crate) struct MlxReplicatedTextSupport;
 
 impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
-    fn facts(&self, state_policy: &CacheResidencyPolicy) -> BackendMechanismFacts {
+    fn facts(&self, placement: StateComponentPlacement) -> BackendMechanismFacts {
         BackendMechanismFacts::new(
             MlxNeuralBackend::OPERATOR_CAPABILITIES,
             [
@@ -28,14 +29,14 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
             StateLifecycleCapabilities::new()
                 .with_transactions(true, true)
                 .with_reset(true)
-                .with_prompt_cache(matches!(state_policy, CacheResidencyPolicy::Paged(_)))
+                .with_prompt_cache(placement == StateComponentPlacement::Paged)
                 .with_observation_retention(true),
         )
         .with_session(eredu_core::SessionCapabilities::new(true, true, true))
         .with_grouped_operations(GROUPED_OPERATION_CAPABILITIES)
         .with_indexed_movement(true)
         .with_addressable_storage(
-            eredu_runtime::RowLookupMechanismSupport::storage(
+            eredu_core::preparation::rows::NativeRowLookupSupport::row_storage(
                 &crate::backend::runtime::residency::parameter_bank::MlxRowLookupSupport,
             )
             .expect("native addressable storage is implemented"),
@@ -62,19 +63,14 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
 
     fn supports_state_component(
         &self,
-        component: &StateComponentPolicy,
-        storage_dtype: StateStorageDtype,
+        _shape: &[StateTensorDimension],
+        _storage_dtype: StateStorageDtype,
         placement: StateComponentPlacement,
     ) -> bool {
         matches!(
             placement,
             StateComponentPlacement::Device | StateComponentPlacement::Paged
-        ) && match component.dtype() {
-            StateTensorDtype::Floating => storage_dtype.is_floating(),
-            StateTensorDtype::Float32 => storage_dtype == StateStorageDtype::F32,
-            StateTensorDtype::Int32 => storage_dtype == StateStorageDtype::I32,
-            StateTensorDtype::Uint32 => storage_dtype == StateStorageDtype::U32,
-        }
+        )
     }
 }
 
@@ -92,18 +88,4 @@ pub(in crate::composition::mlx) fn floating_state_storage_dtype(
         TensorDtype::U32 | TensorDtype::Encoded(_) => StateStorageDtype::F32,
         _ => return None,
     })
-}
-
-pub(crate) fn capabilities(
-    requirements: &ReplicatedTextRequirements,
-    request: &ReplicatedTextSelectionRequest,
-) -> BackendMechanismCapabilities {
-    synthesize_replicated_text_capabilities(requirements, request, &MlxReplicatedTextSupport)
-}
-
-pub(crate) fn state_capabilities(
-    requirements: &eredu_runtime::StateRealizationRequirements,
-    policy: &CacheResidencyPolicy,
-) -> eredu_runtime::StateMechanismCapabilities {
-    eredu_runtime::synthesize_state_capabilities(requirements, policy, &MlxReplicatedTextSupport)
 }

@@ -233,7 +233,6 @@ pub(super) fn cost(
     Ok(cost)
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     pub(crate) fn wants_routed_interventions(&self, routing: &str) -> bool {
         self.interventions.as_ref().is_some_and(|run| {

@@ -6,7 +6,7 @@ use eredu_core::{
 
 #[allow(clippy::type_complexity)]
 pub(super) fn submit(
-    runtime: &mut ModelRuntime<MockBackend>,
+    runtime: &mut ModelRuntime<MockBackend, MockSession>,
     input: PendingTextInput<Vec<u32>, MockToken>,
     decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
     state: &mut observed_mock::State,
@@ -66,7 +66,7 @@ pub(super) fn submit(
 }
 
 fn setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
 ) {
@@ -78,7 +78,11 @@ fn setup() -> (
     };
     let chat = probe.prepare_chat(request()).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
-    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let mut runtime = ModelRuntime::<_, _>::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     runtime.session_mut().iterative = true;
     let mut model = unicode_model_with_runtime(Some(first), 64, QWEN_TEMPLATE, runtime);
     let chat = model.prepare_chat(request()).unwrap();
@@ -98,16 +102,13 @@ fn setup() -> (
 
 #[test]
 fn iterative_drafts_preserve_controlled_and_ordinary_unicode_and_eos_commitment() {
-    use eredu::api::{ObservedGenerationEvent, TraceLimits};
+    use eredu::api::ObservedGenerationEvent;
     use eredu_core::refinement::DraftEvent;
     use std::ops::ControlFlow;
     let (mut model, chat, settings) = setup();
-    let limits = TraceLimits {
-        per_record_bytes: 65536,
-        total_bytes: 1024 * 1024,
+    let prepare = |model: &LoadedModel<MockBackend, MockSession>| {
+        model.prepare_controlled_chat(&chat, settings).unwrap()
     };
-    let prepare =
-        |model: &LoadedModel<MockBackend>| model.prepare_controlled_chat(&chat, settings).unwrap();
     let mut ordinary = Vec::new();
     let output = model
         .generate_observed(
@@ -317,7 +318,7 @@ fn iterative_target_rejects_causal_speculative_verification_before_backend_execu
         GenerationRequest {
             output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+            input: PreparedChatInput::prepared_input(&chat, vec![3, 4]),
 
             settings: eredu::api::PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
@@ -345,7 +346,7 @@ fn iterative_target_rejects_causal_speculative_verification_before_backend_execu
         GenerationRequest {
             output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+            input: PreparedChatInput::prepared_input(&chat, vec![3, 4]),
 
             settings: PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(

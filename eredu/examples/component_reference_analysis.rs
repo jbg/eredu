@@ -45,8 +45,11 @@ fn contained_by_whole_write(
     false
 }
 
-fn query<B: ParameterBackend>(
-    model: &mut LoadedModel<B>,
+fn query<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     facts: &ParameterDiscovery,
     parameter: &str,
     row: Option<u64>,
@@ -70,8 +73,11 @@ fn query<B: ParameterBackend>(
         .values)
 }
 
-fn measured<B: ParameterBackend>(
-    model: &mut LoadedModel<B>,
+fn measured<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     facts: &ParameterDiscovery,
     residual: &[f32],
     direction: &[f64],
@@ -108,8 +114,11 @@ fn measured<B: ParameterBackend>(
     )?)
 }
 
-pub fn reconstruct<B: ParameterBackend>(
-    model: &mut LoadedModel<B>,
+pub fn reconstruct<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     architecture: &ArchitectureDescriptor,
     evidence: &BTreeMap<String, Vec<f32>>,
     target: u32,

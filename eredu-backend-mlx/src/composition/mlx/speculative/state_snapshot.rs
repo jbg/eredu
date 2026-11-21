@@ -14,25 +14,6 @@ pub(crate) fn estimate_array(array: &Array) -> Option<SnapshotEstimate> {
     })
 }
 
-pub(crate) fn estimate_state<'a, S>(
-    arrays: impl IntoIterator<Item = &'a Array>,
-) -> Option<SnapshotEstimate> {
-    let host = std::mem::size_of::<S>() as u64;
-    arrays.into_iter().try_fold(
-        SnapshotEstimate {
-            retained_bytes: host,
-            copy_bytes: host,
-        },
-        |sum, array| {
-            let array = estimate_array(array)?;
-            Some(SnapshotEstimate {
-                retained_bytes: sum.retained_bytes.checked_add(array.retained_bytes)?,
-                copy_bytes: sum.copy_bytes.checked_add(array.copy_bytes)?,
-            })
-        },
-    )
-}
-
 pub(crate) fn settle(arrays: Vec<&Array>) -> Result<(), Exception> {
     if !arrays.is_empty() {
         async_eval_with_event(arrays)?.synchronize()?;

@@ -7,6 +7,7 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, TensorMetadata, TensorSourceProvenance},
     LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
 };
+use eredu_core::communication::CommunicationCompletionPolicy;
 use eredu_core::{
     artifact::{ArtifactIdentity, DeferredArtifactIdentity},
     ParallelRankTopology, QuantizationRequest, RealtimeSampling, RealtimeSpeechConfig,
@@ -14,16 +15,16 @@ use eredu_core::{
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     observe_and_intervene, observe_model_logits, select_realtime_realization, ActivationObserver,
-    CacheResidencyPolicy, CommunicationCompletionPolicy, CompositeLayeredTraversalHook,
-    ExecutionResidency, GenerationSampler, LayerWeightResidency, LayeredTraversalHook,
-    NormalizedLoadRequest, PreparedRealtimeModelContract, RealtimeArchitectureProof,
-    RealtimeArchitectureRequirements, RealtimeDecisionExecution, RealtimeExecutionRequirements,
-    RealtimeIdentity, RealtimeMaterializationComponent, RealtimeMaterializationTask,
-    RealtimeMechanism, RealtimeMechanismCapabilities, RealtimeMechanismRequirements,
-    RealtimeObservationRequirements, RealtimeScheduleDescriptor, RealtimeSelectionError,
-    RealtimeSelectionRequest, RealtimeTopologyPolicy, RealtimeWeightComponentRequirement,
-    RealtimeWeightComponentRole, RealtimeWeightLoweringRequirement, ResettableRuntimeState,
-    RuntimeState, SelectedRealtimeRealization, WeightLoweringDescriptor, WeightLoweringKind,
+    CacheResidencyPolicy, CompositeLayeredTraversalHook, ExecutionResidency, GenerationSampler,
+    LayerWeightResidency, LayeredTraversalHook, NormalizedLoadRequest,
+    PreparedRealtimeModelContract, RealtimeArchitectureProof, RealtimeArchitectureRequirements,
+    RealtimeDecisionExecution, RealtimeExecutionRequirements, RealtimeIdentity,
+    RealtimeMaterializationComponent, RealtimeMaterializationTask, RealtimeMechanism,
+    RealtimeMechanismCapabilities, RealtimeMechanismRequirements, RealtimeObservationRequirements,
+    RealtimeScheduleDescriptor, RealtimeSelectionError, RealtimeSelectionRequest,
+    RealtimeTopologyPolicy, RealtimeWeightComponentRequirement, RealtimeWeightComponentRole,
+    RealtimeWeightLoweringRequirement, ResettableRuntimeState, RuntimeState,
+    SelectedRealtimeRealization, WeightLoweringDescriptor, WeightLoweringKind,
 };
 
 use super::{
@@ -178,16 +179,15 @@ pub(super) fn execute_detached_replicated_moshi_realtime<A, B, M, SB, S>(
     MoshiRealtimeExecutionError<M::PolicyError>,
 >
 where
-    B: eredu_runtime::SubmissionBackend<
-            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-        > + DistributedNeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + DistributedNeuralBackend,
     A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
     M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
     M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
     <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
         eredu_nn::AttentionCache<B::Tensor>,
     M::PolicyError: std::fmt::Display,
-    SB: eredu_runtime::SamplingBackend<
+    SB: eredu_core::sampling::SamplingBackend<
         Logits = B::Tensor,
         Token = B::Tensor,
         Context = <B::Tensor as Tensor>::Context,
@@ -223,16 +223,15 @@ fn execute_detached_replicated_moshi_realtime_with_observer<A, B, M, SB, S, O>(
     MoshiRealtimeExecutionError<M::PolicyError>,
 >
 where
-    B: eredu_runtime::SubmissionBackend<
-            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-        > + DistributedNeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + DistributedNeuralBackend,
     A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
     M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
     M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
     <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
         eredu_nn::AttentionCache<B::Tensor>,
     M::PolicyError: std::fmt::Display,
-    SB: eredu_runtime::SamplingBackend<
+    SB: eredu_core::sampling::SamplingBackend<
         Logits = B::Tensor,
         Token = B::Tensor,
         Context = <B::Tensor as Tensor>::Context,
@@ -389,7 +388,6 @@ pub(super) fn execute_detached_partitioned_moshi_realtime<
                 A,
                 B,
                 State,
-                (),
                 eredu_runtime::LayerwiseTraversalPartitionExecutor<A, B, State, Policy>,
                 G,
                 R,
@@ -406,7 +404,7 @@ pub(super) fn execute_detached_partitioned_moshi_realtime<
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<(B::Tensor, super::ForwardContext<B::Tensor>), MoshiRealtimeExecutionError<Policy::Error>>
 where
-    B: eredu_runtime::CommunicationBackend<
+    B: eredu_core::communication::CommunicationBackend<
             Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
         > + DistributedNeuralBackend,
     State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
@@ -417,12 +415,12 @@ where
     Policy::Error: std::fmt::Display,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
-    I: eredu_runtime::CommunicationTensorMetadata<B>,
+    I: eredu_core::communication::CommunicationTensorMetadata<B>,
     T: eredu_runtime::PartitionBoundaryTransport<B, G, R, I>,
     U: eredu_runtime::PartitionOutputPublisher<B, G, R, I>,
     V: eredu_runtime::PartitionCommitAgreement<B, G, R, I>,
     B::ParallelContext: Sized,
-    SB: eredu_runtime::SamplingBackend<
+    SB: eredu_core::sampling::SamplingBackend<
         Logits = B::Tensor,
         Token = B::Tensor,
         Context = <B::Tensor as Tensor>::Context,
@@ -691,6 +689,9 @@ pub enum MoshiRealtimeStartupError {
     /// The selected architecture cannot describe its categorical ingress.
     #[error("invalid Moshi realtime ingress: {0}")]
     Ingress(String),
+    /// This realtime cache route requires device-resident state.
+    #[error("categorical realtime state must be device-resident")]
+    StateResidency,
     /// Selected native state or RNG could not be realized.
     #[error(transparent)]
     Backend(#[from] eredu_core::BackendFailure),
@@ -736,14 +737,11 @@ impl<E> MoshiRealtimeExecution<E> {
         sampling: RealtimeSampling,
     ) -> Result<MoshiRealtimeGeneration<S, T, M::Random, M::Completion>, MoshiRealtimeStartupError>
     where
-        S: eredu_core::scheduler::SemanticStateTransaction,
+        S: eredu_runtime::CategoricalRealtimeState
+            + eredu_core::scheduler::SemanticStateTransaction,
         S::Error: Send + Sync + 'static,
         T: Clone,
-        M: eredu_runtime::RealtimeStartupMechanisms
-            + eredu_runtime::RealtimeStateMaterializer<
-                eredu_runtime::SelectedRealtimeStateRealization,
-                S,
-            >,
+        M: eredu_core::realtime_mechanisms::RealtimeStartupMechanisms,
     {
         let schedule = self.execution_config.frame_schedule();
         let samplers = realtime_generation_samplers(schedule, sampling)?;
@@ -751,7 +749,11 @@ impl<E> MoshiRealtimeExecution<E> {
             .map_err(MoshiRealtimeStartupError::Ingress)?
             .channels()
             .clone();
-        let model = mechanisms.realize_state(self.selected.state())?;
+        let state = self.selected.state();
+        if !matches!(state.policy(), CacheResidencyPolicy::Device) {
+            return Err(MoshiRealtimeStartupError::StateResidency);
+        }
+        let model = S::resident_categorical_state(state.layout())?;
         let random = sampling
             .is_stochastic()
             .then(|| mechanisms.realize_random(sampling.seed()))
@@ -808,6 +810,9 @@ pub enum MoshiRealtimeDispatchError<E> {
     /// The native mechanisms could not realize the selected construction.
     #[error("realtime mechanism binding failed: {0}")]
     Mechanism(E),
+    /// The realized rank could not bind the selected tensor transport.
+    #[error("realtime communication binding failed: {0}")]
+    Communication(#[from] eredu_core::BackendFailure),
 }
 
 impl PreparedMoshiRealtime {
@@ -1106,22 +1111,45 @@ fn selected_moshi_lowering_summary(
 
 /// Constructs the selected Moshi-family executor from the retained source.
 /// Store validation inspects metadata before transport and materialization.
-impl<B, S, M> eredu_runtime::PreparedRealtimeBinding<B, S, M> for PreparedMoshiRealtimeSource
+impl<B, C, M> eredu_runtime::PreparedRealtimeBinding<B, eredu_runtime::state::KeyValueState<C>, M>
+    for PreparedMoshiRealtimeSource
 where
-    B: eredu_runtime::CommunicationBackend<
+    B: eredu_core::communication::CommunicationBackend<
             Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
-        > + DistributedNeuralBackend,
+        > + DistributedNeuralBackend
+        + eredu_core::checkpoint_mechanisms::CheckpointParameterBackend,
     B::ParallelContext: Sized,
     B::Tensor: 'static,
-    S: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B> + 'static,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
-    M: eredu_runtime::RealtimeBindingMechanisms<B, S>,
-    <M::Sampling as eredu_runtime::SamplingBackend>::Error: std::fmt::Display,
+    B: eredu_core::backend::LocalComponentStorage<CacheStorage = C>,
+    C: eredu_core::cache::mechanisms::ResidentKeyValueStorage<Value = B::Tensor>
+        + eredu_core::cache::mechanisms::PagedKeyValueStorage
+        + 'static,
+    M: eredu_core::realtime_mechanisms::RealtimeBindingMechanisms<
+        B,
+        Materializer: eredu_runtime::ParameterUnitMechanisms<
+            B,
+            UnitError = M::Error,
+            Parameters: eredu_core::checkpoint_mechanisms::ExactParameterMaterializer<B>,
+        > + 'static,
+        Sampling: eredu_core::sampling::SamplingBackend<
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = B::Executor,
+        > + 'static,
+    >,
+    M::Error: From<eredu_core::BackendFailure>,
+    <M::Sampling as eredu_core::sampling::SamplingBackend>::Error: std::fmt::Display,
     M::Group: 'static,
     M::Route: 'static,
     M::TensorMetadata: 'static,
 {
-    type Execution = MoshiRealtimeExecution<M::Execution>;
+    type Execution = MoshiRealtimeExecution<
+        eredu_runtime::InstalledRealtimeExecution<
+            M::Sampling,
+            eredu_runtime::state::KeyValueState<C>,
+            M::Queue,
+        >,
+    >;
     type Error = MoshiRealtimeDispatchError<M::Error>;
 
     fn realization(&self) -> &SelectedRealtimeRealization {
@@ -1154,7 +1182,6 @@ where
             contract,
         ) = prepared.into_parts();
         let selected = contract.selected();
-        let residency = selected.residency();
         if selected.topology().is_replicated() != parallel.is_none() {
             return Err(MoshiRealtimeDispatchError::Architecture(
                 "Moshi realtime topology and rank-local parallel plan differ".into(),
@@ -1172,10 +1199,37 @@ where
                         "selected Moshi tensor-parallel layout is empty".into(),
                     ));
                 }
-                let resources = mechanisms
-                    .realize_tensor(plan.communication().clone(), plan.tensor_group())
+                let transport = mechanisms
+                    .open_communication_setup()
                     .map_err(MoshiRealtimeDispatchError::Mechanism)?;
-                Ok((plan, resources))
+                let prepared = eredu_runtime::communication::prepare_world_communication(
+                    transport,
+                    plan.communication(),
+                )
+                .map_err(eredu_core::BackendFailure::from_error)?;
+                let rank = mechanisms
+                    .realize_rank(prepared)
+                    .map_err(MoshiRealtimeDispatchError::Mechanism)?;
+                let group = plan.tensor_group();
+                let (communication, parallel, executor) =
+                    eredu_runtime::PartitionCommunication::bind_rank(
+                        rank,
+                        plan.communication().clone(),
+                        Some(group),
+                    )?;
+                let parallel = parallel.ok_or_else(|| {
+                    eredu_core::BackendFailure::from_error(
+                        eredu_runtime::PartitionExecutionError::UnknownGroup(group),
+                    )
+                })?;
+                Ok((
+                    plan,
+                    eredu_runtime::RealtimeTensorResources {
+                        communication,
+                        parallel,
+                        executor,
+                    },
+                ))
             })
             .transpose()?;
 
@@ -1216,23 +1270,19 @@ where
             contract,
             parallel,
         };
-        let (executor, mut metadata) = prepared.construct(
-            context,
-            |layout| {
-                mechanisms.materializer::<super::LayeredModel<B>>(
-                    store.clone(),
-                    residency,
-                    lowering.transform,
-                    layout,
-                )
-            },
-            |materializer| {
-                mechanisms.materialization_metadata::<super::LayeredModel<B>>(materializer)
-            },
-        )?;
+        let materializer = mechanisms.materializer();
+        let (executor, mut metadata) =
+            prepared.construct(context, store.clone(), lowering.transform, &materializer)?;
         metadata.set_effective_model_type(model_type);
         metadata.set_quantization(lowering.target);
-        Ok(descriptor.bind(mechanisms.bind_executor(executor, metadata, store)))
+        Ok(
+            descriptor.bind(eredu_runtime::InstalledRealtimeExecution::bind(
+                executor,
+                metadata,
+                store,
+                mechanisms.execution_queue(),
+            )),
+        )
     }
 }
 

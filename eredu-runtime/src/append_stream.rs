@@ -1,159 +1,156 @@
 //! Named append-only tensor streams with bounded range access.
-use eredu_nn::{Error, Index, Tensor, TensorElementType};
+use eredu_core::cache::append_stream::{
+    AppendOnlyStream, AppendStreamBacking, AppendStreamBinding, AppendStreamError,
+    AppendStreamLimits, AppendStreamSpec,
+};
+use eredu_nn::{Index, Tensor, TensorElementType};
 use std::ops::Range;
 
-/// Exact lane count and finite storage limits bound before native state allocation.
-/// Layer indices are local to the selected state layout. Byte limits are per lane;
-/// admission must account for all lanes and all replicas of a binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendStreamBinding {
-    /// Local state layer owning this stream.
-    pub layer: usize,
-    /// Number of independent sequence lanes.
-    pub lanes: u32,
-    /// Exact parameter-free record geometry.
-    pub spec: AppendStreamSpec,
-    /// Finite retained-history and operator-read limits.
-    pub limits: AppendStreamLimits,
-    /// Resident payload allowance for one lane.
-    pub payload_bytes: u64,
-    /// Compact read and tail-copy allowance for one lane.
-    pub scratch_bytes: u64,
-    /// Resident chunk catalog allowance for one lane.
-    pub catalog_bytes: u64,
-}
-
-impl AppendStreamBinding {
-    /// Checks selected scalar types as well as complete logical layout coverage.
-    pub fn validate_selected(
-        selected: &crate::SelectedStateRealization,
-        bindings: &[Self],
-    ) -> Result<(), AppendStreamError> {
-        Self::validate_layout(selected.layout(), bindings)?;
-        for binding in bindings {
-            let component = selected
-                .components()
-                .iter()
-                .find(|c| {
-                    c.layer() == binding.layer
-                        && c.component().role()
-                            == eredu_core::cache::StateComponentRole::AppendStream {
-                                slot: binding.spec.slot,
-                            }
-                })
-                .ok_or(AppendStreamError::Geometry)?;
-            if component.storage_dtype().element_type() != binding.spec.element {
-                return Err(AppendStreamError::Geometry);
-            }
-            match component.placement() {
-                crate::StateComponentPlacement::Device => {
-                    let required = (binding.limits.entries as u64)
-                        .checked_mul(binding.spec.record_bytes()?)
-                        .ok_or(AppendStreamError::Geometry)?;
-                    if required > binding.payload_bytes {
-                        return Err(AppendStreamError::Budget {
-                            resource: "payload bytes",
-                            required,
-                            limit: binding.payload_bytes,
-                        });
-                    }
-                }
-                crate::StateComponentPlacement::Paged => {
-                    let crate::CacheResidencyPolicy::Paged(options) = selected.policy() else {
-                        return Err(AppendStreamError::Geometry);
-                    };
-                    if binding.limits.page_entries != options.block_size_tokens() as usize {
-                        return Err(AppendStreamError::Geometry);
-                    }
-                    let required = (binding.limits.page_entries as u64)
-                        .checked_mul(binding.spec.record_bytes()?)
-                        .ok_or(AppendStreamError::Geometry)?;
-                    if required > options.device_budget_bytes() {
-                        return Err(AppendStreamError::Budget {
-                            resource: "device page bytes",
-                            required,
-                            limit: options.device_budget_bytes(),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    /// Proves complete, unique coverage of all declared streams before allocating.
-    pub fn validate_layout(
-        layout: &crate::StateLayout,
-        bindings: &[Self],
-    ) -> Result<(), AppendStreamError> {
-        let declared = layout
-            .layers()
+/// Checks selected scalar types as well as complete logical layout coverage.
+pub fn resolve_append_stream_allocations(
+    selected: &crate::SelectedStateRealization,
+    bindings: &[AppendStreamBinding],
+) -> Result<Vec<(AppendStreamBinding, AppendStreamBacking)>, AppendStreamError> {
+    validate_append_stream_layout(selected.layout(), bindings)?;
+    let mut allocations = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let component = selected
+            .components()
             .iter()
-            .map(|p| p.append_streams().len())
-            .sum::<usize>();
-        if declared != bindings.len() {
+            .find(|c| {
+                c.layer() == binding.layer
+                    && c.component().role()
+                        == eredu_core::cache::StateComponentRole::AppendStream {
+                            slot: binding.spec.slot,
+                        }
+            })
+            .ok_or(AppendStreamError::Geometry)?;
+        if component.storage_dtype().element_type() != binding.spec.element {
             return Err(AppendStreamError::Geometry);
         }
-        let mut identities = std::collections::BTreeSet::new();
-        let lanes = bindings.first().map(|binding| binding.lanes);
-        for binding in bindings {
-            if binding.lanes == 0
-                || binding.lanes > i32::MAX as u32
-                || Some(binding.lanes) != lanes
-                || !identities.insert((binding.layer, binding.spec.slot))
-            {
-                return Err(AppendStreamError::Geometry);
-            }
-            let policy = layout
-                .layer(binding.layer)
-                .and_then(|policy| {
-                    policy
-                        .append_streams()
-                        .iter()
-                        .find(|s| s.slot() == binding.spec.slot)
-                })
-                .ok_or(AppendStreamError::Geometry)?;
-            let dtype = match binding.spec.element {
-                TensorElementType::F16 => "Float16",
-                TensorElementType::Bf16 => "Bfloat16",
-                TensorElementType::F32 => "Float32",
-                TensorElementType::F64 => "Float64",
-                TensorElementType::I32 => "Int32",
-                TensorElementType::U32 => "Uint32",
-                _ => return Err(AppendStreamError::Geometry),
-            };
-            if binding.spec.width != policy.width() || !policy.dtype().accepts_dtype_name(dtype) {
-                return Err(AppendStreamError::Geometry);
-            }
-            let required = binding.limits.scratch_bytes(&binding.spec)?;
-            if required > binding.scratch_bytes {
-                return Err(AppendStreamError::Budget {
-                    resource: "scratch bytes",
-                    required,
-                    limit: binding.scratch_bytes,
-                });
-            }
-        }
-        Self::allowances(bindings)?;
-        Ok(())
-    }
-
-    /// Adds declared per-lane allowances without hiding replicas or overflowing.
-    /// Paged payload residency is charged by the shared cache policy separately.
-    pub fn allowances(bindings: &[Self]) -> Result<AppendStreamAllowances, AppendStreamError> {
-        let mut total = AppendStreamAllowances::default();
-        for binding in bindings {
-            for (value, limit) in [
-                (&mut total.payload_bytes, binding.payload_bytes),
-                (&mut total.scratch_bytes, binding.scratch_bytes),
-                (&mut total.catalog_bytes, binding.catalog_bytes),
-            ] {
-                *value = limit
-                    .checked_mul(u64::from(binding.lanes))
-                    .and_then(|n| value.checked_add(n))
+        let backing = match component.placement() {
+            crate::StateComponentPlacement::Device => {
+                let required = (binding.limits.entries as u64)
+                    .checked_mul(binding.spec.record_bytes()?)
                     .ok_or(AppendStreamError::Geometry)?;
+                if required > binding.payload_bytes {
+                    return Err(AppendStreamError::Budget {
+                        resource: "payload bytes",
+                        required,
+                        limit: binding.payload_bytes,
+                    });
+                }
+                AppendStreamBacking::Resident
             }
+            crate::StateComponentPlacement::Paged => {
+                let crate::CacheResidencyPolicy::Paged(options) = selected.policy() else {
+                    return Err(AppendStreamError::Geometry);
+                };
+                if binding.limits.page_entries != options.block_size_tokens() as usize {
+                    return Err(AppendStreamError::Geometry);
+                }
+                let required = (binding.limits.page_entries as u64)
+                    .checked_mul(binding.spec.record_bytes()?)
+                    .ok_or(AppendStreamError::Geometry)?;
+                if required > options.device_budget_bytes() {
+                    return Err(AppendStreamError::Budget {
+                        resource: "device page bytes",
+                        required,
+                        limit: options.device_budget_bytes(),
+                    });
+                }
+                AppendStreamBacking::Paged
+            }
+        };
+        allocations.push((binding.clone(), backing));
+    }
+    Ok(allocations)
+}
+/// Proves complete, unique coverage of all declared streams before allocating.
+pub fn validate_append_stream_layout<'a>(
+    layout: &crate::StateLayout,
+    bindings: impl IntoIterator<IntoIter: ExactSizeIterator, Item = &'a AppendStreamBinding>,
+) -> Result<(), AppendStreamError> {
+    let bindings = bindings.into_iter();
+    let declared = layout
+        .layers()
+        .iter()
+        .map(|p| p.append_streams().len())
+        .sum::<usize>();
+    if declared != bindings.len() {
+        return Err(AppendStreamError::Geometry);
+    }
+    let mut allowances = AppendStreamAllowances::default();
+    let mut identities = std::collections::BTreeSet::new();
+    let mut lanes = None;
+    for binding in bindings {
+        if binding.lanes == 0
+            || binding.lanes > i32::MAX as u32
+            || lanes.is_some_and(|lanes| binding.lanes != lanes)
+            || !identities.insert((binding.layer, binding.spec.slot))
+        {
+            return Err(AppendStreamError::Geometry);
         }
-        Ok(total)
+        lanes = Some(binding.lanes);
+        allowances.add(binding)?;
+        let policy = layout
+            .layer(binding.layer)
+            .and_then(|policy| {
+                policy
+                    .append_streams()
+                    .iter()
+                    .find(|s| s.slot() == binding.spec.slot)
+            })
+            .ok_or(AppendStreamError::Geometry)?;
+        let dtype = match binding.spec.element {
+            TensorElementType::F16 => "Float16",
+            TensorElementType::Bf16 => "Bfloat16",
+            TensorElementType::F32 => "Float32",
+            TensorElementType::F64 => "Float64",
+            TensorElementType::I32 => "Int32",
+            TensorElementType::U32 => "Uint32",
+            _ => return Err(AppendStreamError::Geometry),
+        };
+        if binding.spec.width != policy.width() || !policy.dtype().accepts_dtype_name(dtype) {
+            return Err(AppendStreamError::Geometry);
+        }
+        let required = binding.limits.scratch_bytes(&binding.spec)?;
+        if required > binding.scratch_bytes {
+            return Err(AppendStreamError::Budget {
+                resource: "scratch bytes",
+                required,
+                limit: binding.scratch_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Adds declared per-lane allowances without hiding replicas or overflowing.
+/// Paged payload residency is charged by the shared cache policy separately.
+pub fn append_stream_allowances<'a>(
+    bindings: impl IntoIterator<Item = &'a AppendStreamBinding>,
+) -> Result<AppendStreamAllowances, AppendStreamError> {
+    let mut total = AppendStreamAllowances::default();
+    for binding in bindings {
+        total.add(binding)?;
+    }
+    Ok(total)
+}
+
+impl AppendStreamAllowances {
+    fn add(&mut self, binding: &AppendStreamBinding) -> Result<(), AppendStreamError> {
+        for (value, limit) in [
+            (&mut self.payload_bytes, binding.payload_bytes),
+            (&mut self.scratch_bytes, binding.scratch_bytes),
+            (&mut self.catalog_bytes, binding.catalog_bytes),
+        ] {
+            *value = limit
+                .checked_mul(u64::from(binding.lanes))
+                .and_then(|n| value.checked_add(n))
+                .ok_or(AppendStreamError::Geometry)?;
+        }
+        Ok(())
     }
 }
 
@@ -188,125 +185,6 @@ pub trait RuntimeAppendStreams<B: eredu_nn::NeuralBackend>: crate::RuntimeLayerS
     ) -> Result<(&mut Self::Stream, &mut Self::Stream), AppendStreamError>;
 }
 
-/// Exact identity, scalar representation and record width declared by an architecture.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendStreamSpec {
-    /// Stable slot within a layer and sequence lane.
-    pub slot: u32,
-    /// Number of scalar fields in one immutable record.
-    pub width: i32,
-    /// Exact storage type; integer columns are never promoted through floating point.
-    pub element: TensorElementType,
-}
-impl AppendStreamSpec {
-    /// Validates geometry and returns exact logical storage bytes per record.
-    pub fn record_bytes(&self) -> Result<u64, AppendStreamError> {
-        let bytes = match self.element {
-            TensorElementType::Bool | TensorElementType::I8 | TensorElementType::U8 => 1,
-            TensorElementType::F16
-            | TensorElementType::Bf16
-            | TensorElementType::I16
-            | TensorElementType::U16 => 2,
-            TensorElementType::F32 | TensorElementType::I32 | TensorElementType::U32 => 4,
-            TensorElementType::F64
-            | TensorElementType::I64
-            | TensorElementType::U64
-            | TensorElementType::Complex64 => 8,
-        };
-        if self.width <= 0 {
-            return Err(AppendStreamError::Geometry);
-        }
-        Ok(self.width as u64 * bytes)
-    }
-}
-/// Mechanism limits selected independently of stream identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppendStreamLimits {
-    /// Maximum immutable record count retained by this mechanism.
-    pub entries: usize,
-    /// Entries per physical chunk, including the mutable tail.
-    pub page_entries: usize,
-    /// Largest compact range returned to an operator.
-    pub read_entries: usize,
-}
-impl AppendStreamLimits {
-    /// Checks addressable, nonzero logical and physical bounds.
-    pub fn validate(&self) -> Result<(), AppendStreamError> {
-        if [self.entries, self.page_entries, self.read_entries]
-            .into_iter()
-            .any(|n| n == 0 || n > i32::MAX as usize)
-        {
-            return Err(AppendStreamError::Geometry);
-        }
-        Ok(())
-    }
-
-    /// Tail replacement and compact range copies can coexist with their sources.
-    pub fn scratch_bytes(&self, spec: &AppendStreamSpec) -> Result<u64, AppendStreamError> {
-        self.validate()?;
-        (self.page_entries as u64 + self.read_entries as u64)
-            .checked_mul(spec.record_bytes()?)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or(AppendStreamError::Geometry)
-    }
-}
-/// Typed admission, frontier and payload failures.
-#[derive(Debug, thiserror::Error)]
-pub enum AppendStreamError {
-    /// Invalid dimensions, type or chunking policy.
-    #[error("append stream geometry or scalar representation differs from its declaration")]
-    Geometry,
-    /// Exact append frontier did not match retained state.
-    #[error("append stream frontier {actual} differs from expected {expected}")]
-    Frontier {
-        /// Caller frontier.
-        expected: usize,
-        /// Retained frontier.
-        actual: usize,
-    },
-    /// A requested range is outside retained history.
-    #[error("append stream range is outside retained history")]
-    Range,
-    /// Required storage or range exceeds the selected bound.
-    #[error("append stream needs {required} {resource}, admitted {limit}")]
-    Budget {
-        /// Bounded resource.
-        resource: &'static str,
-        /// Required amount.
-        required: u64,
-        /// Admitted amount.
-        limit: u64,
-    },
-    /// Backend range transfer, tensor construction or completion failure.
-    #[error(transparent)]
-    Tensor(#[from] Error),
-}
-/// Storage contract used by architecture-owned streaming algorithms.
-///
-/// Implementations may retain resident chunks or page immutable records through
-/// a shared residency manager. Reads return only the requested compact records;
-/// they must not gather the complete stream. Append/frontier updates are atomic
-/// on synchronous failure. The execution owner retains native work until completion
-/// and checkpoints all streams together with ordinary attention and fixed state.
-pub trait AppendOnlyStream<T: Tensor> {
-    /// Exact declaration retained at construction.
-    fn specification(&self) -> &AppendStreamSpec;
-    /// Records already committed to this stream.
-    fn len(&self) -> usize;
-    /// Whether the stream contains no records.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    /// Appends `[entries,width]` at the specified exact frontier.
-    fn append(
-        &mut self,
-        frontier: usize,
-        values: T,
-        context: &T::Context,
-    ) -> Result<(), AppendStreamError>;
-    /// Returns compact `[range.len(),width]` storage, within the read bound.
-    fn read(&mut self, range: Range<usize>, context: &T::Context) -> Result<T, AppendStreamError>;
-}
 /// Resident realization shared by neutral conformance and native tensor contexts.
 ///
 /// Completed chunks are immutable. Clones retain an exact cheap transaction
@@ -385,6 +263,60 @@ impl<T: Tensor> ResidentAppendStream<T> {
         self.entries = 0;
     }
 }
+/// Checks an append against the stream geometry, current frontier, and entry budget.
+pub fn admit_append(
+    spec: &AppendStreamSpec,
+    limits: &AppendStreamLimits,
+    entries: usize,
+    frontier: usize,
+    values: &impl Tensor,
+) -> Result<usize, AppendStreamError> {
+    if frontier != entries {
+        return Err(AppendStreamError::Frontier {
+            expected: frontier,
+            actual: entries,
+        });
+    }
+    if values.shape().len() != 2
+        || values.dim(0) <= 0
+        || values.dim(1) != spec.width
+        || values.element_type() != Some(spec.element)
+    {
+        return Err(AppendStreamError::Geometry);
+    }
+    let added = values.dim(0) as usize;
+    let next = entries
+        .checked_add(added)
+        .ok_or(AppendStreamError::Geometry)?;
+    if next > limits.entries {
+        return Err(AppendStreamError::Budget {
+            resource: "entries",
+            required: next as u64,
+            limit: limits.entries as u64,
+        });
+    }
+    Ok(next)
+}
+
+/// Checks that a read lies within the current frontier and read budget.
+pub fn admit_read(
+    limits: &AppendStreamLimits,
+    entries: usize,
+    range: &Range<usize>,
+) -> Result<(), AppendStreamError> {
+    if range.start >= range.end || range.end > entries {
+        return Err(AppendStreamError::Range);
+    }
+    if range.len() > limits.read_entries {
+        return Err(AppendStreamError::Budget {
+            resource: "read entries",
+            required: range.len() as u64,
+            limit: limits.read_entries as u64,
+        });
+    }
+    Ok(())
+}
+
 impl<T: Tensor> AppendOnlyStream<T> for ResidentAppendStream<T> {
     fn specification(&self) -> &AppendStreamSpec {
         &self.spec
@@ -398,31 +330,8 @@ impl<T: Tensor> AppendOnlyStream<T> for ResidentAppendStream<T> {
         values: T,
         context: &T::Context,
     ) -> Result<(), AppendStreamError> {
-        if frontier != self.entries {
-            return Err(AppendStreamError::Frontier {
-                expected: frontier,
-                actual: self.entries,
-            });
-        }
-        if values.shape().len() != 2
-            || values.dim(0) <= 0
-            || values.dim(1) != self.spec.width
-            || values.element_type() != Some(self.spec.element)
-        {
-            return Err(AppendStreamError::Geometry);
-        }
-        let added = values.dim(0) as usize;
-        let next = self
-            .entries
-            .checked_add(added)
-            .ok_or(AppendStreamError::Geometry)?;
-        if next > self.limits.entries {
-            return Err(AppendStreamError::Budget {
-                resource: "entries",
-                required: next as u64,
-                limit: self.limits.entries as u64,
-            });
-        }
+        let next = admit_append(&self.spec, &self.limits, self.entries, frontier, &values)?;
+        let added = next - self.entries;
         let mut new_chunks = Vec::new();
         let mut consumed = 0;
         let tail = self.entries % self.limits.page_entries;
@@ -459,16 +368,7 @@ impl<T: Tensor> AppendOnlyStream<T> for ResidentAppendStream<T> {
         Ok(())
     }
     fn read(&mut self, range: Range<usize>, context: &T::Context) -> Result<T, AppendStreamError> {
-        if range.start >= range.end || range.end > self.entries {
-            return Err(AppendStreamError::Range);
-        }
-        if range.len() > self.limits.read_entries {
-            return Err(AppendStreamError::Budget {
-                resource: "read entries",
-                required: range.len() as u64,
-                limit: self.limits.read_entries as u64,
-            });
-        }
+        admit_read(&self.limits, self.entries, &range)?;
         let page = self.limits.page_entries;
         let mut parts = Vec::new();
         for index in range.start / page..=(range.end - 1) / page {

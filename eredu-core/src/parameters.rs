@@ -2,12 +2,17 @@
 //! Plans describe logical loaded parameters, never checkpoint files or native handles.
 use crate::{
     capture::{elements, CaptureError, CaptureUsage},
+    communication::CommunicationSessionIdentity,
+    consensus::BoundedConsensusTransport,
     intervention::InterventionDtype,
+    BackendFailure, BoundedCompletionWait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod coordination;
+/// Physical requests and mechanisms used for portable parameter access.
+pub mod native;
 mod partition;
 pub use coordination::{
     ParameterCoordinationError, ParameterCoordinationStage, ParameterCoordinationUsage,
@@ -498,39 +503,58 @@ impl From<ParameterCoordinationError> for ParameterError {
     }
 }
 
-/// Additive backend mechanism implemented by loaded parameter access providers.
-pub trait ParameterBackend: crate::TextGenerationBackend {
-    /// Reads actual loaded geometry without evaluating or retaining parameter
-    /// tensors. Distributed implementations may exchange bounded prepared
-    /// metadata through the retained communicator; every rank participates.
-    fn parameter_discovery(
-        runtime: &mut crate::ModelRuntime<Self>,
-    ) -> Result<ParameterDiscovery, ParameterError>;
+/// Optional loaded parameter access for an installed session.
+pub trait ParameterSession<B> {
+    /// Reads actual loaded geometry without evaluating or retaining parameter tensors.
+    fn parameter_discovery(&mut self, backend: &B) -> Result<ParameterDiscovery, ParameterError>;
     /// Copies only the admitted region after reserving cumulative resources.
     fn query_parameter(
-        runtime: &mut crate::ModelRuntime<Self>,
+        &mut self,
+        backend: &B,
         identity: &str,
         parameter: &str,
         region: ParameterRegion,
         limits: CaptureUsage,
     ) -> Result<ParameterValues, ParameterError>;
-    /// Projects effective weights natively, copying only bounded reduction output to the host.
+    /// Contracts effective weights on the device and copies the bounded result.
     fn project_parameter(
-        runtime: &mut crate::ModelRuntime<Self>,
+        &mut self,
+        backend: &B,
         identity: &str,
         parameter: &str,
         projection: ParameterProjection,
         limits: CaptureUsage,
     ) -> Result<ParameterProjectionValues, ParameterError>;
-    /// Prepares every replacement before one atomic publication at an idle boundary.
+    /// Prepares every replacement before one publication at an idle boundary.
     fn activate_parameter_overlay(
-        runtime: &mut crate::ModelRuntime<Self>,
+        &mut self,
+        backend: &B,
         overlay: &AdmittedParameterOverlay,
         limits: CaptureUsage,
     ) -> Result<ParameterDiscovery, ParameterError>;
     /// Restores original parameters and invalidates incompatible mutable state.
     fn remove_parameter_overlay(
-        runtime: &mut crate::ModelRuntime<Self>,
+        &mut self,
+        backend: &B,
         identity: &str,
     ) -> Result<ParameterDiscovery, ParameterError>;
+}
+
+/// Ordinary native portable-word transport and exact retained session facts.
+pub trait ParameterOperationTransport: BoundedConsensusTransport {
+    /// Actual world rank, not an application-supplied label.
+    fn parameter_rank(&self) -> usize;
+    /// Actual retained setup identity.
+    fn parameter_setup(&self) -> CommunicationSessionIdentity;
+    /// Selected bounded completion policy, queried without submission.
+    fn parameter_wait(&self) -> Result<BoundedCompletionWait, ParameterError>;
+    /// Exact conservative native/host bound for one equally sized gather.
+    /// Runtime adds its framing and decoding buffers separately.
+    fn estimate_parameter_gather(&self, local_words: usize)
+        -> Result<CaptureUsage, ParameterError>;
+    /// Rejects a failed native session before new work.
+    fn ensure_parameter_active(&self) -> Result<(), BackendFailure>;
+    /// Fences the shared execution on ambiguous failure. Exact submitted native
+    /// completions still retain or quarantine resources independently.
+    fn fail_parameter_operation(&self, error: &ParameterCoordinationError);
 }

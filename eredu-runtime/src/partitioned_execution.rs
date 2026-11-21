@@ -5,63 +5,42 @@
 //! partition schedule, mechanical wire validation, exact completion, publication,
 //! and the execution strategy installed in [`crate::ReplicatedTextSession`].
 
+use eredu_core::SubmissionBackend;
+
+mod direct;
+pub use direct::{direct_execution_plan, DirectPartitionExecutor, DirectResidentPartitionPass};
+
 use std::{borrow::Borrow, marker::PhantomData};
 
 use eredu_core::{
-    checkpoint::TensorDtype, BoundedCompletion, BoundedCompletionOutcome, BoundedSubmissionOutcome,
-    CollectiveGroupId, CompletionCancellationMode, DistributedCommitEpoch,
-    DistributedCommitOutcome, DistributedCommitPhase,
+    checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveGroupId,
+    CompletionCancellationMode, DistributedCommitEpoch, DistributedCommitOutcome,
+    DistributedCommitPhase,
 };
 use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
-    ActivationObserver, ArchitectureGroupKind, BarrierBackend, BroadcastBackend,
-    CommunicationBackend, CommunicationGroupDescriptor, CommunicationManifest,
-    CommunicationOperation, CommunicationOperationRequirement, CommunicationPeerCounts,
-    CommunicationRouteDescriptor, CommunicationRouteId, EvenGatherBackend, ExecutionGraph,
-    ExecutionResidency, ExpertPass, FailureAgreementBackend, LayeredArchitecture,
-    LayeredPartitionDriver, LayeredPipelineSchedule, LayeredPipelineScheduleError,
-    LayeredTraversalHook, LayerwisePolicy, LayerwiseRuntime, LayerwiseRuntimeError,
-    ParallelLayeredArchitecture, PipelineActivationDtype, PipelineWireContract,
-    PointToPointBackend, ReplicatedTextExecutionStrategy, ReplicatedTextSessionError,
-    ResolvedBoundaryTensorSpec, ResolvedBoundaryWireSchema, RuntimeState, SubmissionBackend,
-    SumReductionBackend, UnevenGatherBackend, VariableAllToAllBackend,
+    ActivationObserver, ArchitectureGroupKind, ExecutionGraph, ExecutionResidency, ExpertPass,
+    LayeredArchitecture, LayeredPartitionDriver, LayeredPipelineSchedule,
+    LayeredPipelineScheduleError, LayeredTraversalHook, LayerwisePolicy, LayerwiseRuntime,
+    LayerwiseRuntimeError, ParallelLayeredArchitecture, PipelineWireContract,
+    ReplicatedTextExecutionStrategy, ReplicatedTextSessionError, ResolvedBoundaryTensorSpec,
+    ResolvedBoundaryWireSchema, RuntimeState,
 };
-
-/// Backend-native tensor metadata used only for mechanical communication validation.
-pub trait CommunicationTensorMetadata<B: NeuralBackend> {
-    /// Returns the portable logical dtype of one native tensor.
-    fn dtype(&self, tensor: &B::Tensor) -> TensorDtype;
-
-    /// Returns the exact logical shape of one native tensor.
-    fn shape(&self, tensor: &B::Tensor) -> Vec<usize>;
-}
-
-/// One backend-native group paired with the opaque identity selected by the manifest.
-pub struct RealizedCommunicationGroup<G> {
-    id: CollectiveGroupId,
-    resource: G,
-}
-
-impl<G> RealizedCommunicationGroup<G> {
-    /// Binds one native resource to its selected opaque group identity.
-    pub const fn new(id: CollectiveGroupId, resource: G) -> Self {
-        Self { id, resource }
-    }
-}
-
-/// One backend-native route paired with the opaque identity selected by the manifest.
-pub struct RealizedCommunicationRoute<R> {
-    id: CommunicationRouteId,
-    resource: R,
-}
-
-impl<R> RealizedCommunicationRoute<R> {
-    /// Binds one native resource to its selected opaque route identity.
-    pub const fn new(id: CommunicationRouteId, resource: R) -> Self {
-        Self { id, resource }
-    }
-}
+use eredu_core::communication::{
+    BarrierBackend, BroadcastBackend, CommunicationAuthority, CommunicationBackend,
+    CommunicationError, CommunicationPeerCounts, CommunicationPoisoned, EvenGatherBackend,
+    FailureAgreementBackend, PointToPointBackend, SumReductionBackend, UnevenGatherBackend,
+    VariableAllToAllBackend,
+};
+use eredu_core::communication::{
+    CommunicationGroupDescriptor, CommunicationManifest, CommunicationOperationRequirement,
+    CommunicationRouteDescriptor, CommunicationRouteId,
+};
+use eredu_core::communication::{
+    CommunicationOperation, CommunicationTensorMetadata, RealizedCommunicationGroup,
+    RealizedCommunicationRoute,
+};
 
 /// Opaque native communication resources paired in manifest order.
 pub struct PartitionCommunication<B, G, R, I>
@@ -72,329 +51,8 @@ where
     groups: Vec<RealizedCommunicationGroup<G>>,
     routes: Vec<RealizedCommunicationRoute<R>>,
     inspector: I,
-    authority: PartitionCommunicationAuthority,
+    authority: CommunicationAuthority,
     backend: PhantomData<fn() -> B>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct CommunicationPoison {
-    operation: CommunicationOperation,
-    phase: DistributedExecutionPhase,
-    route: Option<CommunicationRouteId>,
-    cancellation: CompletionCancellationMode,
-}
-
-/// Cloneable bounded-completion and poison authority for one selected communication session.
-///
-/// Backend-owned operations adjacent to the neutral partition driver must
-/// retain this authority instead of a bare native group. Every clone observes
-/// the first terminal communication failure and fails before later submission.
-#[derive(Debug, Clone)]
-pub struct PartitionCommunicationAuthority {
-    policy: Option<crate::CommunicationCompletionPolicy>,
-    poison: std::sync::Arc<std::sync::Mutex<Option<CommunicationPoison>>>,
-}
-
-impl PartitionCommunicationAuthority {
-    fn new(policy: Option<crate::CommunicationCompletionPolicy>) -> Self {
-        Self {
-            policy,
-            poison: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    /// Creates the poison and bounded-completion authority selected by one manifest.
-    pub fn from_manifest(
-        manifest: &CommunicationManifest,
-    ) -> Result<Self, PartitionExecutionError> {
-        if manifest.completion_policy().is_none()
-            && (!manifest.groups().is_empty() || !manifest.routes().is_empty())
-        {
-            return Err(PartitionExecutionError::MissingBoundedCompletionPolicy);
-        }
-        Ok(Self::new(manifest.completion_policy()))
-    }
-
-    fn poison_guard(&self) -> std::sync::MutexGuard<'_, Option<CommunicationPoison>> {
-        self.poison
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Rejects work after any submission, completion, cancellation, or deadline failure.
-    pub fn ensure_active(&self) -> Result<(), PartitionExecutionError> {
-        match *self.poison_guard() {
-            Some(poison) => Err(PartitionExecutionError::CommunicationPoisoned {
-                operation: poison.operation,
-                phase: poison.phase,
-                route: poison.route,
-                cancellation: poison.cancellation,
-            }),
-            None => Ok(()),
-        }
-    }
-
-    /// Returns the bounded completion policy selected by the communication manifest.
-    pub const fn completion_policy(&self) -> Option<crate::CommunicationCompletionPolicy> {
-        self.policy
-    }
-
-    fn mark_poisoned(&self, poison: CommunicationPoison) {
-        let mut current = self.poison_guard();
-        if current.is_none() {
-            *current = Some(poison);
-        }
-    }
-
-    fn is_poisoned(&self) -> bool {
-        self.poison_guard().is_some()
-    }
-
-    /// Records a diagnostic-only submission rejection and poisons the authority.
-    /// Use [`Self::submission_failure`] when an owned error is available.
-    pub fn submission_error(
-        &self,
-        error: impl std::fmt::Display,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> PartitionExecutionError {
-        let cancellation = self
-            .policy
-            .expect("communication submission requires a selected completion policy")
-            .cancellation();
-        self.mark_poisoned(CommunicationPoison {
-            operation,
-            phase,
-            route,
-            cancellation,
-        });
-        PartitionExecutionError::CommunicationSubmissionFailed {
-            operation,
-            phase,
-            route,
-            error: error.to_string(),
-            source: None,
-        }
-    }
-
-    /// Records a diagnostic-only completion rejection in the shared poison domain.
-    /// Use [`Self::completion_failure`] when an owned error is available.
-    pub fn completion_error(
-        &self,
-        error: impl std::fmt::Display,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> PartitionExecutionError {
-        let cancellation = self
-            .policy
-            .expect("communication completion requires a selected completion policy")
-            .cancellation();
-        self.mark_poisoned(CommunicationPoison {
-            operation,
-            phase,
-            route,
-            cancellation,
-        });
-        PartitionExecutionError::CommunicationCompletionFailed {
-            operation,
-            phase,
-            route,
-            error: error.to_string(),
-            source: None,
-        }
-    }
-
-    /// Records a submission failure while retaining its original typed cause.
-    pub fn submission_failure(
-        &self,
-        error: impl std::error::Error + Send + Sync + 'static,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> PartitionExecutionError {
-        let mut failure = self.submission_error(&error, operation, phase, route);
-        if let PartitionExecutionError::CommunicationSubmissionFailed { source, .. } = &mut failure
-        {
-            *source = Some(eredu_core::BackendFailure::from_error(error));
-        }
-        failure
-    }
-
-    /// Records a completion failure without treating the error as release evidence.
-    pub fn completion_failure(
-        &self,
-        error: impl std::error::Error + Send + Sync + 'static,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> PartitionExecutionError {
-        let mut failure = self.completion_error(&error, operation, phase, route);
-        if let PartitionExecutionError::CommunicationCompletionFailed { source, .. } = &mut failure
-        {
-            *source = Some(eredu_core::BackendFailure::from_error(error));
-        }
-        failure
-    }
-
-    /// Waits under the selected bound and permanently poisons this session on failure.
-    pub fn wait<T, C>(
-        &self,
-        submission: eredu_core::Submission<T, C>,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> Result<T, PartitionExecutionError>
-    where
-        C: BoundedCompletion,
-        C::Error: std::fmt::Display,
-    {
-        self.ensure_active()?;
-        let policy = self
-            .policy
-            .ok_or(PartitionExecutionError::MissingBoundedCompletionPolicy)?
-            .bounded_wait();
-        let outcome = match submission.wait_bounded(policy) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.mark_poisoned(CommunicationPoison {
-                    operation,
-                    phase,
-                    route,
-                    cancellation: policy.cancellation(),
-                });
-                return Err(PartitionExecutionError::CommunicationCompletionFailed {
-                    operation,
-                    phase,
-                    route,
-                    error: error.to_string(),
-                    source: Some(eredu_core::BackendFailure::from_error(error)),
-                });
-            }
-        };
-        match outcome {
-            BoundedSubmissionOutcome::Completed(output) => Ok(output),
-            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
-                self.mark_poisoned(CommunicationPoison {
-                    operation,
-                    phase,
-                    route,
-                    cancellation,
-                });
-                Err(PartitionExecutionError::CommunicationDeadlineExceeded {
-                    operation,
-                    phase,
-                    route,
-                    cancellation,
-                })
-            }
-        }
-    }
-
-    fn wait_after_prior_failure<T, C>(
-        &self,
-        submission: eredu_core::Submission<T, C>,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> Result<T, PartitionExecutionError>
-    where
-        C: BoundedCompletion,
-        C::Error: std::fmt::Display,
-    {
-        let policy = self
-            .policy
-            .ok_or(PartitionExecutionError::MissingBoundedCompletionPolicy)?
-            .bounded_wait();
-        let outcome = submission.wait_bounded(policy).map_err(|error| {
-            self.mark_poisoned(CommunicationPoison {
-                operation,
-                phase,
-                route,
-                cancellation: policy.cancellation(),
-            });
-            PartitionExecutionError::CommunicationCompletionFailed {
-                operation,
-                phase,
-                route,
-                error: error.to_string(),
-                source: Some(eredu_core::BackendFailure::from_error(error)),
-            }
-        })?;
-        match outcome {
-            BoundedSubmissionOutcome::Completed(output) => Ok(output),
-            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
-                self.mark_poisoned(CommunicationPoison {
-                    operation,
-                    phase,
-                    route,
-                    cancellation,
-                });
-                Err(PartitionExecutionError::CommunicationDeadlineExceeded {
-                    operation,
-                    phase,
-                    route,
-                    cancellation,
-                })
-            }
-        }
-    }
-
-    fn wait_before_failure_agreement<T, C>(
-        &self,
-        submission: eredu_core::Submission<T, C>,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) -> Result<T, PartitionExecutionError>
-    where
-        C: BoundedCompletion,
-        C::Error: std::fmt::Display,
-    {
-        self.ensure_active()?;
-        let policy = self
-            .policy
-            .ok_or(PartitionExecutionError::MissingBoundedCompletionPolicy)?
-            .bounded_wait();
-        match submission.wait_bounded(policy).map_err(|error| {
-            PartitionExecutionError::CommunicationCompletionFailed {
-                operation,
-                phase,
-                route,
-                error: error.to_string(),
-                source: Some(eredu_core::BackendFailure::from_error(error)),
-            }
-        })? {
-            BoundedSubmissionOutcome::Completed(output) => Ok(output),
-            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
-                Err(PartitionExecutionError::CommunicationDeadlineExceeded {
-                    operation,
-                    phase,
-                    route,
-                    cancellation,
-                })
-            }
-        }
-    }
-
-    fn fence_protocol_failure(
-        &self,
-        operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
-        route: Option<CommunicationRouteId>,
-    ) {
-        let cancellation = self
-            .policy
-            .expect("communication protocol failure requires a selected completion policy")
-            .cancellation();
-        self.mark_poisoned(CommunicationPoison {
-            operation,
-            phase,
-            route,
-            cancellation,
-        });
-    }
 }
 
 impl<B, G, R, I> PartitionCommunication<B, G, R, I>
@@ -404,6 +62,42 @@ where
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
 {
+    /// Binds an admitted tensor role and pairs the native resources with their manifest.
+    pub fn bind_rank<C>(
+        rank: C,
+        manifest: CommunicationManifest,
+        tensor_group: Option<CollectiveGroupId>,
+    ) -> Result<(Self, Option<C::Parallel>, B::OwnedExecutor), eredu_core::BackendFailure>
+    where
+        C: eredu_core::communication::RankCommunication<
+            Backend = B,
+            Group = G,
+            Route = R,
+            Metadata = I,
+        >,
+    {
+        use eredu_core::BackendFailure;
+        let parallel = tensor_group
+            .map(|id| {
+                rank.tensor_context(id)
+                    .ok_or(PartitionExecutionError::UnknownGroup(id))
+            })
+            .transpose()
+            .map_err(BackendFailure::from_error)?;
+        let resources = rank
+            .into_rank_resources(&manifest)
+            .map_err(BackendFailure::from_error)?;
+        let communication = Self::new_with_authority(
+            manifest,
+            resources.groups,
+            resources.routes,
+            resources.metadata,
+            resources.authority,
+        )
+        .map_err(BackendFailure::from_error)?;
+        Ok((communication, parallel, resources.executor))
+    }
+
     /// Pairs already-created opaque resources with their authoritative manifest order.
     pub fn new(
         manifest: CommunicationManifest,
@@ -411,7 +105,8 @@ where
         routes: Vec<RealizedCommunicationRoute<R>>,
         inspector: I,
     ) -> Result<Self, PartitionExecutionError> {
-        let authority = PartitionCommunicationAuthority::from_manifest(&manifest)?;
+        let authority = CommunicationAuthority::from_manifest(&manifest)
+            .map_err(|_| PartitionExecutionError::MissingBoundedCompletionPolicy)?;
         Self::new_with_authority(manifest, groups, routes, inspector, authority)
     }
 
@@ -421,9 +116,9 @@ where
         groups: Vec<RealizedCommunicationGroup<G>>,
         routes: Vec<RealizedCommunicationRoute<R>>,
         inspector: I,
-        authority: PartitionCommunicationAuthority,
+        authority: CommunicationAuthority,
     ) -> Result<Self, PartitionExecutionError> {
-        if authority.policy != manifest.completion_policy() {
+        if authority.completion_policy() != manifest.completion_policy() {
             return Err(PartitionExecutionError::MissingBoundedCompletionPolicy);
         }
         if groups.len() != manifest.groups().len() || routes.len() != manifest.routes().len() {
@@ -465,13 +160,19 @@ where
         &self.manifest
     }
 
+    pub(crate) fn native_groups(&self) -> impl Iterator<Item = &G> {
+        self.groups.iter().map(|group| &group.resource)
+    }
+
     /// Shares the selected deadline and terminal poison domain with adjacent operations.
-    pub fn authority(&self) -> PartitionCommunicationAuthority {
+    pub fn authority(&self) -> CommunicationAuthority {
         self.authority.clone()
     }
 
     fn ensure_active(&self) -> Result<(), PartitionExecutionError> {
-        self.authority.ensure_active()
+        self.authority
+            .ensure_active()
+            .map_err(PartitionExecutionError::from)
     }
 
     fn submission_error(
@@ -481,8 +182,14 @@ where
         phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
     ) -> PartitionExecutionError {
-        self.authority
-            .submission_failure(error, operation, phase, route)
+        self.authority.fence(operation, route);
+        PartitionExecutionError::CommunicationSubmissionFailed {
+            operation,
+            phase,
+            route,
+            error: error.to_string(),
+            source: Some(eredu_core::BackendFailure::from_error(error)),
+        }
     }
 
     fn group(
@@ -583,7 +290,9 @@ where
         phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
     ) -> Result<T, PartitionExecutionError> {
-        self.authority.wait(submission, operation, phase, route)
+        self.authority
+            .wait(submission, operation, route)
+            .map_err(|error| partition_communication_error(error, phase))
     }
 
     fn expected_axis_output_shape(
@@ -617,11 +326,9 @@ where
         &self,
         error: PartitionExecutionError,
         operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
     ) -> PartitionExecutionError {
-        self.authority
-            .fence_protocol_failure(operation, phase, route);
+        self.authority.fence(operation, route);
         error
     }
 
@@ -654,12 +361,7 @@ where
         )?;
         self.validate_tensor(&output, requirement, true)
             .map_err(|error| {
-                self.output_contract_error(
-                    error,
-                    CommunicationOperation::AllReduceSum,
-                    DistributedExecutionPhase::Execution,
-                    None,
-                )
+                self.output_contract_error(error, CommunicationOperation::AllReduceSum, None)
             })?;
         Ok(output)
     }
@@ -708,7 +410,6 @@ where
                         self.output_contract_error(
                             error,
                             CommunicationOperation::AllReduceSum,
-                            DistributedExecutionPhase::Execution,
                             None,
                         )
                     })?;
@@ -761,12 +462,7 @@ where
         self.validate_tensor(&output, requirement, true)
             .and_then(|()| self.validate_output_shape(&output, expected))
             .map_err(|error| {
-                self.output_contract_error(
-                    error,
-                    CommunicationOperation::AllGatherEven,
-                    DistributedExecutionPhase::Execution,
-                    None,
-                )
+                self.output_contract_error(error, CommunicationOperation::AllGatherEven, None)
             })?;
         Ok(output)
     }
@@ -817,12 +513,7 @@ where
         self.validate_tensor(&output, requirement, true)
             .and_then(|()| self.validate_output_shape(&output, expected))
             .map_err(|error| {
-                self.output_contract_error(
-                    error,
-                    CommunicationOperation::AllGatherUneven,
-                    DistributedExecutionPhase::Execution,
-                    None,
-                )
+                self.output_contract_error(error, CommunicationOperation::AllGatherUneven, None)
             })?;
         Ok(output)
     }
@@ -885,12 +576,7 @@ where
         self.validate_tensor(&output, requirement, true)
             .and_then(|()| self.validate_output_shape(&output, expected))
             .map_err(|error| {
-                self.output_contract_error(
-                    error,
-                    CommunicationOperation::VariableAllToAll,
-                    DistributedExecutionPhase::Execution,
-                    None,
-                )
+                self.output_contract_error(error, CommunicationOperation::VariableAllToAll, None)
             })?;
         Ok(output)
     }
@@ -971,12 +657,7 @@ where
                 )
             })
             .map_err(|error| {
-                self.output_contract_error(
-                    error,
-                    CommunicationOperation::SendReceive,
-                    DistributedExecutionPhase::Execution,
-                    Some(route),
-                )
+                self.output_contract_error(error, CommunicationOperation::SendReceive, Some(route))
             })?;
         Ok(output)
     }
@@ -1080,7 +761,7 @@ where
         let output = self.wait(submission, CommunicationOperation::Broadcast, phase, None)?;
         self.validate_tensor(&output, requirement, true)
             .map_err(|error| {
-                self.output_contract_error(error, CommunicationOperation::Broadcast, phase, None)
+                self.output_contract_error(error, CommunicationOperation::Broadcast, None)
             })?;
         Ok(output)
     }
@@ -1102,42 +783,59 @@ where
                 None,
             )
         })?;
+        self.wait(
+            eredu_core::Submission {
+                output: (),
+                completion,
+            },
+            CommunicationOperation::Barrier,
+            DistributedExecutionPhase::Commit,
+            None,
+        )
+    }
+
+    // Recovery agreement may use the control group after a local failure.
+    // Source-completion checks defer fencing until their peers have agreed.
+    fn wait_for_agreement<T>(
+        &self,
+        submission: eredu_core::Submission<T, B::CommunicationCompletion>,
+        operation: CommunicationOperation,
+        phase: DistributedExecutionPhase,
+        route: Option<CommunicationRouteId>,
+        recovery: bool,
+    ) -> Result<T, PartitionExecutionError> {
+        if !recovery {
+            self.ensure_active()?;
+        }
         let policy = self
-            .manifest
+            .authority
             .completion_policy()
-            .expect("partition communication requires bounded completion")
+            .ok_or(PartitionExecutionError::MissingBoundedCompletionPolicy)?
             .bounded_wait();
-        let outcome = match completion.wait_bounded(policy) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.authority.mark_poisoned(CommunicationPoison {
-                    operation: CommunicationOperation::Barrier,
-                    phase: DistributedExecutionPhase::Commit,
-                    route: None,
-                    cancellation: policy.cancellation(),
-                });
-                return Err(PartitionExecutionError::CommunicationCompletionFailed {
-                    operation: CommunicationOperation::Barrier,
-                    phase: DistributedExecutionPhase::Commit,
-                    route: None,
-                    error: error.to_string(),
-                    source: Some(eredu_core::BackendFailure::from_error(error)),
-                });
+        let outcome = submission.wait_bounded(policy).map_err(|error| {
+            if recovery {
+                self.authority
+                    .record_failure(operation, route, policy.cancellation());
             }
-        };
+            PartitionExecutionError::CommunicationCompletionFailed {
+                operation,
+                phase,
+                route,
+                error: error.to_string(),
+                source: Some(eredu_core::BackendFailure::from_error(error)),
+            }
+        })?;
         match outcome {
-            BoundedCompletionOutcome::Completed => Ok(()),
-            BoundedCompletionOutcome::DeadlineExceeded { cancellation } => {
-                self.authority.mark_poisoned(CommunicationPoison {
-                    operation: CommunicationOperation::Barrier,
-                    phase: DistributedExecutionPhase::Commit,
-                    route: None,
-                    cancellation,
-                });
+            BoundedSubmissionOutcome::Completed(output) => Ok(output),
+            BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
+                if recovery {
+                    self.authority
+                        .record_failure(operation, route, cancellation);
+                }
                 Err(PartitionExecutionError::CommunicationDeadlineExceeded {
-                    operation: CommunicationOperation::Barrier,
-                    phase: DistributedExecutionPhase::Commit,
-                    route: None,
+                    operation,
+                    phase,
+                    route,
                     cancellation,
                 })
             }
@@ -1165,16 +863,8 @@ where
             None,
         )?;
         B::resolve_failure_agreement(output).map_err(|error| {
-            self.authority.mark_poisoned(CommunicationPoison {
-                operation: CommunicationOperation::FailureAgreement,
-                phase,
-                route: None,
-                cancellation: self
-                    .manifest
-                    .completion_policy()
-                    .expect("partition communication requires bounded completion")
-                    .cancellation(),
-            });
+            self.authority
+                .fence(CommunicationOperation::FailureAgreement, None);
             PartitionExecutionError::CommunicationCompletionFailed {
                 operation: CommunicationOperation::FailureAgreement,
                 phase,
@@ -1195,7 +885,7 @@ where
     where
         B: FailureAgreementBackend,
     {
-        if local_success && !self.authority.is_poisoned() {
+        if local_success && self.authority.ensure_active().is_ok() {
             return Err(PartitionExecutionError::RecoveryAgreementWithoutFailure { phase });
         }
         let index = self
@@ -1222,16 +912,8 @@ where
         let native = self.groups[index].resource.borrow();
         let submission =
             B::agree_success(local_success, None, native, executor).map_err(|error| {
-                self.authority.mark_poisoned(CommunicationPoison {
-                    operation: CommunicationOperation::FailureAgreement,
-                    phase,
-                    route: None,
-                    cancellation: self
-                        .manifest
-                        .completion_policy()
-                        .expect("partition communication requires bounded completion")
-                        .cancellation(),
-                });
+                self.authority
+                    .fence(CommunicationOperation::FailureAgreement, None);
                 PartitionExecutionError::CommunicationSubmissionFailed {
                     operation: CommunicationOperation::FailureAgreement,
                     phase,
@@ -1240,23 +922,16 @@ where
                     source: Some(eredu_core::BackendFailure::from_error(error)),
                 }
             })?;
-        let output = self.authority.wait_after_prior_failure(
+        let output = self.wait_for_agreement(
             submission,
             CommunicationOperation::FailureAgreement,
             phase,
             None,
+            true,
         )?;
         B::resolve_failure_agreement(output).map_err(|error| {
-            self.authority.mark_poisoned(CommunicationPoison {
-                operation: CommunicationOperation::FailureAgreement,
-                phase,
-                route: None,
-                cancellation: self
-                    .manifest
-                    .completion_policy()
-                    .expect("partition communication requires bounded completion")
-                    .cancellation(),
-            });
+            self.authority
+                .fence(CommunicationOperation::FailureAgreement, None);
             PartitionExecutionError::CommunicationCompletionFailed {
                 operation: CommunicationOperation::FailureAgreement,
                 phase,
@@ -1308,11 +983,12 @@ where
             }
         })?;
         if before_failure_agreement {
-            self.authority.wait_before_failure_agreement(
+            self.wait_for_agreement(
                 submission,
                 CommunicationOperation::SendReceive,
                 phase,
                 Some(route),
+                false,
             )
         } else {
             self.wait(
@@ -1355,6 +1031,63 @@ where
             DistributedExecutionPhase::Execution,
             None,
         )
+    }
+}
+
+impl From<CommunicationPoisoned> for PartitionExecutionError {
+    fn from(failure: CommunicationPoisoned) -> Self {
+        Self::CommunicationPoisoned {
+            operation: failure.operation,
+            route: failure.route,
+            cancellation: failure.cancellation,
+        }
+    }
+}
+
+fn partition_communication_error(
+    error: CommunicationError,
+    phase: DistributedExecutionPhase,
+) -> PartitionExecutionError {
+    match error {
+        CommunicationError::Poisoned(error) => error.into(),
+        CommunicationError::MissingCompletionPolicy => {
+            PartitionExecutionError::MissingBoundedCompletionPolicy
+        }
+        CommunicationError::Submission {
+            operation,
+            route,
+            source,
+        } => PartitionExecutionError::CommunicationSubmissionFailed {
+            operation,
+            phase,
+            route,
+            error: source.to_string(),
+            source: Some(source),
+        },
+        CommunicationError::Completion {
+            operation,
+            route,
+            source,
+        } => PartitionExecutionError::CommunicationCompletionFailed {
+            operation,
+            phase,
+            route,
+            error: source.to_string(),
+            source: Some(source),
+        },
+        CommunicationError::Deadline {
+            operation,
+            route,
+            cancellation,
+        } => PartitionExecutionError::CommunicationDeadlineExceeded {
+            operation,
+            phase,
+            route,
+            cancellation,
+        },
+        error => PartitionExecutionError::OutputPreparationFailed(
+            eredu_core::BackendFailure::from_error(error),
+        ),
     }
 }
 
@@ -2295,7 +2028,7 @@ fn indeterminate_commit(
 }
 
 /// Complete rank-local runtime installed behind the shared replicated session.
-pub struct PartitionedTextRuntime<A, B, S, P, E, G, R, I, T, U, V>
+pub struct PartitionedTextRuntime<A, B, S, E, G, R, I, T, U, V>
 where
     B: CommunicationBackend,
     G: Borrow<B::CommunicationGroup>,
@@ -2314,7 +2047,6 @@ where
     commit_agreement: V,
     execution_rejection_agreed: bool,
     residency: ExecutionResidency,
-    bounded_policy: Option<P>,
     marker: PhantomData<fn(A, S)>,
 }
 
@@ -2405,7 +2137,7 @@ where
     }
 }
 
-impl<A, B, S, P, E, G, R, I, T, U, V> PartitionedTextRuntime<A, B, S, P, E, G, R, I, T, U, V>
+impl<A, B, S, E, G, R, I, T, U, V> PartitionedTextRuntime<A, B, S, E, G, R, I, T, U, V>
 where
     B: CommunicationBackend,
     G: Borrow<B::CommunicationGroup>,
@@ -2429,14 +2161,13 @@ where
         output_publisher: U,
         commit_agreement: V,
         residency: ExecutionResidency,
-        bounded_policy: Option<P>,
+        bounded: bool,
     ) -> Result<Self, PartitionExecutionError> {
         plan.validate_manifest(communication.manifest())?;
         if V::PHASE_FAILURE_AGREEMENT {
             plan.validate_exact_commit_agreement(communication.manifest())?;
         }
-        let bounded = !matches!(residency, ExecutionResidency::FullyResident);
-        if bounded != bounded_policy.is_some() {
+        if bounded == matches!(residency, ExecutionResidency::FullyResident) {
             return Err(PartitionExecutionError::ResidencyPolicyMismatch);
         }
         if (!V::PHASE_FAILURE_AGREEMENT
@@ -2463,7 +2194,6 @@ where
             commit_agreement,
             execution_rejection_agreed: false,
             residency,
-            bounded_policy,
             marker: PhantomData,
         })
     }
@@ -2496,12 +2226,11 @@ where
     }
 }
 
-impl<A, B, S, P, ExecutionPolicy, G, R, I, T, U, V>
+impl<A, B, S, ExecutionPolicy, G, R, I, T, U, V>
     PartitionedTextRuntime<
         A,
         B,
         S,
-        P,
         LayerwiseTraversalPartitionExecutor<A, B, S, ExecutionPolicy>,
         G,
         R,
@@ -2579,7 +2308,6 @@ impl<A, B, S, ExecutionPolicy, G, R, I, T, U, V>
                 A,
                 B,
                 S,
-                (),
                 LayerwiseTraversalPartitionExecutor<A, B, S, ExecutionPolicy>,
                 G,
                 R,
@@ -2717,7 +2445,7 @@ where
             .map_err(ReplicatedTextSessionError::Partition)
     }
 
-    type Runtime = PartitionedTextRuntime<A, B, S, Bounded, E, G, R, I, T, U, V>;
+    type Runtime = PartitionedTextRuntime<A, B, S, E, G, R, I, T, U, V>;
 
     fn observation_hooks(runtime: &Self::Runtime) -> crate::inspection::ObservationHookSupport {
         runtime.executor.observation_hooks().with_publication(true)
@@ -2755,8 +2483,10 @@ where
             .publish_parameter_replacements(values, active)
     }
 
-    fn bounded_policy(runtime: &Self::Runtime) -> Option<&Bounded> {
-        runtime.bounded_policy.as_ref()
+    fn parameter_telemetry(
+        runtime: &Self::Runtime,
+    ) -> Option<&dyn crate::layered::ParameterPolicyTelemetry> {
+        runtime.executor.parameter_policy()?.parameter_telemetry()
     }
 
     fn execution_residency(
@@ -2975,22 +2705,17 @@ where
                         }
                         if let Some(error) = local_error {
                             let route = wave.first().map(|index| same_group_routes[*index].route);
-                            runtime.communication.authority.fence_protocol_failure(
-                                CommunicationOperation::SendReceive,
-                                route.map_or(
-                                    DistributedExecutionPhase::Execution,
-                                    DistributedExecutionPhase::BoundarySourceCompletion,
-                                ),
-                                route,
-                            );
+                            runtime
+                                .communication
+                                .authority
+                                .fence(CommunicationOperation::SendReceive, route);
                             return Err(map_partition_route_error(error));
                         }
                         if let Some(route) = remote_completion_failure {
-                            runtime.communication.authority.fence_protocol_failure(
-                                CommunicationOperation::SendReceive,
-                                DistributedExecutionPhase::BoundarySourceCompletion(route),
-                                Some(route),
-                            );
+                            runtime
+                                .communication
+                                .authority
+                                .fence(CommunicationOperation::SendReceive, Some(route));
                             return Err(ReplicatedTextSessionError::Contract(
                                 PartitionExecutionError::RemotePhaseFailure(
                                     DistributedExecutionPhase::BoundarySourceCompletion(route),
@@ -3137,7 +2862,7 @@ where
                 if V::PHASE_FAILURE_AGREEMENT {
                     let manifest = runtime.communication.manifest();
                     let mut waves = Vec::new();
-                    for descriptor_range in manifest.route_submission_waves() {
+                    for descriptor_range in crate::communication::route_submission_waves(manifest) {
                         let wave = descriptor_range
                             .clone()
                             .filter_map(|index| {
@@ -3249,19 +2974,17 @@ where
                             )
                             .map_err(ReplicatedTextSessionError::Partition)?;
                         if let Some(error) = local_error {
-                            runtime.communication.authority.fence_protocol_failure(
-                                CommunicationOperation::SendReceive,
-                                DistributedExecutionPhase::BoundarySourceCompletion(phase_route),
-                                Some(phase_route),
-                            );
+                            runtime
+                                .communication
+                                .authority
+                                .fence(CommunicationOperation::SendReceive, Some(phase_route));
                             return Err(map_partition_route_error(error));
                         }
                         if !completed {
-                            runtime.communication.authority.fence_protocol_failure(
-                                CommunicationOperation::SendReceive,
-                                DistributedExecutionPhase::BoundarySourceCompletion(phase_route),
-                                Some(phase_route),
-                            );
+                            runtime
+                                .communication
+                                .authority
+                                .fence(CommunicationOperation::SendReceive, Some(phase_route));
                             return Err(ReplicatedTextSessionError::Contract(
                                 PartitionExecutionError::RemotePhaseFailure(
                                     DistributedExecutionPhase::BoundarySourceCompletion(
@@ -3351,11 +3074,7 @@ where
             .finish(pass, state, context)
             .map_err(ReplicatedTextSessionError::Architecture)?;
         let output = if runtime.plan.publication.is_some() {
-            let element = match runtime.plan.wire.activation_dtype() {
-                PipelineActivationDtype::Float32 => eredu_nn::TensorElementType::F32,
-                PipelineActivationDtype::Float16 => eredu_nn::TensorElementType::F16,
-                PipelineActivationDtype::Bfloat16 => eredu_nn::TensorElementType::Bf16,
-            };
+            let element = runtime.plan.wire.activation_dtype().element_type();
             // Owners and placeholders enter publication with the same retained
             // wire contract. Compute precision remains with local layer state.
             output.cast_float(element, context).map_err(|error| {
@@ -3573,7 +3292,7 @@ where
             && runtime.executor.has_cross_stage_collective_waves();
         let needs_recovery_agreement = cross_stage_failure
             && !runtime.execution_rejection_agreed
-            && (!local_success || runtime.communication.authority.is_poisoned());
+            && (!local_success || runtime.communication.authority.ensure_active().is_err());
         let agreed = if needs_recovery_agreement {
             match runtime.plan.commit_barrier {
                 Some(group) => runtime.commit_agreement.agree_phase_after_prior_failure(
@@ -3590,12 +3309,10 @@ where
         }
         .map_err(ReplicatedTextSessionError::Partition)?;
         if cross_stage_failure && !agreed && !runtime.execution_rejection_agreed {
-            let _ = runtime.communication.authority.submission_error(
-                "routed pipeline collective wave failed on at least one rank",
-                CommunicationOperation::AllGatherEven,
-                DistributedExecutionPhase::Execution,
-                None,
-            );
+            runtime
+                .communication
+                .authority
+                .fence(CommunicationOperation::AllGatherEven, None);
         }
         Ok(agreed)
     }
@@ -3867,21 +3584,12 @@ fn resolved_tagged_boundary_roles<T>(
     values: &[crate::ArchitectureBoundaryValue<T>],
     schema: &ResolvedBoundaryWireSchema,
     wire: PipelineWireContract,
-) -> Result<Vec<crate::BoundaryRoleContract>, PartitionExecutionError> {
+) -> Result<Vec<eredu_core::communication::BoundaryRoleContract>, PartitionExecutionError> {
     values
         .iter()
         .zip(schema.tensors())
         .map(|(value, spec)| {
-            let dtype = match spec.dtype() {
-                crate::BoundaryTensorDtype::Activation => match wire.activation_dtype() {
-                    PipelineActivationDtype::Float16 => TensorDtype::F16,
-                    PipelineActivationDtype::Bfloat16 => TensorDtype::Bf16,
-                    PipelineActivationDtype::Float32 => TensorDtype::F32,
-                },
-                crate::BoundaryTensorDtype::Uint32 => TensorDtype::U32,
-                crate::BoundaryTensorDtype::Int32 => TensorDtype::I32,
-                crate::BoundaryTensorDtype::Float32 => TensorDtype::F32,
-            };
+            let dtype = spec.dtype().tensor_dtype(wire.activation_dtype());
             let shape = spec
                 .shape()
                 .iter()
@@ -3892,7 +3600,7 @@ fn resolved_tagged_boundary_roles<T>(
                         "resolved boundary shape is not representable".into(),
                     )
                 })?;
-            crate::BoundaryRoleContract::new(value.role(), dtype, shape)
+            eredu_core::communication::BoundaryRoleContract::new(value.role(), dtype, shape)
                 .map_err(|error| PartitionExecutionError::BoundaryFraming(error.to_string()))
         })
         .collect()
@@ -3921,16 +3629,7 @@ where
             actual: shape,
         });
     }
-    let expected_dtype = match spec.dtype() {
-        crate::BoundaryTensorDtype::Activation => match wire.activation_dtype() {
-            PipelineActivationDtype::Float16 => TensorDtype::F16,
-            PipelineActivationDtype::Bfloat16 => TensorDtype::Bf16,
-            PipelineActivationDtype::Float32 => TensorDtype::F32,
-        },
-        crate::BoundaryTensorDtype::Uint32 => TensorDtype::U32,
-        crate::BoundaryTensorDtype::Int32 => TensorDtype::I32,
-        crate::BoundaryTensorDtype::Float32 => TensorDtype::F32,
-    };
+    let expected_dtype = spec.dtype().tensor_dtype(wire.activation_dtype());
     let actual = inspector.dtype(value);
     if actual != expected_dtype {
         return Err(PartitionExecutionError::BoundaryDtype {
@@ -4003,11 +3702,10 @@ pub enum PartitionExecutionError {
     },
     /// A prior timed-out or failed operation left this communicator unsafe for reuse.
     #[error(
-        "communication is poisoned by prior {operation:?} during {phase:?} (route {route:?}, disposition {cancellation:?})"
+        "communication is poisoned by prior {operation:?} (route {route:?}, disposition {cancellation:?})"
     )]
     CommunicationPoisoned {
         operation: CommunicationOperation,
-        phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
         cancellation: CompletionCancellationMode,
     },
@@ -4153,7 +3851,8 @@ pub enum PartitionExecutionError {
 #[cfg(test)]
 mod plan_tests {
     use super::*;
-    use crate::{CommunicationGroupRequirements, CommunicationTensorLimits};
+    use eredu_core::communication::PipelineActivationDtype;
+    use eredu_core::communication::{CommunicationGroupRequirements, CommunicationTensorLimits};
 
     #[test]
     fn publication_authority_preserves_selected_owner_and_group_local_rank() {
@@ -4245,7 +3944,7 @@ mod plan_tests {
         let requirement = CommunicationOperationRequirement::tensors(
             CommunicationOperation::SendReceive,
             [TensorDtype::F32],
-            crate::CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
+            eredu_core::communication::CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
             true,
         )
         .unwrap();

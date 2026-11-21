@@ -242,6 +242,16 @@ pub enum PhysicalMemorySemantics {
     Unknown,
 }
 
+/// Backend memory observations independent of the selected model.
+pub struct NativeMemoryFacts {
+    /// Current active allocations.
+    pub active_allocation_bytes: Observed<u64>,
+    /// Current allocator cache.
+    pub allocator_cache_bytes: Observed<u64>,
+    /// Relationship between device and host physical memory.
+    pub physical_semantics: PhysicalMemorySemantics,
+}
+
 /// Provenance of a process-global native allocator-cache policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1173,3 +1183,76 @@ mod tests {
 #[cfg(test)]
 #[path = "capability/append_tests.rs"]
 mod append_tests;
+
+/// Native allocator measurements for portable resource accounting.
+pub trait NativeAllocatorObservations {
+    /// Physical allocator and memory topology facts.
+    fn native_memory_facts() -> NativeMemoryFacts;
+    /// Available device and host memory observed without submitting model work.
+    fn available_memory() -> Result<crate::AvailableMemory, crate::BackendFailure>;
+    /// Native allocator cache limit, when known.
+    fn allocator_cache_limit() -> crate::Observed<u64>;
+}
+
+/// Host memory observation for a native allocator whose defaults remain untouched.
+pub struct InitialAllocatorCacheFacts {
+    /// Currently available bytes, when the host can establish them.
+    pub available_memory_bytes: Option<u64>,
+}
+
+/// Physical operations for setting an untouched allocator cache ceiling.
+pub trait NativeAllocatorCacheDefaults {
+    /// Observes the untouched default, or returns none if the limit is already set.
+    fn initial_cache_facts(
+        &self,
+    ) -> Result<Option<InitialAllocatorCacheFacts>, crate::BackendFailure>;
+
+    /// Applies the selected ceiling only if the native default remains untouched.
+    fn apply_initial_cache_ceiling(&self, ceiling: u64) -> Result<(), crate::BackendFailure>;
+}
+
+/// Exact native memory observations for a retained execution placement.
+pub trait NativePlacementMemory {
+    /// Native allocator facts for the retained placement.
+    type Memory: NativeAllocatorObservations;
+    /// Whether the admitted queue executes on the host.
+    fn host_execution(&self) -> Result<bool, crate::BackendFailure>;
+    /// Exact native upper bound for scratch storage, when exposed.
+    fn scratch_memory_upper_bound(&self) -> Option<u64>;
+}
+
+/// Backend calibration of native scratch storage per vocabulary entry.
+pub struct NativeWorkspaceEstimate {
+    /// Lower byte estimate.
+    pub lower: u64,
+    /// Upper byte estimate.
+    pub upper: u64,
+    /// Measurement or calibration assumptions.
+    pub evidence: &'static str,
+}
+
+/// Observations needed for forecasts without submitting or synchronizing work.
+pub trait NativeExecutionMemory<B: crate::BackendProvider> {
+    /// Exact allocator and physical memory observations for this backend.
+    type Allocator: NativeAllocatorObservations;
+    /// Native storage envelope for a vocabulary entry in one refinement invocation.
+    fn refinement_workspace() -> NativeWorkspaceEstimate;
+    /// Native storage envelope for a vocabulary entry in one speculative sampling invocation.
+    fn sampling_workspace() -> NativeWorkspaceEstimate;
+    /// Whether target and draft report memory from the same allocator.
+    fn shares_allocator() -> bool;
+    /// Whether native capture temporaries are released between predictions.
+    fn capture_completes_per_step() -> bool;
+    /// Whether the execution device is a host CPU.
+    fn host_execution(backend: &B) -> Result<bool, B::Error>;
+}
+
+/// Backend memory counters used by portable parameter memory reporting.
+pub struct ParameterMemoryFacts {
+    /// Process allocation observations.
+    pub native: crate::capability::NativeMemoryFacts,
+    /// Current capacity and available physical memory.
+    pub available: crate::capability::AvailableMemory,
+    /// Current native allocator cache limit.
+    pub allocator_cache_limit: crate::Observed<u64>,
+}

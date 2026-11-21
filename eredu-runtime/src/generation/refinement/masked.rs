@@ -1,6 +1,12 @@
 //! Scalar equations for confidence-based unmasking and float64 logit noise.
 
-use eredu_core::refinement::MaskedSampling;
+use std::num::NonZeroU32;
+
+use eredu_core::refinement::{
+    MaskedRefinementConfig, MaskedSampling, RefinementBackend, RefinementCanvas,
+};
+
+use super::{MaskedRefinementStep, RefinementError};
 
 /// Invalid numerical input rejected before a transfer can be published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -204,4 +210,166 @@ mod tests {
             Err(MaskedNumericalError::Scores)
         );
     }
+}
+
+pub(super) fn initialize_canvas<B: RefinementBackend>(
+    length: NonZeroU32,
+    mask_token: u32,
+    layout: Option<&RefinementCanvas>,
+    context: &B::Context,
+) -> Result<(B::Token, u32), RefinementError<B::Error>> {
+    let mut tokens = vec![mask_token; length.get() as usize];
+    if let Some(layout) = layout {
+        for (token, seed) in tokens.iter_mut().zip(&layout.seed_tokens) {
+            *token = seed.unwrap_or(mask_token);
+        }
+    }
+    let remaining = masked_count(&tokens, mask_token);
+    let canvas = B::materialize_tokens(&tokens, context).map_err(RefinementError::Backend)?;
+    Ok((canvas, remaining))
+}
+
+pub(super) fn invalidate_suffix<B: RefinementBackend>(
+    canvas: &B::Token,
+    position: usize,
+    token: &B::Token,
+    mask_token: u32,
+    pins: Option<(&B::Token, &B::Mask)>,
+    context: &B::Context,
+) -> Result<(B::Token, u32), RefinementError<B::Error>> {
+    let mut ids = B::read_tokens(canvas, context).map_err(RefinementError::Backend)?;
+    let token = B::read_tokens(token, context).map_err(RefinementError::Backend)?;
+    let [token] = token.as_slice() else {
+        return Err(RefinementError::Geometry);
+    };
+    let Some((current, suffix)) = ids.get_mut(position..).and_then(<[_]>::split_first_mut) else {
+        return Err(RefinementError::Geometry);
+    };
+    *current = *token;
+    suffix.fill(mask_token);
+    let len = ids.len();
+    if let Some((seeds, fixed)) = pins {
+        let seeds = B::read_tokens(seeds, context).map_err(RefinementError::Backend)?;
+        let fixed = B::read_mask(fixed, context).map_err(RefinementError::Backend)?;
+        if seeds.len() != len || fixed.len() != len {
+            return Err(RefinementError::Geometry);
+        }
+        for position in position + 1..len {
+            if fixed[position] {
+                ids[position] = seeds[position];
+            }
+        }
+    }
+    let remaining = masked_count(&ids, mask_token);
+    let canvas = B::materialize_tokens(&ids, context).map_err(RefinementError::Backend)?;
+    Ok((canvas, remaining))
+}
+
+fn masked_count(ids: &[u32], mask: u32) -> u32 {
+    ids.iter().filter(|&&id| id == mask).count() as u32
+}
+
+/// Runs the shared masked-token equations over exact native tensor transfers.
+pub(crate) fn step<B: RefinementBackend>(
+    canvas: &B::Token,
+    previous: Option<&B::Logits>,
+    logits: &B::Logits,
+    mask_token: u32,
+    config: MaskedRefinementConfig,
+    scheduled: u32,
+    random: &mut B::RandomState,
+    context: &B::Context,
+) -> Result<MaskedRefinementStep<B>, RefinementError<B::Error>> {
+    use RefinementError::{Backend, Geometry};
+
+    let options = config.options();
+    let [positions, width] = B::masked_score_shape(logits).ok_or(Geometry)?;
+    let elements = positions.checked_mul(width).ok_or(Geometry)?;
+    let mut ids = B::read_tokens(canvas, context).map_err(Backend)?;
+    if ids.len() != positions
+        || previous.is_some_and(|p| B::masked_score_shape(p) != Some([positions, width]))
+    {
+        return Err(Geometry);
+    }
+    let raw = B::read_scores(logits, context).map_err(Backend)?;
+    if raw.len() != elements || width == 0 || positions == 0 {
+        return Err(Geometry);
+    }
+    let rows = raw.chunks_exact(width);
+    let confidence_rows: Vec<Vec<f32>> = rows
+        .clone()
+        .map(|row| {
+            if options.sampling == MaskedSampling::Categorical && options.temperature > 0.0 {
+                row.iter()
+                    .map(|score| score / options.temperature)
+                    .collect()
+            } else {
+                row.to_vec()
+            }
+        })
+        .collect();
+    let draw_count = if options.temperature == 0.0 {
+        0
+    } else {
+        match options.sampling {
+            MaskedSampling::GumbelPower => elements,
+            MaskedSampling::Categorical => positions,
+        }
+    };
+    let mut draws = if draw_count == 0 {
+        Vec::new()
+    } else {
+        B::masked_uniforms(draw_count, random, context).map_err(Backend)?
+    }
+    .into_iter();
+    if draws.len() != draw_count {
+        return Err(MaskedNumericalError::Random.into());
+    }
+    let sampled: Vec<_> = rows
+        .map(|row| {
+            sample_position(row, options.sampling, options.temperature, || {
+                draws.next().expect("complete noise geometry")
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let eligible: Vec<_> = ids.iter().map(|&id| id == mask_token).collect();
+    let transfer = transfer_positions(
+        &confidence_rows,
+        &sampled,
+        &eligible,
+        scheduled,
+        options.confidence_threshold,
+    )?;
+    let previous = previous
+        .map(|scores| B::read_scores(scores, context))
+        .transpose()
+        .map_err(Backend)?;
+    if previous
+        .as_ref()
+        .is_some_and(|scores| scores.len() != elements)
+    {
+        return Err(Geometry);
+    }
+    let mut scores = Vec::with_capacity(elements);
+    for (position, id) in ids.iter_mut().enumerate() {
+        if transfer[position] {
+            *id = sampled[position];
+        }
+        let row = if eligible[position] {
+            &confidence_rows[position]
+        } else {
+            previous
+                .as_ref()
+                .map(|old| &old[position * width..(position + 1) * width])
+                .unwrap_or(&confidence_rows[position])
+        };
+        scores.extend_from_slice(row);
+    }
+
+    Ok(MaskedRefinementStep {
+        remaining: masked_count(&ids, mask_token),
+        canvas: B::materialize_tokens(&ids, context).map_err(Backend)?,
+        scores: B::materialize_scores(&scores, [positions, width], context).map_err(Backend)?,
+        transfer: B::materialize_mask(&transfer, context).map_err(Backend)?,
+    })
 }

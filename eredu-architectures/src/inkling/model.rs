@@ -34,10 +34,7 @@ use super::{
     composite_state_layout, mtp_state_layout, state_layout, AudioInput, AudioTower, DecoderLayer,
     LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
-use crate::{
-    composite_execution::{CompositeArchitecture, PreparedCompositeInput},
-    media_plan::InklingInputPartPlan,
-};
+use crate::{composite_execution::PreparedCompositeInput, media_plan::InklingInputPartPlan};
 
 /// Canonical static-role identity for the embedded prediction modules and
 /// their persistent state owner.
@@ -265,7 +262,7 @@ pub fn prepare_input<T: Tensor>(
                 projected.push(None);
             }
             InklingInputPartPlan::Projected { modality, .. } => {
-                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Embeddings(value) = part.payload() else {
                     return Err(Error::backend(
                         "Inkling admitted projected part lost its embedding payload",
                     ));
@@ -277,7 +274,7 @@ pub fn prepare_input<T: Tensor>(
             InklingInputPartPlan::Media {
                 modality, ingress, ..
             } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Inkling admitted media part lost its tensor payload",
                     ));
@@ -327,7 +324,8 @@ pub fn prepare_input<T: Tensor>(
     })
 }
 
-impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for InklingKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -335,7 +333,7 @@ where
 {
 }
 
-impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S> for InklingKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -362,7 +360,7 @@ where
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
 
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Self::Error> {
@@ -371,13 +369,13 @@ where
     type AdmissionConfig = ModelArgs;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.kernel().args.clone()
+        self.args.clone()
     }
 
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<
         crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         eredu_core::CapabilityError,
@@ -417,7 +415,6 @@ where
         };
         let continuation = if group == 0 && mode.is_active() {
             let vision = self
-                .kernel()
                 .args
                 .vision_config
                 .as_ref()
@@ -463,7 +460,7 @@ where
                         None
                     }
                 }),
-            self.kernel().args.text_config.hidden_size,
+            self.args.text_config.hidden_size,
             tensor_partitions,
         )
     }
@@ -476,7 +473,7 @@ where
     }
 
     fn routed_tensor_output_width(&self) -> Result<Option<usize>, Self::Error> {
-        usize::try_from(self.kernel().args.text_config.vocab_size)
+        usize::try_from(self.args.text_config.vocab_size)
             .map(Some)
             .map_err(|_| Error::backend("Inkling physical vocabulary width exceeds usize"))
     }

@@ -8,12 +8,44 @@ use eredu_core::{
     SpeculativePrefill, Submission,
 };
 
+mod installed;
+mod memory_observation;
+pub use installed::{
+    InstalledSpeculationPrimitives, MappedSpeculativeTargetObserver, SpeculativeTargetObserver,
+};
 mod refinement;
 pub use refinement::{
     NoTargetRefinement, SharedTargetRefinement, SharedTargetRefinementState, TargetRefinement,
 };
+mod batch;
+mod discovery;
+pub use batch::{
+    execute_resident_batch, BatchCapture, BatchQueue, BatchSession, ResidentBatchMechanisms,
+    ResidentBatchRoute,
+};
+pub use discovery::{validate_control_capture, SpeculativeGenerationBackend};
+mod embedded_batch;
+pub use embedded_batch::execute_embedded_batch;
+mod external_batch;
+pub use external_batch::{
+    admit_external_draft_scope, execute_external_batch, BatchDraft, ExternalBatchMechanisms,
+};
 mod causal;
 pub use causal::{CausalExecutor, CausalSeed};
+
+/// Supplies the native mechanisms that the portable speculative batch driver composes.
+pub trait SpeculativeBatchBinding: eredu_core::TextGenerationBackend {
+    /// Native bindings for resident, embedded, and external batch execution.
+    type Mechanisms: ExternalBatchMechanisms<Self>;
+}
+
+impl<B> SpeculativeBatchBinding for B
+where
+    B: eredu_core::TextGenerationBackend + eredu_core::session_authority::DraftNativeResources,
+    B::TargetOperators: ExternalBatchMechanisms<B>,
+{
+    type Mechanisms = B::TargetOperators;
+}
 
 /// Attribution of a model invocation within an independent-draft transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +120,11 @@ pub trait AutoregressiveMechanisms {
     type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Retained native bytes for an immutable verification output.
+    fn verification_output_bytes(_output: &Self::Output) -> Option<u64> {
+        None
+    }
 
     /// Retention/copy allowance for a handoff's immutable causal score row.
     fn logits_snapshot_estimate(_logits: &Self::Logits) -> Option<SnapshotEstimate> {
@@ -252,11 +289,19 @@ impl<'a, M: AutoregressiveMechanisms, R: TargetRefinement<M>> AutoregressiveExec
             refinement,
         }
     }
-    /// Realizes an isolated pair of ordinary lane caches.
-    pub fn new_cache(
+}
+
+impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>>
+    eredu_core::speculative::SpeculativeCacheFactory for AutoregressiveExecutor<'_, M, R>
+{
+    fn create_cache<'context>(
         &mut self,
-        context: M::Context<'_>,
-    ) -> Result<AutoregressiveCache<M::State>, M::Error> {
+        _: &(),
+        context: Self::Context<'context>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'context,
+    {
         Ok(AutoregressiveCache {
             target: M::empty(self.target, AutoregressivePass::TargetPrefill, context)?,
             draft: M::empty(self.draft, AutoregressivePass::DraftPrefill, context)?,

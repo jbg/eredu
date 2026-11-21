@@ -1,5 +1,7 @@
 //! Explicit backend selection for metadata-only application inspection.
 
+pub use eredu_core::communication::CommunicationCompletionPolicy;
+pub use eredu_core::communication::PipelineActivationDtype;
 pub use eredu_core::residency::{
     CacheEvictionPolicy, OffloadConfig, OffloadError, ParameterConversionRetentionPolicy,
 };
@@ -11,10 +13,10 @@ pub use eredu_core::{
     ParallelTopology, QuantizationRequest, SessionCapabilities,
 };
 pub use eredu_runtime::{
-    CacheResidencyPolicy, CommunicationCompletionPolicy, DenseDiskStreamLoadOptions,
-    DraftingLoadRequest, LayerWeightResidency, LayerwiseLoadOptions, NormalizedLoadRequest,
-    NormalizedLoadRequestError, OrdinaryWeightResidency, PagedCacheOptions, ParallelLoadRequest,
-    ParameterBankLoadOptions, PipelineActivationDtype, PipelineWireContract, WeightResidency,
+    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DraftingLoadRequest, LayerWeightResidency,
+    LayerwiseLoadOptions, NormalizedLoadRequest, NormalizedLoadRequestError,
+    OrdinaryWeightResidency, PagedCacheOptions, ParallelLoadRequest, ParameterBankLoadOptions,
+    PipelineWireContract, WeightResidency,
 };
 
 pub use eredu_architectures::inspect_model_metadata;

@@ -1,8 +1,9 @@
 //! Cold rank-local projection of independently addressable parameter members.
 
 use super::{AddressableBankMember, AddressableBankMemberError, AddressableBankParameter};
-use crate::{BindingPlacementError, LocalModelLayout, ResidencyDeclarationError, WeightBinding};
+use crate::{BindingPlacementError, LocalModelLayout};
 use eredu_checkpoint::recipe::{RecipeCatalog, RecipeError};
+use eredu_core::residency::parameter_binding::{ResidencyDeclarationError, WeightBinding};
 
 /// Failure projecting selected member recipes into their remaining local placement.
 #[derive(Debug, thiserror::Error)]

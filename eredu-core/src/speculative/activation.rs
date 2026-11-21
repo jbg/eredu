@@ -3,7 +3,6 @@ use super::SpeculativeActivationPhase;
 use crate::{capture::*, intervention::*};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
-#[cfg(feature = "tensor-capture")]
 mod tests;
 
 /// Wire version for internal speculative capture plans and discovery.
@@ -77,7 +76,6 @@ pub struct SpeculativeActivationDiscovery {
 
 /// Serializable internal capture/edit request, separate from sampler logits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct SpeculativeActivationPlan {
     /// Wire version; see `SPECULATIVE_ACTIVATION_SCHEMA_VERSION`.
     pub schema_version: u32,
@@ -92,7 +90,6 @@ pub struct SpeculativeActivationPlan {
 /// Immutable authority bound to actual loaded model, execution and session facts.
 /// Snapshot restoration does not recreate its cumulative runtime allowance.
 #[derive(Debug, Clone)]
-#[cfg(feature = "tensor-capture")]
 pub struct AdmittedSpeculativeActivations {
     identity: String,
     execution_identity: String,
@@ -104,7 +101,6 @@ pub struct AdmittedSpeculativeActivations {
     intervention_scopes: Vec<SpeculativeCaptureScope>,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl SpeculativeActivationPlan {
     /// Validates exact invocation geometry, loaded support and all scope joins
     /// before a native observer may be constructed. Native estimators still
@@ -200,7 +196,6 @@ impl SpeculativeActivationPlan {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl AdmittedSpeculativeActivations {
     /// Stable digest of this exact session, geometry, selections, edits and scopes.
     pub fn identity(&self) -> &str {
@@ -239,7 +234,6 @@ impl AdmittedSpeculativeActivations {
         self.captures.is_empty() && self.interventions.is_empty()
     }
     /// Rechecks all retained authority against the actual loaded call path.
-    #[cfg(feature = "tensor-capture")]
     pub fn validate(&self, discovery: &SpeculativeActivationDiscovery) -> Result<(), CaptureError> {
         let current = SpeculativeActivationPlan {
             schema_version: SPECULATIVE_ACTIVATION_SCHEMA_VERSION,

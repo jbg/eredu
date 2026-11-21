@@ -5,12 +5,14 @@ use super::{
     perception_layered::{validate_perception_partition, PerceptionBoundarySchema},
     perception_preparation::PreparedPerceptionPartitionBindings,
 };
+use eredu_core::communication::CommunicationManifest;
+use eredu_core::communication::PipelineActivationDtype;
 use eredu_core::{BackendFailure, CollectiveGroupId};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend};
 use eredu_runtime::{
-    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition, CommunicationManifest,
+    ArchitectureBoundary, ArchitectureGroupKind, ArchitecturePartition,
     ComponentPipelinePreparationError, ComponentRankMechanisms, LayerWeightResidency,
-    LayerwiseModelMetadata, PartitionedExecutionPlan, PipelineActivationDtype,
+    LayerwiseModelMetadata, PartitionedExecutionPlan,
 };
 
 use super::perception_stage::{PerceptionPipeline, PerceptionPipelineArchitecture};
@@ -126,7 +128,7 @@ impl PreparedPerceptionPipelineBindings {
         H: ComponentRankMechanisms<B, PerceptionRuntimeState<B::Tensor>, C>,
     {
         let (pipeline, dimensions, layout, state) = self.into_pipeline::<B>(residency)?;
-        let (execution, metadata) = mechanisms.bind_pipeline(pipeline, communication)?;
+        let (execution, metadata) = pipeline.bind(mechanisms, communication)?;
         Ok((
             PerceptionPipeline::new(execution, dimensions, layout, state),
             metadata,

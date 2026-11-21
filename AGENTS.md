@@ -5,25 +5,32 @@ and dependency direction; directory names alone are not an architectural API.
 
 ## Dependency direction
 
-Production crates occupy these dependency strata, from dependency roots to
+The required production dependency direction runs from dependency roots to
 applications:
 
 ```text
 foundations:          eredu-gguf / eredu-nn-macros
 storage and text:     eredu-checkpoint / eredu-text
-portable contracts:  eredu-core / eredu-nn
+portable contracts:  eredu-nn / eredu-core (core may use neural contracts)
 portable mechanisms: eredu-media / eredu-runtime
 portable families:   eredu-codec / eredu-architectures
-native realization:  eredu-backend-* (currently eredu-backend-mlx)
-facade:               eredu
+native mechanisms:    eredu-backend-* (depend on lower-level contracts)
+model orchestration:  eredu/src/runtime (backend-neutral)
+facade:               eredu/src/api and feature-gated backend wiring
 application policy:   eredu-recommendation
 applications:         eredu-cli / examples / downstream applications
 ```
 
-A later stratum may depend on an earlier one; placement on the same line does
-not itself authorize a dependency. Native runtime crates such as `safemlx` are
-backend-specific dependencies and never dependencies of the
-portable strata. Validation tooling such as `eredu-evaluation` may depend on
+A later stratum may depend on an earlier one subject to the boundaries below.
+Portable runtime mechanisms, model families, and native implementations meet
+through lower-level contracts. Native crates have no production dependency on
+`eredu-runtime` or the family stratum. Call direction follows ownership. The
+portable driver calls the runtime and family code, and that code calls native
+mechanisms through neutral contracts. Native code does not invoke portable
+session constructors, model execution drivers, or scheduling policy, including
+through callbacks that transfer control of those workflows into a backend.
+Native runtime crates such as `safemlx` are backend-specific dependencies
+and never dependencies of the portable strata. Validation tooling such as `eredu-evaluation` may depend on
 portable families, but production facade and backend code must not depend on
 it.
 
@@ -40,26 +47,38 @@ it.
   backend-neutral and must not depend on `eredu`, a concrete `eredu-backend-*`
   crate, `safemlx`, or another native accelerator runtime. Target-specific
   operating-system or host-library support for portable facilities is allowed.
+- `eredu-nn` owns neutral tensor and neural operator contracts and reusable
+  neural components. Family-specific equations and parameter policy belong in
+  the family implementation.
 - `eredu-architectures` owns model-family configuration, checkpoint schemas,
   parameter topology, module construction, state geometry, parallel semantic
   plans, processor request policy, cold execution-class selection, prepared
   source roles, total prepared-execution construction, typed state-profile
   dispatch, architecture-aware inspection, and embedding/layer/output
-  execution. Backends supply native contexts, typed binding visitors and final
-  executable adapters to that construction driver, not semantic branch logic.
+  execution. Family construction and execution compose neutral operators,
+  components, and runtime mechanisms with family-specific logic.
   It may use neutral backend traits, but must not import `safemlx`,
   `eredu::backend`, or another concrete backend.
 - `eredu-runtime` owns execution-plan normalization, portable load policy,
   selected-task residency sizing, neutral residency telemetry, and
-  model-independent mechanism selection. It synthesizes capabilities from
+  model-independent mechanism selection. It owns the live cache catalog, leases,
+  append and truncation transactions, tier eviction, transfer scheduling, spill
+  publication, and budget accounting. Native cache operations supply exact
+  tensor views, buffers, copies, queues, and completion. Runtime synthesizes
+  capabilities from
   exact single-candidate support predicates and backend mechanism facts.
   Backends inject diagnostics choices and native observations; they do not
   repeat portable plan conversion or requirement enumeration.
   Cold selection and inspection consume backend capability facts but never a
   native device, stream, tensor, group, or completion object.
-- `eredu-core` owns exact session-admission comparison and move-only submission
-  authority. Backends retain the neutral lease alongside native completion
-  resources and establish safe completion, terminal failure, or teardown before
+- `eredu-core` owns the neutral submission and completion contracts, exact
+  session-admission comparison, and move-only submission authority. Portable
+  scheduling chooses when and where to submit work. Core also owns the
+  collective submission and exact pipeline transport contracts. Runtime owns
+  manifest projection and chooses when to use the native operators.
+  Backends supply queue creation, submission, dependency ordering, and resource
+  retention. They retain the neutral lease alongside native completion resources
+  and establish safe completion, terminal failure, or teardown before
   releasing it. A polling error alone is not a universal completion signal.
   It also owns versioned logical architecture and observation discovery contracts.
   Architecture-layer projections supply family semantics; runtime support reports
@@ -72,40 +91,42 @@ it.
   construction. It consumes general neutral tensor, parameter, and runtime
   contracts; a concrete backend supplies ordinary materialization and neural
   mechanisms rather than a codec-family implementation.
-- Every concrete `eredu-backend-*` crate owns its native tensors, operators,
-  clients/devices, streams or queues, completion objects, materialization,
-  cache storage, transfers, collectives, exact hardware facts, and final typed
-  binding/erasure. It may bind architecture-declared parameters and assemble
-  native sessions or distributed executables, but must consume the retained
-  neutral selection and prepared sources without reopening artifacts or
-  reconstructing semantic branches. A backend must not own model-family
-  configuration, checkpoint naming policy, layer equations, family-specific
-  state geometry, portable inspection state, source-format dispatch,
-  tokenizer/generation policy, or application scheduling.
-- `eredu-backend-mlx` is the current concrete realization. It owns reusable
-  MLX tensors, operators, streams, completion objects, materialization, cache
-  storage, transfers, and collectives through `safemlx`. Its MLX composition
-  may bind architecture-declared parameters and assemble sessions or
-  distributed executables. Its cold adapters translate public options once,
-  report exact side-effect-free capability facts, bind native rank/device
-  resources, and
-  consume the retained neutral selection and prepared sources without
-  reopening artifacts or reconstructing semantic branches. Reusable backend
-  modules must not own model-family configuration, checkpoint naming policy,
-  layer equations, family-specific state geometry, portable inspection state,
-  or source-format dispatch. The crate must not depend on the `eredu` facade.
-- `eredu/src/api` and `eredu/src/runtime` own backend-independent facade
-  orchestration. Production backend code must not import them. A backend's
-  public adapter may depend on narrow composition-owned executable or session
-  types needed to implement the neutral backend traits; that exception does
-  not transfer tokenizer, generation, scheduling, or application policy into
-  the backend.
+- The backend-independent model driver in `eredu/src/runtime` owns the
+  artifact-to-session workflow. It coordinates checkpoint inspection with
+  family admission, provides backend mechanism facts to portable selection,
+  prepares the selected checkpoint sources, and invokes architecture-owned
+  construction and advances model execution through neutral interfaces.
+  `eredu-runtime` supplies reusable construction, execution, and scheduling
+  mechanisms to this driver. The driver is shared across
+  backends and across applicable resident, bounded, distributed, and
+  controlled execution paths.
+- Every concrete `eredu-backend-*` crate owns native tensors, operators,
+  devices, streams or queues, completion, materialization, cache storage,
+  transfers, collectives, exact hardware facts, and native resource lifetime.
+  It implements neutral mechanism contracts and accepts the exact binding
+  inputs it needs. Report exact side-effect-free capability facts and
+  materialize from prepared sources without rediscovering artifacts.
+  Production backend crates must not depend on
+  `eredu-runtime`, `eredu-architectures`, `eredu-codec`, family implementation crates, or
+  the `eredu` facade. Backend development targets follow the same dependency
+  direction. Backends must not select a model resolver, dispatch on family or
+  checkpoint format, or own the artifact-to-session workflow.
+  `eredu-backend-mlx` implements these mechanisms through `safemlx`.
+- `eredu/src/api` exposes the application API. Feature-gated wiring supplies
+  a concrete implementation of neutral mechanism contracts to the portable
+  driver. Registry-facing binding, discovery, capture orchestration, and
+  speculative execution adapters are backend-independent and work through
+  those contracts. Code that depends on MLX or another concrete backend must
+  not import or call the architecture registry or family implementations,
+  including in a separate integration crate. Native specialization may
+  depend on operator or state requirements.
 - `eredu-media` owns portable host audio, image, and video validation and
   processing. It may depend on optional host libraries, but never allocates a
   backend tensor, selects a device or stream, or depends on a concrete backend.
 - `eredu-evaluation` owns reusable evaluation fixtures, metrics, and comparison
-  policy. Concrete backend tests and examples may use it as a development
-  dependency; production backend mechanisms must not call into it.
+  policy. Shared integration and family acceptance that need a real backend
+  run in the portable composition crate behind its backend feature and may
+  use evaluation as a development dependency.
 - `eredu-recommendation` owns model discovery, benchmark attribution, catalogue
   construction, and application recommendation policy above the portable facade.
   It consumes retained inspection and forecast contracts, never implements family
@@ -131,17 +152,18 @@ it.
 - `eredu` with `default-features = false` is the portable facade. Native MLX,
   other concrete backends, accelerator runtimes, and optional host-media
   dependencies must remain feature-gated. The `mlx` feature selects the current
-  adapter; `metal`, `cuda`, and `nccl` configure it only when selected. Image
+  backend; `metal`, `cuda`, and `nccl` configure it only when selected. Image
   and audio features enable portable host processing plus conversion in an
   enabled backend, not backend ownership of media semantics.
 - `eredu-nn` and `eredu-codec` expose no concrete-backend features, including
   under `--all-features`. MLX implementations belong in `eredu-backend-mlx`.
 - `eredu-media` keeps image and audio dependencies optional. Consumers forward
   only the host-media features they need.
-- Feature-gate concrete backend adapters and backend-specific composition, not
-  the family they adapt. If a family integration currently mixes neutral and
-  native code, separate those surfaces instead of hiding the family behind the
-  native feature.
+- Model-family features, when introduced, default to the full family set in
+  the facade and select portable family admission, implementation, and
+  required shared components. Family features must not enable native backends
+  or be forwarded to them. Keep backend selection, backend mechanism features,
+  and portable family selection independent.
 - Portable facade and conformance tests must use neutral traits and mock
   backends. Do not make them import a concrete backend implementation.
 - New backend capabilities should be expressed as neutral associated types,

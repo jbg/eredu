@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use eredu_runtime::{PenaltyConfig, SamplingBackend, TokenDomain};
+use eredu_core::sampling::{PenaltyConfig, SamplingBackend, TokenDomain};
 use safemlx::{
     argmax_axis, array, error::Exception, ops::indexing::TryIndexOp, random, Array, Dtype, Stream,
 };
@@ -340,6 +340,3 @@ fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exc
     let minimum = Array::from_f32(f32::NEG_INFINITY);
     safemlx::ops::r#where(mask, minimum, logits, stream)
 }
-
-#[cfg(test)]
-mod tests;

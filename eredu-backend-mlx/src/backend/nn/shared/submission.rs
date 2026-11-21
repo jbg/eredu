@@ -1,5 +1,10 @@
 use super::*;
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use eredu_core::communication::{
+    BarrierBackend, BroadcastBackend, CommunicationBackend, CommunicationPeerCounts,
+    EvenGatherBackend, FailureAgreementBackend, PointToPointBackend, RoleExactBoundaryValue,
+    SumReductionBackend, UnevenGatherBackend, VariableAllToAllBackend,
+};
 use std::{cell::Cell, rc::Rc};
 
 struct HostResourceNode {
@@ -437,14 +442,6 @@ impl CommunicationBackend for MlxNeuralBackend {
             .into_iter()
             .map(|value| value.as_array().clone())
             .collect::<Vec<_>>();
-        #[cfg(test)]
-        if std::env::var_os("EREDU_TEST_PARTITION_COLLECTIVE_TRACE").is_some() {
-            eprintln!(
-                "partition-schedule rank={} operation=local-dependencies shapes={:?}",
-                std::env::var("MLX_RANK").unwrap_or_else(|_| "?".into()),
-                outputs.iter().map(Array::shape).collect::<Vec<_>>(),
-            );
-        }
         let retained = outputs.clone();
         let completion = MlxCommunicationCompletion::submit(
             outputs.iter(),
@@ -465,7 +462,7 @@ impl CommunicationBackend for MlxNeuralBackend {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MlxCommunicationTensorMetadata;
 
-impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
+impl eredu_core::communication::CommunicationTensorMetadata<MlxNeuralBackend>
     for MlxCommunicationTensorMetadata
 {
     fn dtype(&self, tensor: &MlxTensor) -> TensorDtype {
@@ -565,8 +562,6 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
         group: &Group,
         executor: &Stream,
     ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::variable_all_to_all_submission();
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -682,7 +677,7 @@ impl BroadcastBackend for MlxNeuralBackend {
                 })?
         };
         let output = crate::backend::runtime::distributed::all_sum_for(
-            eredu_runtime::CommunicationOperation::Broadcast,
+            eredu_core::communication::CommunicationOperation::Broadcast,
             &contribution,
             group,
             executor,
@@ -713,7 +708,7 @@ impl BarrierBackend for MlxNeuralBackend {
         }
         let token = zeros_dtype(&[], Dtype::Float32, executor)?;
         let completed = crate::backend::runtime::distributed::payload_free_all_sum_for(
-            eredu_runtime::CommunicationOperation::Barrier,
+            eredu_core::communication::CommunicationOperation::Barrier,
             &token,
             group,
             executor,
@@ -769,7 +764,7 @@ impl FailureAgreementBackend for MlxNeuralBackend {
             Array::from_slice(&[i32::from(local_success)], &[1])
         };
         let output = crate::backend::runtime::distributed::payload_free_all_sum_for(
-            eredu_runtime::CommunicationOperation::FailureAgreement,
+            eredu_core::communication::CommunicationOperation::FailureAgreement,
             &input,
             group,
             executor,
@@ -941,7 +936,7 @@ pub(super) fn decode_boundary_payload(
         .reshape(prototype.shape(), executor)
 }
 
-impl TransferBackend for MlxNeuralBackend {
+impl ParameterTransferBackend for MlxNeuralBackend {
     type HostBuffer = Arc<ImmutableHostTransferBuffer>;
     type Transfer = MlxSubmissionCompletion;
     type TransferError = safemlx::error::Exception;

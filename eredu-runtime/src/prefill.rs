@@ -3,6 +3,9 @@ use crate::{LayeredArchitecture, RuntimeState};
 use eredu_nn::NeuralBackend;
 use std::{ops::Range, sync::Arc};
 
+mod erased;
+pub use erased::{ErasedPrefillCursor, PrefillCursorError};
+
 /// Architecture-owned input construction and immutable context between prefill steps.
 pub trait ChunkedPrefillRequest<A, B, S>
 where

@@ -538,6 +538,44 @@ pub enum BackendError {
     },
 }
 
+/// Submits backend-native work and retains values through exact completion.
+pub trait SubmissionBackend: eredu_nn::NeuralBackend {
+    /// Backend executor, queue, stream, or equivalent submission context.
+    type Executor: ?Sized;
+    /// Owned executor used for an independently schedulable graph lane.
+    type OwnedExecutor: std::borrow::Borrow<Self::Executor>;
+    /// Exact completion object for one submission.
+    type Completion: Completion;
+
+    /// Creates independently schedulable executors on the same backend device.
+    fn fork_executors(
+        executor: &Self::Executor,
+        count: usize,
+    ) -> Result<Vec<Self::OwnedExecutor>, <Self::Completion as Completion>::Error>;
+
+    /// Submits evaluation of backend-native values on one executor.
+    fn submit<'a, I>(
+        executor: &Self::Executor,
+        values: I,
+    ) -> Result<Self::Completion, <Self::Completion as Completion>::Error>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>;
+
+    /// Orders future work on `executor` after an exact producer completion.
+    fn order_after(
+        completion: &Self::Completion,
+        executor: &Self::Executor,
+    ) -> Result<(), <Self::Completion as Completion>::Error>;
+
+    /// Retains an owned value until `completion` has completed exactly.
+    fn retain_until_complete<T: Send + 'static>(
+        executor: &Self::Executor,
+        completion: &Self::Completion,
+        value: T,
+    ) -> Result<(), <Self::Completion as Completion>::Error>;
+}
+
 /// Exact completion owned by one backend submission.
 pub trait Completion {
     /// Error produced while observing the completion.
@@ -755,6 +793,59 @@ pub struct Submission<T, C> {
     pub completion: C,
 }
 
+/// Native completion of a text invocation. The scope must retain the resource
+/// root and submission lease through failure, unwinding, and cancellation.
+pub trait TextSubmissionScope<O, E>: Sized {
+    /// Completion of this exact invocation.
+    type Completion: Completion<Error = E>;
+
+    /// Keeps the resource root alive through a dropped or unwound invocation.
+    fn abandon(self, root: std::rc::Rc<dyn std::any::Any>);
+
+    /// Seals and publishes the invocation into its native completion.
+    fn finish(
+        self,
+        root: std::rc::Rc<dyn std::any::Any>,
+        output: Result<O, E>,
+    ) -> Result<Submission<O, Self::Completion>, E>;
+
+    /// Settles and checks token-validation work before publishing synchronous state.
+    fn validate_tokens(&mut self) -> Result<(), E>;
+
+    /// Establishes completion of a synchronous state transaction.
+    fn settle<T>(self, root: std::rc::Rc<dyn std::any::Any>, result: Result<T, E>) -> Result<T, E>;
+}
+
+/// Native submission authority for synchronous transactions on an installed model.
+pub trait TextTransactionMechanisms: crate::session_authority::SessionRetirement {
+    /// Scores retained by the native submission scope.
+    type Scores;
+    /// Exact native scope for settle or abandonment.
+    type Scope<'a>: TextSubmissionScope<Self::Scores, Self::Error>
+    where
+        Self: 'a;
+
+    /// Opens a scope without entering any model workflow.
+    fn open_transaction(
+        &self,
+        lease: crate::SubmissionLease,
+    ) -> Result<Self::Scope<'_>, Self::Error>;
+
+    /// Translates a portable rejection into the backend's operation error.
+    fn transaction_error(error: TextTransactionError) -> Self::Error;
+}
+
+/// Preflight rejection before any transaction may mutate the executable.
+#[derive(Debug, thiserror::Error)]
+pub enum TextTransactionError {
+    /// The resource root is shared by outstanding work.
+    #[error("installed text resources are still retained by a submission")]
+    Busy,
+    /// A preparation result failed to propagate the local rejection.
+    #[error("model operation preparation accepted absent submission authority")]
+    AbsentAuthority,
+}
+
 impl<T, C> Submission<T, C>
 where
     C: Completion,
@@ -851,14 +942,8 @@ impl<M> std::ops::DerefMut for PreparedModel<M> {
     }
 }
 
-/// One backend selected for an entire prepared model and all its sessions.
+/// Native backend identity, device capabilities, and prepared model resources.
 pub trait BackendProvider: Sized {
-    /// Portable model preparation request.
-    type ModelConfig;
-    /// Opaque backend model/executable.
-    type Model;
-    /// Opaque backend session/cache state and execution implementation.
-    type Session: BackendSession<Self>;
     /// Backend error.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -866,21 +951,6 @@ pub trait BackendProvider: Sized {
     fn descriptor(&self) -> BackendDescriptor;
     /// Discovers devices and their fail-closed capabilities.
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error>;
-    /// Loads, compiles, or materializes a model for this backend.
-    fn prepare_model(
-        &self,
-        config: Self::ModelConfig,
-    ) -> Result<PreparedModel<Self::Model>, Self::Error>;
-    /// Consumes a prepared model into one backend-owned execution session.
-    ///
-    /// The executable and its mutable cache state have one owner after this
-    /// call. This prevents callers from pairing session state with a different
-    /// model or submitting the same mutable executable through two sessions.
-    fn create_session(
-        &self,
-        model: PreparedModel<Self::Model>,
-    ) -> Result<Self::Session, Self::Error>;
-
     /// Constructs an internal backend error for an admission/realization mismatch.
     ///
     /// Backends whose prepared and realized reports cannot differ may leave
@@ -894,53 +964,169 @@ pub trait BackendProvider: Sized {
     }
 }
 
-/// Artifact-loading extension for a selected whole-model backend.
-///
-/// Core owns checkpoint inspection and preparation planning. Implementations
-/// translate the resulting neutral plan and their associated load options into
-/// the backend's concrete [`BackendProvider::ModelConfig`]. Tensor materialization
-/// remains entirely inside [`BackendProvider::prepare_model`].
+/// Portable projection of separately supplied policy inputs and native facts.
+pub trait AdmissionFacts: Sized {
+    /// Inputs available without inspecting or materializing an artifact.
+    type Inputs;
+
+    /// Forms the facts consumed by a portable admission implementation.
+    fn from_inputs(inputs: Self::Inputs) -> Self;
+}
+
+/// Portable cold selection for a directly loaded artifact.
+pub trait ModelLoadAdmission<P> {
+    /// Architecture-owned source preparation associated with this admission.
+    type SourcePreparation: ModelSourcePreparation<P>;
+    /// Reason portable selection failed.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Selects a preparation for this inspection without materializing sources.
+    fn select(
+        self,
+        inspection: &ArtifactInspection<P>,
+    ) -> Result<Self::SourcePreparation, Self::Error>;
+}
+
+/// Portable transformation of an admitted artifact into prepared sources.
+pub trait ModelSourcePreparation<P> {
+    /// Exact sources supplied to backend binding.
+    type Prepared;
+
+    /// Failure to prepare the admitted sources.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Returns the preparation admission retained before materialization.
+    fn admission(&self) -> PreparationAdmission;
+
+    /// Prepares sources from the exact retained plan and source selection.
+    fn prepare(self, plan: ModelPreparationPlan<P>) -> Result<Self::Prepared, Self::Error>;
+}
+
+/// A portable prepared source that can bind to a backend's model configuration.
+pub trait BindModelSources<B: ModelLoadingBackend> {
+    /// Executable and retained resources produced by this source binding.
+    type Model;
+
+    /// Constructs the selected executable with the backend's bound mechanisms.
+    fn construct_model(
+        self,
+        backend: &B,
+        placement: B::Binding,
+    ) -> Result<PreparedModel<Self::Model>, BackendFailure>;
+}
+
+/// Loaded model assembled by the source preparation selected for an artifact.
+pub type LoadedModelFor<B, P, S> =
+    <<S as ModelSourcePreparation<P>>::Prepared as BindModelSources<B>>::Model;
+
+/// Portable source preparation paired with opaque native placement.
+#[derive(Debug, Clone)]
+pub struct SelectedModelBinding<S, N> {
+    source: S,
+    native: N,
+}
+
+impl<S, N> SelectedModelBinding<S, N> {
+    /// Pairs a portable selection with its native placement.
+    pub(crate) const fn new(source: S, native: N) -> Self {
+        Self { source, native }
+    }
+
+    /// Borrows the selected native placement.
+    pub const fn native(&self) -> &N {
+        &self.native
+    }
+
+    /// Consumes the pair for source preparation and native binding.
+    pub fn into_parts(self) -> (S, N) {
+        (self.source, self.native)
+    }
+}
+
+impl<S, N> AsRef<S> for SelectedModelBinding<S, N> {
+    fn as_ref(&self) -> &S {
+        &self.source
+    }
+}
+
+/// Cold direct-load request and independent backend device assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelLoadOptions<R, P> {
+    request: R,
+    placement: Option<P>,
+}
+
+impl<R: Default, P> Default for ModelLoadOptions<R, P> {
+    fn default() -> Self {
+        Self::new(R::default())
+    }
+}
+
+impl<R, P> ModelLoadOptions<R, P> {
+    /// Selects the portable request for an already realized backend.
+    pub const fn new(request: R) -> Self {
+        Self {
+            request,
+            placement: None,
+        }
+    }
+
+    /// Supplies the native device assignment independently of portable rank policy.
+    pub fn with_placement(mut self, placement: P) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+
+    /// Borrows the portable request.
+    pub const fn request(&self) -> &R {
+        &self.request
+    }
+
+    /// Borrows the optional native device assignment.
+    pub const fn placement(&self) -> Option<&P> {
+        self.placement.as_ref()
+    }
+}
+
+/// Portable facts projected from a normalized request and exact mechanism inputs.
+pub trait DirectLoadFacts {
+    /// Normalized policy supplied by the caller.
+    type Request;
+    /// Exact side-effect-free mechanism descriptions.
+    type Mechanisms;
+
+    /// Reads the admitted portable rank without opening native resources.
+    fn rank(request: &Self::Request) -> Option<crate::ParallelRankTopology>;
+
+    /// Combines the portable policy and backend's independent mechanism facts.
+    fn from_request(request: Self::Request, mechanisms: Self::Mechanisms) -> Self;
+}
+
+/// Native mechanisms used by a portable model-loading policy.
 pub trait ModelLoadingBackend: BackendProvider {
-    /// Backend load policy exposed to a generic caller.
-    type LoadOptions;
+    /// Exact device assignment selected by a distributed caller.
+    type LoadPlacement;
 
-    /// Exact pre-materialization realization selected from the inspected
-    /// artifact, caller request, and backend mechanisms.
-    type SelectedPreparation;
+    /// Native inputs retained separately from the portable source selection.
+    type Binding;
 
-    /// Architecture registry selected by this backend adapter.
-    type ConfigurationResolver: ModelConfigurationResolver;
+    /// Side-effect-free mechanisms parameterizing the portable catalog's facts.
+    type LoadMechanisms;
 
-    /// Returns the architecture-owned model configuration registry.
-    fn configuration_resolver(&self) -> &Self::ConfigurationResolver;
+    /// Supplies mechanism facts without consuming model policy.
+    fn load_mechanisms(&self) -> Self::LoadMechanisms;
 
-    /// Intersects normalized architecture requirements and the caller request
-    /// with backend support, returning the sole construction-policy handoff.
-    ///
-    /// Core deliberately does not infer architecture capabilities from a
-    /// coarse model-family identity. Implementations must fail closed for
-    /// requested routes that the exact normalized architecture or backend
-    /// cannot realize.
-    fn select_preparation(
+    /// Validates and retains an exact rank and matching native device assignment.
+    fn bind_load_placement(
         &self,
-        inspection: &ArtifactInspection<
-            <Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-        >,
-        options: &Self::LoadOptions,
-    ) -> Result<Self::SelectedPreparation, Self::Error>;
+        rank: Option<crate::ParallelRankTopology>,
+        placement: Option<Self::LoadPlacement>,
+    ) -> Result<Self::Binding, Self::Error>;
 
-    /// Returns the exact portable admission retained by the authoritative selection.
-    fn selected_preparation_admission(
-        &self,
-        selected: &Self::SelectedPreparation,
-    ) -> PreparationAdmission;
-
-    /// Binds a neutral preparation plan and its authoritative selected
-    /// realization to backend-owned materialization input.
-    fn model_config(
-        &self,
-        selected: SelectedModelPreparation<Self>,
-    ) -> Result<Self::ModelConfig, Self::Error>;
+    /// Validates native placement before portable source preparation begins.
+    fn validate_model_binding(&self, _binding: &Self::Binding) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// One neutral preparation plan inseparably paired with its backend selection.
@@ -949,43 +1135,29 @@ pub trait ModelLoadingBackend: BackendProvider {
 /// admission have succeeded against the same artifact inspection. Backend adapters
 /// may consume the pair, but callers cannot substitute a different plan after
 /// selection.
-pub struct SelectedModelPreparation<B: ModelLoadingBackend> {
-    plan: ModelPreparationPlan<
-        <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-    >,
-    selected: B::SelectedPreparation,
+pub struct SelectedModelPreparation<B: ModelLoadingBackend, P, S> {
+    plan: ModelPreparationPlan<P>,
+    selected: SelectedModelBinding<S, B::Binding>,
 }
 
-impl<B: ModelLoadingBackend> SelectedModelPreparation<B> {
+impl<B: ModelLoadingBackend, P, S> SelectedModelPreparation<B, P, S> {
     pub(crate) fn new(
-        plan: ModelPreparationPlan<
-            <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-        >,
-        selected: B::SelectedPreparation,
+        plan: ModelPreparationPlan<P>,
+        selected: SelectedModelBinding<S, B::Binding>,
     ) -> Self {
         Self { plan, selected }
     }
 
-    pub(crate) const fn plan(
-        &self,
-    ) -> &ModelPreparationPlan<<B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan>
-    {
+    pub(crate) const fn plan(&self) -> &ModelPreparationPlan<P> {
         &self.plan
     }
 
-    pub(crate) const fn selected(&self) -> &B::SelectedPreparation {
+    pub(crate) const fn selected(&self) -> &SelectedModelBinding<S, B::Binding> {
         &self.selected
     }
 
     /// Consumes the binding into the exact admitted plan and backend selection.
-    pub fn into_parts(
-        self,
-    ) -> (
-        ModelPreparationPlan<
-            <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-        >,
-        B::SelectedPreparation,
-    ) {
+    pub fn into_parts(self) -> (ModelPreparationPlan<P>, SelectedModelBinding<S, B::Binding>) {
         (self.plan, self.selected)
     }
 }
@@ -997,9 +1169,18 @@ pub enum ModelLoadError<E: std::error::Error + Send + Sync + 'static> {
     /// Portable artifact inspection or preparation planning failed.
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
+    /// Portable cold selection failed.
+    #[error("failed to select model preparation: {0}")]
+    Selection(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The portable source preparation failed.
+    #[error("failed to prepare checkpoint sources: {0}")]
+    SourcePreparation(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The selected backend failed policy resolution or materialization.
     #[error("selected backend failed to prepare the model: {0}")]
     Backend(#[source] E),
+    /// Constructing the executable from its prepared sources failed.
+    #[error(transparent)]
+    Construction(BackendFailure),
     /// The inspected architecture/load-policy/topology route lacks a requirement.
     #[error(transparent)]
     SessionCapability(#[from] SessionCapabilityError),
@@ -1007,16 +1188,24 @@ pub enum ModelLoadError<E: std::error::Error + Send + Sync + 'static> {
 
 /// Inspects, plans, and prepares one artifact on the selected backend.
 ///
-/// This is the sole generic artifact-loading entry point. The backend instance
-/// already owns its device, execution queues, transfer queues, and optional
-/// distributed communication state; none are passed separately to loading.
-pub fn load_model<B: ModelLoadingBackend>(
+/// The caller supplies the resolver. The backend instance already owns its
+/// device, queues, and optional distributed communication state.
+pub fn load_model<B: ModelLoadingBackend, P, A>(
     backend: &B,
     artifact: impl AsRef<Path>,
-    options: B::LoadOptions,
-) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let inspection = inspect_artifact(artifact, backend.configuration_resolver())?;
-    prepare_inspected_model(backend, inspection, options)
+    resolver: &impl ModelConfigurationResolver<ArtifactPlan = P>,
+    options: ModelLoadOptions<A::Request, B::LoadPlacement>,
+) -> Result<PreparedModel<LoadedModelFor<B, P, A::SourcePreparation>>, ModelLoadError<B::Error>>
+where
+    P: Clone + std::fmt::Debug,
+    A: DirectLoadFacts<Mechanisms = B::LoadMechanisms>
+        + ModelLoadAdmission<
+            P,
+            SourcePreparation: ModelSourcePreparation<P, Prepared: BindModelSources<B>>,
+        >,
+{
+    let inspection = inspect_artifact(artifact, resolver)?;
+    prepare_inspected_model::<B, P, A>(backend, inspection, options)
 }
 
 /// Plans and prepares an artifact that the caller has already inspected.
@@ -1024,17 +1213,28 @@ pub fn load_model<B: ModelLoadingBackend>(
 /// This is the canonical lower-level entry point for facade loaders which
 /// must derive tokenizer, chat, or other portable sidecar state from the same
 /// inspection before transferring ownership to the selected backend.
-pub fn prepare_inspected_model<B: ModelLoadingBackend>(
+pub fn prepare_inspected_model<B: ModelLoadingBackend, P, A>(
     backend: &B,
-    inspection: ArtifactInspection<
-        <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
-    >,
-    options: B::LoadOptions,
-) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let selected = backend
-        .select_preparation(&inspection, &options)
+    inspection: ArtifactInspection<P>,
+    options: ModelLoadOptions<A::Request, B::LoadPlacement>,
+) -> Result<PreparedModel<LoadedModelFor<B, P, A::SourcePreparation>>, ModelLoadError<B::Error>>
+where
+    P: Clone + std::fmt::Debug,
+    A: DirectLoadFacts<Mechanisms = B::LoadMechanisms>
+        + ModelLoadAdmission<
+            P,
+            SourcePreparation: ModelSourcePreparation<P, Prepared: BindModelSources<B>>,
+        >,
+{
+    let ModelLoadOptions { request, placement } = options;
+    let binding = backend
+        .bind_load_placement(A::rank(&request), placement)
         .map_err(ModelLoadError::Backend)?;
-    let admission = backend.selected_preparation_admission(&selected);
+    let selected = A::from_request(request, backend.load_mechanisms())
+        .select(&inspection)
+        .map_err(|error| ModelLoadError::Selection(Box::new(error)))?;
+    let admission = selected.admission();
+    let selected = SelectedModelBinding::new(selected, binding);
     let plan = ModelPreparationPlan::from_retained_admission(inspection, admission)?;
     prepare_selected_model(backend, SelectedModelPreparation::new(plan, selected))
 }
@@ -1044,16 +1244,40 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
 /// Selection and capability admission must have completed before the backend
 /// instance was realized. This entry point therefore performs no policy or
 /// route selection after native resources exist.
-pub(crate) fn prepare_selected_model<B: ModelLoadingBackend>(
+pub(crate) fn prepare_selected_model<B: ModelLoadingBackend, P, S>(
     backend: &B,
-    selected: SelectedModelPreparation<B>,
-) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let config = backend
-        .model_config(selected)
-        .map_err(ModelLoadError::Backend)?;
+    selected: SelectedModelPreparation<B, P, S>,
+) -> Result<PreparedModel<LoadedModelFor<B, P, S>>, ModelLoadError<B::Error>>
+where
+    P: Clone + std::fmt::Debug,
+    S: ModelSourcePreparation<P, Prepared: BindModelSources<B>>,
+{
+    let (plan, selected) = selected.into_parts();
+    let (source_preparation, binding) = selected.into_parts();
     backend
-        .prepare_model(config)
-        .map_err(ModelLoadError::Backend)
+        .validate_model_binding(&binding)
+        .map_err(ModelLoadError::Backend)?;
+    let sources = source_preparation
+        .prepare(plan)
+        .map_err(|error| ModelLoadError::SourcePreparation(Box::new(error)))?;
+    sources
+        .construct_model(backend, binding)
+        .map_err(ModelLoadError::Construction)
+}
+
+/// Installs an admitted model on an already selected backend.
+pub trait ModelSessionInstaller<B: BackendProvider> {
+    /// Prepared model consumed by this installer.
+    type Model;
+
+    /// Session chosen by the caller's execution composition.
+    type Session: BackendSession<B>;
+
+    /// Installs the prepared model and settles initial session work.
+    fn install_session(
+        backend: &B,
+        model: PreparedModel<Self::Model>,
+    ) -> Result<Self::Session, B::Error>;
 }
 
 /// Prefill/decode interface for an already selected backend session.
@@ -1073,6 +1297,16 @@ pub trait BackendSession<B: BackendProvider> {
 
     /// Reports capabilities of this exact realized session.
     fn capabilities(&self) -> SessionCapabilities;
+
+    /// Reports the exact speculative support of this installed target.
+    fn speculative_capability(&self) -> crate::SpeculativeCapability {
+        crate::SpeculativeCapability::Unavailable
+    }
+
+    /// Returns the installed target identity for binding a separate draft.
+    fn draft_target_identity(&self) -> Option<&str> {
+        None
+    }
 
     /// Submits prompt prefill against this session.
     fn prefill(
@@ -1099,13 +1333,57 @@ pub trait BackendSession<B: BackendProvider> {
     ) -> Result<ObservationSet, B::Error>;
 }
 
-/// One submission produced by the selected backend session.
-pub type SessionSubmission<B> = Submission<
-    <<B as BackendProvider>::Session as BackendSession<B>>::Output,
-    <<B as BackendProvider>::Session as BackendSession<B>>::Completion,
->;
+/// Lifecycle and cold readiness of an installed text session.
+pub trait TextSessionLifecycle<B: BackendProvider>: BackendSession<B> {
+    /// Clears all request-dependent session state after successful synchronization.
+    ///
+    /// On success, subsequent generation must behave as on a fresh session with
+    /// the same model, prompt and generation configuration. Preserve the loaded
+    /// parameters, model identity, selected placement and admitted capabilities.
+    /// Any work submitted by reset itself must be settled before success. Never
+    /// clear an unresolved submission lease or silently recover a poisoned session.
+    /// Stateless backends must explicitly implement this as a no-op.
+    fn reset_session(&mut self, backend: &B) -> Result<(), BackendFailure>;
 
-/// A prepared model, its selected backend, and its backend-owned session.
+    /// Establishes settled, healthy session work without changing request state.
+    ///
+    /// Wait for all work associated with this session, including loading,
+    /// transfers and work retained after cancellation or iterator drop. Return
+    /// success only when no pending submission authority remains and the session
+    /// is reusable. A live detached continuation/submission may be rejected as
+    /// busy. Errors must preserve ownership of unresolved native resources and
+    /// must not be treated as completion. Synchronous backends must explicitly
+    /// implement the corresponding idle/health check, or a no-op when always idle.
+    fn synchronize_session(&self, backend: &B) -> Result<(), BackendFailure>;
+
+    /// Completes a cold preparation stage using this session's actual authority.
+    /// Distributed implementations must agree exact setup, monotone attempt,
+    /// stage and disposition under bounded completion before returning readiness.
+    /// Failed/indeterminate exchanges fence the shared execution owner. The
+    /// default is for single-participant backends and submits no native work.
+    fn agree_text_preparation(
+        &self,
+        _backend: &B,
+        _stage: crate::run_preparation::TextPreparationStage,
+        status: crate::run_preparation::TextPreparationStatus,
+    ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
+        Ok(status.local_outcome())
+    }
+
+    /// Cumulative logical agreement costs of the actual session, not model state.
+    fn text_preparation_usage(
+        &self,
+        _backend: &B,
+    ) -> Result<crate::run_preparation::TextPreparationUsage, BackendFailure> {
+        Ok(Default::default())
+    }
+}
+
+/// One submission produced by the selected backend session.
+pub type SessionSubmission<B, S> =
+    Submission<<S as BackendSession<B>>::Output, <S as BackendSession<B>>::Completion>;
+
+/// A prepared model, its selected backend, and its installed execution session.
 ///
 /// This is the canonical client-side execution owner. Keeping the backend and
 /// session together makes backend selection a whole-model decision: generic
@@ -1113,44 +1391,30 @@ pub type SessionSubmission<B> = Submission<
 /// validate native identity when unrestricted session mutation is exposed.
 /// Backend-owned executable, cache, tensor, and completion types remain
 /// associated types and never enter the portable API.
-pub struct ModelRuntime<B: BackendProvider> {
+/// The execution composition supplies the installed session type.
+pub struct ModelRuntime<B: BackendProvider, S: BackendSession<B>> {
     backend: B,
-    session: B::Session,
+    session: S,
     admission: crate::SessionAdmission,
     execution_plan_target_id: Option<u64>,
 }
 
-impl<B: BackendProvider> ModelRuntime<B> {
-    /// Prepares `config` and creates its sole execution session.
-    pub fn prepare(backend: B, config: B::ModelConfig) -> Result<Self, B::Error> {
-        let model = backend.prepare_model(config)?;
-        Self::from_prepared(backend, model)
-    }
-
-    /// Creates the sole execution session for an already prepared model.
-    pub fn from_prepared(backend: B, model: PreparedModel<B::Model>) -> Result<Self, B::Error> {
-        Self::from_prepared_with_execution_plan_target(backend, model, None)
-    }
-
-    pub(crate) fn from_prepared_execution_plan_target(
+impl<B: BackendProvider, S: BackendSession<B>> ModelRuntime<B, S> {
+    /// Installs the prepared model using the caller's selected installer.
+    pub fn install<I: ModelSessionInstaller<B, Session = S>>(
         backend: B,
-        model: PreparedModel<B::Model>,
-        execution_plan_target_id: u64,
+        model: PreparedModel<I::Model>,
     ) -> Result<Self, B::Error> {
-        Self::from_prepared_with_execution_plan_target(
-            backend,
-            model,
-            Some(execution_plan_target_id),
-        )
+        Self::install_with_target::<I>(backend, model, None)
     }
 
-    fn from_prepared_with_execution_plan_target(
+    pub(crate) fn install_with_target<I: ModelSessionInstaller<B, Session = S>>(
         backend: B,
-        model: PreparedModel<B::Model>,
+        model: PreparedModel<I::Model>,
         execution_plan_target_id: Option<u64>,
     ) -> Result<Self, B::Error> {
         let admitted = model.capabilities();
-        let session = backend.create_session(model)?;
+        let session = I::install_session(&backend, model)?;
         let realized = session.capabilities();
         if crate::SessionAdmission::new(admitted)
             .validate(realized)
@@ -1175,18 +1439,18 @@ impl<B: BackendProvider> ModelRuntime<B> {
         &self.backend
     }
 
-    /// Returns the backend-owned session for optional backend capabilities.
-    pub const fn session(&self) -> &B::Session {
+    /// Returns the installed session for optional execution capabilities.
+    pub const fn session(&self) -> &S {
         &self.session
     }
 
-    /// Returns the backend-owned session for optional backend capabilities.
+    /// Returns the installed session for optional execution capabilities.
     ///
     /// Unrestricted mutation can replace the session, so this invalidates any
     /// retained execution-plan target proof. Previously selected drafting can
     /// no longer attach to this runtime. Generic operations still enforce the
     /// original exact capability admission after mutation.
-    pub fn session_mut(&mut self) -> &mut B::Session {
+    pub fn session_mut(&mut self) -> &mut S {
         self.execution_plan_target_id = None;
         &mut self.session
     }
@@ -1194,7 +1458,7 @@ impl<B: BackendProvider> ModelRuntime<B> {
     /// Borrows the selected backend and its mutable session together.
     ///
     /// Like [`Self::session_mut`], this invalidates retained drafting target proof.
-    pub fn parts_mut(&mut self) -> (&B, &mut B::Session) {
+    pub fn parts_mut(&mut self) -> (&B, &mut S) {
         self.execution_plan_target_id = None;
         (&self.backend, &mut self.session)
     }
@@ -1214,34 +1478,25 @@ impl<B: BackendProvider> ModelRuntime<B> {
     }
 
     /// Submits prompt prefill through the selected backend and session.
-    pub fn prefill(
-        &mut self,
-        input: <B::Session as BackendSession<B>>::PrefillInput,
-    ) -> Result<SessionSubmission<B>, B::Error> {
+    pub fn prefill(&mut self, input: S::PrefillInput) -> Result<SessionSubmission<B, S>, B::Error> {
         self.validate_session_admission()?;
         self.session.prefill(&self.backend, input)
     }
 
     /// Submits cached decode through the selected backend and session.
-    pub fn decode(
-        &mut self,
-        input: <B::Session as BackendSession<B>>::DecodeInput,
-    ) -> Result<SessionSubmission<B>, B::Error> {
+    pub fn decode(&mut self, input: S::DecodeInput) -> Result<SessionSubmission<B, S>, B::Error> {
         self.validate_session_admission()?;
         self.session.decode(&self.backend, input)
     }
 
     /// Materializes portable observations from an already completed output.
-    pub fn observe_output(
-        &self,
-        output: &<B::Session as BackendSession<B>>::Output,
-    ) -> Result<ObservationSet, B::Error> {
+    pub fn observe_output(&self, output: &S::Output) -> Result<ObservationSet, B::Error> {
         self.validate_session_admission()?;
         self.session.observe_output(&self.backend, output)
     }
 }
 
-impl<B: TextGenerationBackend> ModelRuntime<B> {
+impl<B: BackendProvider, S: TextSessionLifecycle<B>> ModelRuntime<B, S> {
     /// Completes fallible local preparation without stranding successful peers.
     /// Local failures retain their original type. Agreement errors independently
     /// fence native authority; an original local error never proves safe reuse.
@@ -1285,14 +1540,15 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
         status: crate::run_preparation::TextPreparationStatus,
     ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
         self.admission.validate(self.session.capabilities())?;
-        B::agree_text_preparation(self, stage, status)
+        self.session
+            .agree_text_preparation(&self.backend, stage, status)
     }
 
     /// Reports session lifetime preparation reservations, unaffected by restore.
     pub fn text_preparation_usage(
         &self,
     ) -> Result<crate::run_preparation::TextPreparationUsage, BackendFailure> {
-        B::text_preparation_usage(self)
+        self.session.text_preparation_usage(&self.backend)
     }
 
     /// Settles prior work and clears request state while retaining the loaded model.
@@ -1302,7 +1558,7 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
     /// preserved. Failure does not establish that the session can be reused.
     pub fn reset(&mut self) -> Result<(), BackendFailure> {
         self.synchronize()?;
-        B::reset_session(&self.backend, &mut self.session)
+        self.session.reset_session(&self.backend)
     }
 
     /// Waits for this session's submitted work, including abandoned generation.
@@ -1314,11 +1570,15 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
     /// contract.
     pub fn synchronize(&self) -> Result<(), BackendFailure> {
         self.admission.validate(self.session.capabilities())?;
-        B::synchronize_session(&self.backend, &self.session)
+        self.session.synchronize_session(&self.backend)
     }
 }
 
-impl<B: ModelCapabilityBackend> ModelRuntime<B> {
+impl<B, S> ModelRuntime<B, S>
+where
+    B: TextGenerationBackend,
+    S: ModelCapabilitySession<B> + TextSessionLifecycle<B>,
+{
     /// Settles ordinary work and releases optional parameter-conversion claims.
     /// Preserves source weights and request state; allocator caches are separate.
     /// Controlled drivers use their canonical boundary instead of settling here.
@@ -1329,19 +1589,7 @@ impl<B: ModelCapabilityBackend> ModelRuntime<B> {
         crate::residency::ParameterConversionTrimError,
     > {
         self.synchronize()?;
-        B::trim_parameter_conversions(self)
-    }
-}
-
-impl<B: ModelLoadingBackend> ModelRuntime<B> {
-    /// Loads an artifact and creates its sole session on `backend`.
-    pub fn load(
-        backend: B,
-        artifact: impl AsRef<Path>,
-        options: B::LoadOptions,
-    ) -> Result<Self, ModelLoadError<B::Error>> {
-        let model = load_model(&backend, artifact, options)?;
-        Self::from_prepared(backend, model).map_err(ModelLoadError::Backend)
+        S::trim_parameter_conversions(self)
     }
 }
 
@@ -1736,66 +1984,76 @@ impl TokenFilterController for FixedTokenFilter {
     }
 }
 
-/// High-level text-generation extension implemented once per backend.
-///
-/// The contract deliberately combines model execution and sampling. Core does
-/// not see logits or ask a backend to implement tensor primitives. The token,
-/// sampling state, cache state, and exact completion remain backend-owned.
-/// Lifecycle hooks return the common [`BackendFailure`]; preserve the original
-/// error as its source and classify only from known facts, not diagnostic text.
-pub trait TextGenerationBackend: BackendProvider {
-    /// Opaque prepared prompt, including any backend-owned multimodal values.
-    type Prompt;
-    /// Backend-owned generated token handle.
-    type Token: TokenOutput<Error = Self::Error>;
-    /// Backend-owned sampler and randomness state for one sequence.
-    type TextGenerationState;
-    /// Exact completion retaining model execution and token sampling.
-    type TextCompletion: Completion<Error = Self::Error>;
-
-    /// Clears all request-dependent session state after successful synchronization.
-    ///
-    /// On success, subsequent generation must behave as on a fresh session with
-    /// the same model, prompt and generation configuration. Preserve the loaded
-    /// parameters, model identity, selected placement and admitted capabilities.
-    /// Any work submitted by reset itself must be settled before success. Never
-    /// clear an unresolved submission lease or silently recover a poisoned session.
-    /// Stateless backends must explicitly implement this as a no-op.
-    fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure>;
-
-    /// Establishes settled, healthy session work without changing request state.
-    ///
-    /// Wait for all work associated with this session, including loading,
-    /// transfers and work retained after cancellation or iterator drop. Return
-    /// success only when no pending submission authority remains and the session
-    /// is reusable. A live detached continuation/submission may be rejected as
-    /// busy. Errors must preserve ownership of unresolved native resources and
-    /// must not be treated as completion. Synchronous backends must explicitly
-    /// implement the corresponding idle/health check, or a no-op when always idle.
-    fn synchronize_session(backend: &Self, session: &Self::Session) -> Result<(), BackendFailure>;
-
-    /// Observes weight residency for this loaded session when supported.
-    /// An unavailable report is distinct from a failed observation.
-    fn residency_telemetry(
-        _runtime: &ModelRuntime<Self>,
-    ) -> Result<Option<crate::ResidencyTelemetry>, BackendFailure> {
-        Ok(None)
+/// Causal submissions owned by an installed text session.
+pub trait CausalTextSession<B: BackendProvider, Prompt, Token, State>: BackendSession<B> {
+    /// Submits native causal prompt work using the selected session.
+    fn submit_causal_prefill(
+        &mut self,
+        _backend: &B,
+        _prompt: Prompt,
+        _domain: Option<crate::capture::CaptureTokenDomain<'_>>,
+        _state: &mut State,
+    ) -> Result<Submission<Self::Output, Self::Completion>, TextOperationError<B::Error>> {
+        Err(TextOperationPolicyError::UnsupportedCausalSubmission.into())
     }
 
-    /// Observes expert-cache occupancy for this loaded session when supported.
-    /// An unavailable report is distinct from a failed observation.
-    fn expert_cache_telemetry(
-        _runtime: &ModelRuntime<Self>,
-    ) -> Result<Option<crate::ExpertCacheTelemetry>, BackendFailure> {
-        Ok(None)
+    /// Submits native causal decode work using the last committed token.
+    fn submit_causal_decode(
+        &mut self,
+        _backend: &B,
+        _token: Token,
+        _domain: Option<crate::capture::CaptureTokenDomain<'_>>,
+        _state: &mut State,
+    ) -> Result<Submission<Self::Output, Self::Completion>, TextOperationError<B::Error>> {
+        Err(TextOperationPolicyError::UnsupportedCausalSubmission.into())
+    }
+
+    /// Supplies previously retained scores after a settled mode transition.
+    fn submit_causal_continuation(
+        &mut self,
+        _backend: &B,
+        _state: &mut State,
+    ) -> Result<Submission<Self::Output, Self::Completion>, TextOperationError<B::Error>> {
+        Err(TextOperationPolicyError::UnsupportedContinuation.into())
+    }
+}
+
+/// Portable dispatch of a text session's physical operations.
+pub trait TextOperationDriver<B: TextGenerationBackend>: BackendSession<B> + Sized {
+    /// Prepared input owned by this portable operation driver.
+    type Prompt: 'static;
+
+    /// Admits tokenized text and prepares the exact prompt for this installed driver.
+    fn prepare_text_prompt(
+        backend: &B,
+        prompt_token_ids: Vec<u32>,
+    ) -> Result<Self::Prompt, B::Error>;
+
+    /// Mutable request state owned by the installed operation driver.
+    type TextGenerationState;
+
+    /// Starts one portable generation request after admission has agreed.
+    fn start_text_generation(
+        &self,
+        backend: &B,
+        config: TextGenerationConfig,
+    ) -> Result<Self::TextGenerationState, B::Error>;
+
+    /// Samples once from the submitted causal scores under the current filter.
+    fn sample_causal_submission(
+        &self,
+        _backend: &B,
+        _submission: SessionSubmission<B, Self>,
+        _filter: &TokenFilter,
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<Submission<B::Token, B::TextCompletion>, TextOperationError<B::Error>> {
+        Err(TextOperationPolicyError::UnsupportedCausalSubmission.into())
     }
 
     /// Exact support for serial, completed-token control on this loaded session.
     /// Backends opt in only for verified ordinary single-sequence execution.
     /// Snapshot mechanisms and complete facade-state support are separate facts.
-    fn text_execution_control_support(
-        _runtime: &ModelRuntime<Self>,
-    ) -> crate::execution_control::ControlSupport {
+    fn text_execution_control_support(&self, _: &B) -> crate::execution_control::ControlSupport {
         crate::execution_control::ControlSupport::Unsupported {
             reason: "backend has not declared completed-token control support".into(),
         }
@@ -1803,23 +2061,112 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Exact support for prospective temperature changes and explicit reseeding.
     /// The runtime validates policy; the adapter supplies atomic native changes.
-    fn text_sampling_control_support(
-        _runtime: &ModelRuntime<Self>,
-    ) -> crate::execution_control::ControlSupport {
+    fn text_sampling_control_support(&self, _: &B) -> crate::execution_control::ControlSupport {
         crate::execution_control::ControlSupport::Unsupported {
             reason: "backend has no prospective sampling controls".into(),
         }
     }
 
     /// Active parameter-edit provenance for ordinary and controlled generation.
-    fn active_parameter_overlay(_runtime: &ModelRuntime<Self>) -> Option<&str> {
+    fn active_parameter_overlay(&self) -> Option<&str> {
         None
+    }
+
+    /// Trained canvas extent of the selected iterative realization, without execution.
+    fn refinement_canvas_length(&self) -> Option<std::num::NonZeroU32> {
+        None
+    }
+
+    /// Admits ordered selected scores for the next refinement operation.
+    fn configure_refinement_readout(
+        &self,
+        _state: &mut Self::TextGenerationState,
+        _selections: Vec<crate::refinement::RefinementScoreSelection>,
+    ) -> Result<(), crate::refinement::RefinementReadoutError> {
+        Err(crate::refinement::RefinementReadoutError::Unsupported)
+    }
+
+    /// Drains selected scores following exact completion.
+    fn take_refinement_readout(
+        _state: &mut Self::TextGenerationState,
+    ) -> Option<crate::refinement::RefinementScoreRows> {
+        None
+    }
+
+    /// Complete score vocabulary of the selected iterative realization.
+    fn refinement_vocabulary_size(&self) -> Option<std::num::NonZeroU32> {
+        None
+    }
+
+    /// Whether the selected executable supports iterative token blocks.
+    fn supports_block_refinement(&self) -> bool {
+        false
+    }
+
+    /// Source-free facts for all modes already realized by this loaded execution.
+    fn decoding_capabilities(&self) -> crate::decoding::DecodingCapabilities {
+        let iterative = self.supports_block_refinement();
+        crate::decoding::DecodingCapabilities {
+            autoregressive: !iterative,
+            diffusion: iterative,
+            entropy_feedback: iterative,
+            ..Default::default()
+        }
+    }
+
+    /// Trained initial policy when the request has no explicit mode.
+    fn default_decoding_mode(&self) -> crate::decoding::DecodingMode {
+        if self.decoding_capabilities().autoregressive {
+            crate::decoding::DecodingMode::Autoregressive
+        } else {
+            crate::decoding::DecodingMode::Diffusion { policy: None }
+        }
+    }
+
+    /// Exact numerical policy supported by the retained iterative architecture.
+    /// A mechanism implementing unmasking does not imply family support for it.
+    fn supports_refinement_policy(&self, policy: crate::refinement::RefinementPolicy) -> bool {
+        self.supports_block_refinement()
+            && matches!(
+                policy,
+                crate::refinement::RefinementPolicy::EntropyFeedback(_)
+            )
+    }
+
+    /// Meaning of scores produced by the retained generation realization.
+    fn generation_score_kind(&self) -> crate::refinement::PredictionScoreKind {
+        if self.supports_block_refinement() {
+            crate::refinement::PredictionScoreKind::RefinementPosition
+        } else {
+            crate::refinement::PredictionScoreKind::CausalConditional
+        }
+    }
+
+    /// Reports whether this executable can chunk ordinary plain-text prefill.
+    /// Media/structured inputs and requested captures can still require the
+    /// complete pass; this capability does not describe those request contracts.
+    fn text_prefill_chunking_support(&self) -> Result<(), &'static str> {
+        Err("backend retains a complete prefill pass")
+    }
+
+    /// Observes weight residency for this loaded session when supported.
+    /// An unavailable report is distinct from a failed observation.
+    fn residency_telemetry(&self) -> Result<Option<crate::ResidencyTelemetry>, BackendFailure> {
+        Ok(None)
+    }
+
+    /// Observes expert-cache occupancy for this loaded session when supported.
+    /// An unavailable report is distinct from a failed observation.
+    fn expert_cache_telemetry(
+        &self,
+    ) -> Result<Option<crate::ExpertCacheTelemetry>, BackendFailure> {
+        Ok(None)
     }
 
     /// Returns genuine mutable points for this exact loaded session.
     #[cfg(feature = "tensor-capture")]
     fn intervention_discovery(
-        _runtime: &ModelRuntime<Self>,
+        &self,
     ) -> Result<crate::intervention::InterventionDiscovery, crate::capture::CaptureError> {
         Err(crate::capture::CaptureError::Unsupported(
             "backend has no intervention discovery".into(),
@@ -1829,7 +2176,7 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Checks both plans without submitting work or changing model/sampler state.
     #[cfg(feature = "tensor-capture")]
     fn validate_text_interventions(
-        runtime: &ModelRuntime<Self>,
+        &self,
         capture: &crate::capture::AdmittedCapturePlan,
         plan: &crate::intervention::AdmittedInterventionPlan,
     ) -> Result<(), crate::capture::CaptureError> {
@@ -1838,26 +2185,26 @@ pub trait TextGenerationBackend: BackendProvider {
                 "backend has no text interventions".into(),
             ));
         }
-        Self::validate_text_capture(runtime, capture)
+        self.validate_text_capture(capture)
     }
 
     /// Installs immutable plans before the first submission. Diagnostics and
     /// evidence must share capture accounting and ordinary completion ownership.
     #[cfg(feature = "tensor-capture")]
     fn configure_text_interventions(
-        runtime: &ModelRuntime<Self>,
+        &self,
         state: &mut Self::TextGenerationState,
         capture: crate::capture::AdmittedCapturePlan,
         plan: crate::intervention::AdmittedInterventionPlan,
     ) -> Result<(), crate::capture::CaptureError> {
-        Self::validate_text_interventions(runtime, &capture, &plan)?;
-        Self::configure_text_capture(runtime, state, capture)
+        self.validate_text_interventions(&capture, &plan)?;
+        self.configure_text_capture(state, capture)
     }
 
     /// Returns retained admission facts without resolving checkpoint content identity.
     #[cfg(feature = "tensor-capture")]
     fn capture_declarations(
-        _runtime: &ModelRuntime<Self>,
+        &self,
     ) -> Result<crate::capture::CaptureDeclarations, crate::capture::CaptureError> {
         Err(crate::capture::CaptureError::Unsupported(
             "backend has no bounded capture declarations".into(),
@@ -1867,7 +2214,7 @@ pub trait TextGenerationBackend: BackendProvider {
     /// Resolves content-exact provenance together with retained observation facts.
     #[cfg(feature = "tensor-capture")]
     fn capture_discovery(
-        _runtime: &ModelRuntime<Self>,
+        &self,
     ) -> Result<crate::capture::CaptureDiscovery, crate::capture::CaptureError> {
         Err(crate::capture::CaptureError::Unsupported(
             "backend has no bounded capture discovery".into(),
@@ -1879,7 +2226,7 @@ pub trait TextGenerationBackend: BackendProvider {
     /// executable facts without model work or native allocations.
     #[cfg(feature = "tensor-capture")]
     fn text_capture_invocation_bounds(
-        _runtime: &ModelRuntime<Self>,
+        &self,
         _request: crate::capture::CaptureRequestShape,
     ) -> Result<Option<crate::capture::CaptureInvocationBounds>, crate::capture::CaptureError> {
         Ok(None)
@@ -1889,7 +2236,7 @@ pub trait TextGenerationBackend: BackendProvider {
     /// must validate it against this session and reject unsupported combinations.
     #[cfg(feature = "tensor-capture")]
     fn configure_text_capture(
-        _runtime: &ModelRuntime<Self>,
+        &self,
         _state: &mut Self::TextGenerationState,
         plan: crate::capture::AdmittedCapturePlan,
     ) -> Result<(), crate::capture::CaptureError> {
@@ -1906,7 +2253,7 @@ pub trait TextGenerationBackend: BackendProvider {
     /// native work or advancing sampler state.
     #[cfg(feature = "tensor-capture")]
     fn validate_text_capture(
-        _runtime: &ModelRuntime<Self>,
+        &self,
         plan: &crate::capture::AdmittedCapturePlan,
     ) -> Result<(), crate::capture::CaptureError> {
         if plan.is_empty() {
@@ -1927,50 +2274,29 @@ pub trait TextGenerationBackend: BackendProvider {
         None
     }
 
-    /// Creates backend sampling state for one sequence.
-    fn start_text_generation(
-        backend: &Self,
-        config: TextGenerationConfig,
-    ) -> Result<Self::TextGenerationState, Self::Error>;
-
-    /// Completes a cold preparation stage using this session's actual authority.
-    /// Distributed implementations must agree exact setup, monotone attempt,
-    /// stage and disposition under bounded completion before returning readiness.
-    /// Failed/indeterminate exchanges fence the shared execution owner. The
-    /// default is for single-participant backends and submits no native work.
-    fn agree_text_preparation(
-        _runtime: &ModelRuntime<Self>,
-        _stage: crate::run_preparation::TextPreparationStage,
-        status: crate::run_preparation::TextPreparationStatus,
-    ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
-        use crate::run_preparation::{
-            TextPreparationOutcome as Outcome, TextPreparationStatus as Status,
-        };
-        Ok(match status {
-            Status::Ready => Outcome::Ready,
-            Status::Cancelled => Outcome::Cancelled,
-            Status::Failed => Outcome::Rejected { rank: 0 },
-        })
+    /// Declares the next physical operation without execution or controller queries.
+    fn text_operation_kind(
+        _runtime: &ModelRuntime<B, Self>,
+        _input: &PendingTextInput<Self::Prompt, B::Token>,
+        _state: &Self::TextGenerationState,
+    ) -> TextOperationKind {
+        TextOperationKind::Decision(crate::refinement::PredictionScoreKind::CausalConditional)
     }
 
-    /// Cumulative logical agreement costs of the actual session, not model state.
-    fn text_preparation_usage(
-        _runtime: &ModelRuntime<Self>,
-    ) -> Result<crate::run_preparation::TextPreparationUsage, BackendFailure> {
-        Ok(Default::default())
-    }
-
-    /// Converts portable tokenizer ids into a backend-owned text prompt.
-    fn prepare_text_prompt(
-        backend: &Self,
-        prompt_token_ids: Vec<u32>,
-    ) -> Result<Self::Prompt, Self::Error>;
-
-    /// Reports whether this executable can chunk ordinary plain-text prefill.
-    /// Media/structured inputs and requested captures can still require the
-    /// complete pass; this capability does not describe those request contracts.
-    fn text_prefill_chunking_support(_runtime: &ModelRuntime<Self>) -> Result<(), &'static str> {
-        Err("backend retains a complete prefill pass")
+    /// Submits a specialized declared operation such as iterative numerical refinement.
+    /// The portable driver handles ordinary causal submissions separately.
+    #[allow(clippy::type_complexity)]
+    fn submit_specialized_text_operation(
+        _runtime: &mut ModelRuntime<B, Self>,
+        _input: PendingTextInput<Self::Prompt, B::Token>,
+        _decision: Option<&TokenSamplingDecision<'_>>,
+        _state: &mut Self::TextGenerationState,
+        _remaining_tokens: Option<usize>,
+    ) -> Result<
+        Submission<TextOperationOutput<Self::Prompt, B::Token>, B::TextCompletion>,
+        TextOperationError<B::Error>,
+    > {
+        Err(TextOperationPolicyError::OutcomeMismatch.into())
     }
 
     /// Completes one nonfinal prefill step without sampling.
@@ -1984,28 +2310,69 @@ pub trait TextGenerationBackend: BackendProvider {
     /// next prefix by shared facade drivers. Inputs without a supported partial
     /// invocation contract retain the full pass.
     fn prefill_text_prefix(
-        _runtime: &mut ModelRuntime<Self>,
+        _runtime: &mut ModelRuntime<B, Self>,
         _prompt: &mut Self::Prompt,
         _max_tokens: std::num::NonZeroUsize,
         _state: &mut Self::TextGenerationState,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<bool, B::Error> {
         Ok(false)
     }
 
     /// Completes the remaining prepared prompt without sampling. On success
     /// the exact input identity is committed and the input is consumed. Returns
-    /// false without execution when the backend has no such boundary.
+    /// false without execution when the session has no such boundary.
     fn complete_text_prefill(
-        _runtime: &mut ModelRuntime<Self>,
+        _runtime: &mut ModelRuntime<B, Self>,
         _prompt: Self::Prompt,
         _state: &mut Self::TextGenerationState,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<bool, B::Error> {
         Ok(false)
     }
 
+    /// Agrees pending commands and cancellation before entering distributed work.
+    /// The default is a single-owner execution with no transport.
+    fn coordinate_decoding_control(
+        _runtime: &mut ModelRuntime<B, Self>,
+        local: crate::decoding::DecodingCoordination,
+    ) -> Result<crate::decoding::DecodingCoordination, TextOperationError<B::Error>> {
+        Ok(local)
+    }
+
+    /// Settles a queued handoff without sampling or advancing commitment controls.
+    /// `false` leaves a diffusion block or verification transaction active. `true`
+    /// replaces pending input after appending its committed suffix exactly once,
+    /// preserving next-target logits and removing all tentative output. Returned
+    /// work must have exact completion before this method returns. Admission uses
+    /// `decoding_capabilities` before this method can be called.
+    fn settle_decoding_mode(
+        _runtime: &mut ModelRuntime<B, Self>,
+        _input: &mut Option<PendingTextInput<Self::Prompt, B::Token>>,
+        _state: &mut Self::TextGenerationState,
+        _previous: crate::decoding::DecodingMode,
+        _requested: crate::decoding::DecodingMode,
+    ) -> Result<bool, TextOperationError<B::Error>> {
+        Err(TextOperationPolicyError::DecodingMode(
+            crate::decoding::DecodingModeError::Unsupported("settled execution handoff"),
+        )
+        .into())
+    }
+
+    /// Publishes accepted verification state after a canonical token commits.
+    fn commit_text_token(
+        _runtime: &mut ModelRuntime<B, Self>,
+        _token_id: u32,
+        _position: crate::refinement::GenerationPosition,
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<(), B::Error> {
+        Ok(())
+    }
+}
+
+/// Automatic prefix reuse through the installed session's cache operations.
+pub trait AutomaticPromptCacheSession<B: TextGenerationBackend>: BackendSession<B> + Sized {
     /// Model-derived prompt-cache identity for the selected execution state.
     fn prompt_cache_model_identity(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
     ) -> Result<crate::cache::PromptCacheModelIdentity, BackendFailure> {
         Err(BackendFailure::from_error(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -2014,20 +2381,20 @@ pub trait TextGenerationBackend: BackendProvider {
     }
     /// Content identity for the exact backend-prepared plain-text prefix.
     fn prompt_cache_prefix_fingerprint(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
         prefix: &[u32],
     ) -> Result<String, BackendFailure> {
         Ok(crate::cache::prompt_cache_token_fingerprint(prefix))
     }
     /// Native isolated-state byte bound, before portable encoding/publication costs.
     fn estimate_prompt_cache_state(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
     ) -> Result<Option<u64>, BackendFailure> {
         Ok(None)
     }
-    /// Saves through the backend's ordinary prompt-cache export path.
+    /// Saves through the installed session's ordinary prompt-cache export path.
     fn save_prompt_cache(
-        _runtime: &mut ModelRuntime<Self>,
+        _runtime: &mut ModelRuntime<B, Self>,
         _store: &dyn crate::cache::PromptCacheStore,
         _descriptor: crate::cache::PromptCacheDescriptor,
         _prefix: &[u32],
@@ -2038,9 +2405,9 @@ pub trait TextGenerationBackend: BackendProvider {
             "prompt-cache export is unavailable",
         )))
     }
-    /// Loads through the backend's ordinary prompt-cache import path.
+    /// Loads through the installed session's ordinary prompt-cache import path.
     fn load_prompt_cache(
-        _runtime: &mut ModelRuntime<Self>,
+        _runtime: &mut ModelRuntime<B, Self>,
         _store: &dyn crate::cache::PromptCacheStore,
         _descriptor: &crate::cache::PromptCacheDescriptor,
         _prefix: &[u32],
@@ -2050,146 +2417,510 @@ pub trait TextGenerationBackend: BackendProvider {
             "prompt-cache import is unavailable",
         )))
     }
+}
 
-    /// Trained canvas extent of the selected iterative realization, without execution.
-    fn refinement_canvas_length(_runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
-        None
-    }
-
-    /// Admits ordered selected scores for the next refinement operation.
-    fn configure_refinement_readout(
-        _runtime: &ModelRuntime<Self>,
-        _state: &mut Self::TextGenerationState,
-        _selections: Vec<crate::refinement::RefinementScoreSelection>,
-    ) -> Result<(), crate::refinement::RefinementReadoutError> {
-        Err(crate::refinement::RefinementReadoutError::Unsupported)
-    }
-
-    /// Drains the selected scores for the completed operation.
-    fn take_refinement_readout(
-        _state: &mut Self::TextGenerationState,
-    ) -> Option<crate::refinement::RefinementScoreRows> {
-        None
-    }
-
-    /// Vocabulary extent for refinement canvas admission.
-    fn refinement_vocabulary_size(_runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
-        None
-    }
-
-    /// Whether the selected executable supports iterative token blocks.
-    fn supports_block_refinement(_runtime: &ModelRuntime<Self>) -> bool {
-        false
-    }
-
-    /// Source-free facts for all modes already realized by this loaded execution.
-    fn decoding_capabilities(
-        runtime: &ModelRuntime<Self>,
-    ) -> crate::decoding::DecodingCapabilities {
-        let iterative = Self::supports_block_refinement(runtime);
-        crate::decoding::DecodingCapabilities {
-            autoregressive: !iterative,
-            diffusion: iterative,
-            entropy_feedback: iterative,
-            ..Default::default()
-        }
-    }
-
-    /// Agrees pending commands and cancellation before entering distributed work.
-    /// The default is a single-owner execution with no transport.
-    fn coordinate_decoding_control(
-        _runtime: &mut ModelRuntime<Self>,
-        local: crate::decoding::DecodingCoordination,
-    ) -> Result<crate::decoding::DecodingCoordination, TextOperationError<Self::Error>> {
-        Ok(local)
-    }
-
-    /// Trained initial policy when the request has no explicit mode.
-    fn default_decoding_mode(runtime: &ModelRuntime<Self>) -> crate::decoding::DecodingMode {
-        if Self::decoding_capabilities(runtime).autoregressive {
-            crate::decoding::DecodingMode::Autoregressive
-        } else {
-            crate::decoding::DecodingMode::Diffusion { policy: None }
-        }
-    }
-
-    /// Settles a queued handoff without sampling or advancing commitment controls.
-    /// `false` leaves a diffusion block or verification transaction active. `true`
-    /// replaces pending input after appending its committed suffix exactly once,
-    /// preserving next-target logits and removing all tentative output. Returned
-    /// work must have exact completion before this method returns. Admission uses
-    /// `decoding_capabilities` before this method can be called.
-    fn settle_decoding_mode(
-        _runtime: &mut ModelRuntime<Self>,
-        _input: &mut Option<PendingTextInput<Self::Prompt, Self::Token>>,
-        _state: &mut Self::TextGenerationState,
-        _previous: crate::decoding::DecodingMode,
-        _requested: crate::decoding::DecodingMode,
-    ) -> Result<bool, TextOperationError<Self::Error>> {
-        Err(TextOperationPolicyError::DecodingMode(
-            crate::decoding::DecodingModeError::Unsupported("settled execution handoff"),
-        )
-        .into())
-    }
-
-    /// Publishes backend state for one controller-accepted token. It settles native
-    /// work before returning and retains no unaccepted verification suffix in the
-    /// canonical cache. Ordinary causal execution needs no additional publication.
-    fn commit_text_token(
-        _runtime: &mut ModelRuntime<Self>,
-        _token_id: u32,
-        _position: crate::refinement::GenerationPosition,
-        _state: &mut Self::TextGenerationState,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    /// Exact numerical policy supported by the retained iterative architecture.
-    /// A mechanism implementing unmasking does not imply family support for it.
-    fn supports_refinement_policy(
-        runtime: &ModelRuntime<Self>,
-        policy: crate::refinement::RefinementPolicy,
-    ) -> bool {
-        Self::supports_block_refinement(runtime)
-            && matches!(
-                policy,
-                crate::refinement::RefinementPolicy::EntropyFeedback(_)
-            )
-    }
-
-    /// Meaning of scores produced by the retained generation realization.
-    fn generation_score_kind(
-        runtime: &ModelRuntime<Self>,
-    ) -> crate::refinement::PredictionScoreKind {
-        if Self::supports_block_refinement(runtime) {
-            crate::refinement::PredictionScoreKind::RefinementPosition
-        } else {
-            crate::refinement::PredictionScoreKind::CausalConditional
-        }
-    }
-
-    /// Declares the next physical operation without execution or controller queries.
-    fn text_operation_kind(
-        _runtime: &ModelRuntime<Self>,
-        _input: &PendingTextInput<Self::Prompt, Self::Token>,
-        _state: &Self::TextGenerationState,
-    ) -> TextOperationKind {
-        TextOperationKind::Decision(crate::refinement::PredictionScoreKind::CausalConditional)
-    }
-
-    /// Submits one declared operation. Progress receives no commitment decision;
-    /// selecting operations receive the current controller decision exactly once.
-    #[allow(clippy::type_complexity)]
-    fn submit_text_operation(
-        runtime: &mut ModelRuntime<Self>,
-        input: PendingTextInput<Self::Prompt, Self::Token>,
-        decision: Option<&TokenSamplingDecision<'_>>,
-        state: &mut Self::TextGenerationState,
-        _remaining_tokens: Option<usize>,
-    ) -> Result<
-        Submission<TextOperationOutput<Self::Prompt, Self::Token>, Self::TextCompletion>,
-        TextOperationError<Self::Error>,
+/// Native tensor representations and operations for an installed text executable.
+pub trait NativeTextValues: 'static {
+    /// Tensor stored in prepared prompt parts.
+    type InputTensor: Clone + 'static;
+    /// Native prepared decode positions.
+    type Decode;
+    /// Native score handle.
+    type Scores;
+    /// Tensor used by the installed neural operators and parameter owner.
+    type Tensor: eredu_nn::Tensor<Context = Self::Context>;
+    /// Tensor passed to the model's invocation observer.
+    type InvocationTensor;
+    /// Native mapping between the two tensor representations.
+    type ObserverMapping: crate::observation::ObserverTensorMapping<
+        InvocationTensor = Self::InvocationTensor,
+        ObserverTensor = Self::Tensor,
+        InvocationError = Self::Error,
+        ObserverError = Self::Error,
     >;
+    /// Exact native execution context.
+    type Context: Clone;
+    /// Failure of model invocation or native resource access.
+    type Error: std::error::Error + Send + Sync + From<BackendFailure> + 'static;
+    /// Failure reading an installed native state observation.
+    type StateError: std::error::Error + Send + Sync + 'static;
+    /// Exact native group used for coordinated token sampling.
+    type Group;
+    /// Side-effect-free metadata inspection for prepared input.
+    type InputInspector: crate::input::PreparedInputInspector<Self::InputTensor>;
+
+    /// Optional guard for native retirement after isolated state copies are dropped.
+    fn snapshot_retirement() -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Borrows tensor metadata without submitting model work.
+    fn input_inspector() -> Self::InputInspector;
+
+    /// Reads the actual token values carried by an incoming tensor.
+    fn read_token_ids(
+        tokens: &Self::InputTensor,
+        context: &Self::Context,
+    ) -> Result<Vec<u32>, Self::Error>;
+
+    /// Native metadata inspection on decoder tensors.
+    type TensorInputInspector: crate::input::PreparedInputInspector<Self::Tensor>;
+    /// Maps decoder tensors to native observers.
+    type TensorObserver: crate::observation::ObserverTensorMapping<
+        InvocationTensor = Self::Tensor,
+        ObserverTensor = Self::InvocationTensor,
+        InvocationError = eredu_nn::Error,
+        ObserverError = Self::Error,
+    >;
+    /// Native neural operators.
+    type Neural: eredu_nn::NeuralBackend<Tensor = Self::Tensor>;
+    /// Native tensor and page storage for portable text state.
+    type Cache: crate::cache::mechanisms::CacheTensorStorage<
+        Value = Self::Tensor,
+        Queue = Self::Context,
+    >;
+    /// Realized rank communication.
+    type Communication: 'static;
+
+    /// Borrows the active native group for sampling, if it has collective work.
+    fn sampling_group(
+        communication: &Self::Communication,
+        group: crate::CollectiveGroupId,
+    ) -> Option<&Self::Group>;
+
+    /// Borrows the exact shared authority retained with native communication.
+    fn authority(
+        communication: &Self::Communication,
+    ) -> &crate::communication::CommunicationAuthority;
+    /// Converts one prepared input handle to the decoder tensor representation.
+    fn input_tensor(value: &Self::InputTensor) -> Self::Tensor;
+    /// Supplies the metadata inspector for decoder tensors.
+    fn tensor_input_inspector() -> Self::TensorInputInspector;
+    /// Converts one prepared decode handle.
+    fn decode_tensor(tokens: &Self::Decode) -> Self::Tensor;
+    /// Converts scores to the representation exposed by native submission.
+    fn scores(value: Self::Tensor) -> Self::Scores;
+    /// Concatenates exact token parts on the specified queue.
+    fn concatenate_token_parts(
+        parts: &[&Self::InputTensor],
+        queue: &Self::Context,
+    ) -> Result<Self::Tensor, Self::Error>;
+    /// Converts a token handle from the invocation observer.
+    fn prompt_tokens(value: &Self::InvocationTensor) -> Self::InputTensor;
+    /// Converts a prepared decode handle into an input handle.
+    fn decode_prompt_tokens(value: &Self::Decode) -> Self::InputTensor;
+    /// Converts a portable state observation error to the native error domain.
+    fn state_error(error: BackendFailure) -> Self::StateError;
+    /// Measures the exact logical payload bytes of a replacement tensor.
+    fn tensor_bytes(value: &Self::Tensor) -> u64;
+    /// Reads the materialized decoder token IDs.
+    fn decoder_token_ids(value: &Self::Tensor) -> Result<Vec<u32>, Self::Error>;
+
+    /// Native predictor materialization operations.
+    type Materializer;
+    /// Native tensor operators and collectors for embedded verification.
+    type Embedded: crate::speculative::embedded::EmbeddedPredictionOperators<Tensor = Self::Tensor>;
+
+    /// Materializes the requested token range on the specified queue.
+    fn slice_tokens(
+        tokens: &Self::Tensor,
+        range: std::ops::Range<usize>,
+        queue: &Self::Context,
+    ) -> Result<
+        Self::Tensor,
+        <Self::Embedded as crate::speculative::embedded::EmbeddedPredictionOperators>::Error,
+    >;
+    /// Settles the retained input handle.
+    fn settle_input(
+        value: &Self::Tensor,
+    ) -> Result<
+        (),
+        <Self::Embedded as crate::speculative::embedded::EmbeddedPredictionOperators>::Error,
+    >;
+    /// Preserves a typed input failure in the predictor error domain.
+    fn input_failure(
+        error: BackendFailure,
+    ) -> <Self::Embedded as crate::speculative::embedded::EmbeddedPredictionOperators>::Error;
+
+    #[doc(hidden)]
+    fn observe_forward() {}
+    #[doc(hidden)]
+    fn observe_publication() {}
+    #[doc(hidden)]
+    fn read_fixed_values(
+        _: &<Self::Cache as crate::cache::mechanisms::LiveCacheBackend>::Tensor,
+    ) -> Result<Vec<f32>, BackendFailure> {
+        Err(BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::other("native fixed-state readback is unavailable"),
+        ))
+    }
+}
+
+/// Backend representations needed to erase an installed executable.
+pub trait TextExecutableTypes: 'static {
+    /// Tensor stored in prepared prompt parts.
+    type InputTensor: Clone + 'static;
+    /// Native prepared decode positions.
+    type Decode;
+    /// Native score handle.
+    type Scores;
+    /// Tensor used by the installed neural operators and parameter owner.
+    type Tensor: eredu_nn::Tensor;
+    /// Tensor passed to the model's invocation observer.
+    type InvocationTensor;
+    /// Native mapping between the two tensor representations.
+    type ObserverMapping: crate::observation::ObserverTensorMapping<
+        InvocationTensor = Self::InvocationTensor,
+        ObserverTensor = Self::Tensor,
+        InvocationError = Self::Error,
+        ObserverError = Self::Error,
+    >;
+    /// Exact native execution context.
+    type Context;
+    /// Failure of model invocation or native resource access.
+    type Error: std::error::Error + Send + Sync + From<BackendFailure> + 'static;
+    /// Failure reading an installed native state observation.
+    type StateError: std::error::Error + Send + Sync + 'static;
+    /// Native state retained by an independently advancing prediction lane.
+    type PredictionState;
+    /// Exact native group used for coordinated token sampling.
+    type Group;
+    /// Native completion and input types for the bound embedded executor.
+    type EmbeddedExecutor: crate::speculative::erasure::GenerationExecutorTypes;
+    /// Native representations used by the installed prediction collectors.
+    type EmbeddedObservers;
+    /// Side-effect-free metadata inspection for prepared input.
+    type InputInspector: crate::input::PreparedInputInspector<Self::InputTensor>;
+
+    /// Optional guard for native retirement after isolated state copies are dropped.
+    fn snapshot_retirement() -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Borrows tensor metadata without submitting model work.
+    fn input_inspector() -> Self::InputInspector;
+
+    /// Reads the actual token values carried by an incoming tensor.
+    fn read_token_ids(
+        tokens: &Self::InputTensor,
+        context: &Self::Context,
+    ) -> Result<Vec<u32>, Self::Error>;
+}
+
+/// The native resource, queue and submission operations used by the driver.
+pub trait TextSessionNative<B: BackendProvider>:
+    Sized + crate::session_authority::SessionRetirement<Error = B::Error>
+{
+    /// Exact native placement of prepared resources.
+    type Target;
+    /// Native communication retained for a prepared executable.
+    type Communication;
+
+    /// Reads native counters and physical memory semantics for this backend.
+    fn native_memory() -> crate::capability::NativeMemoryFacts;
+    /// Reports an existing native failure without progressing outstanding work.
+    fn check_native_health(&self) -> Result<(), B::Error>;
+
+    /// Validates native placement before creating installed resources.
+    fn validate_target(backend: &B, target: &Self::Target) -> Result<(), B::Error>;
+
+    /// An exact capability observation supplied by the native target, when available.
+    fn target_capabilities(_target: &Self::Target) -> Option<SessionCapabilities> {
+        None
+    }
+
+    /// Attaches native placement and completion lifetimes for installation.
+    fn attach_native(
+        target: Self::Target,
+        communication: Option<Self::Communication>,
+    ) -> Result<(Self::Retained, Self), B::Error>;
+
+    /// Exact native values supplied to the portable executable.
+    type TextValues: NativeTextValues<Error = B::Error>;
+    /// Retained native target data.
+    type Retained;
+    /// Native parameter handles retained by the portable overlay state.
+    type ParameterValue: Clone + 'static;
+    /// Native retirement owner specialized to the supplied opaque resource root.
+    type Retired<R: 'static>: std::ops::DerefMut<Target = R> + 'static;
+    /// Applies native retirement to an opaque resource root.
+    fn retain_resources<R: 'static>(resources: R) -> Self::Retired<R>;
+
+    /// Published score handle.
+    type Output;
+    /// Native completion of the invocation.
+    type Completion: Completion<Error = B::Error>;
+    /// Native submission scope for this session.
+    type Scope<'a>: TextSubmissionScope<
+        <Self::TextValues as NativeTextValues>::Scores,
+        B::Error,
+        Completion = Self::Completion,
+    >
+    where
+        Self: 'a;
+
+    /// Adopts exact submission authority before the executable is accessed.
+    /// Token submissions collect deferred native token-index validation.
+    fn begin(
+        &self,
+        lease: crate::SubmissionLease,
+        token_validation: bool,
+    ) -> Result<Self::Scope<'_>, B::Error>;
+
+    /// Makes a one-position input from an exact committed token ID.
+    fn decode_token_id(
+        token: u32,
+        backend: &B,
+    ) -> Result<<Self::TextValues as NativeTextValues>::Decode, B::Error>;
+
+    /// Native sampling result before cached decode preparation.
+    type SampledDecode;
+
+    /// Prepares cached decode positions from an already admitted native sample.
+    fn decode_sample(
+        token: Self::SampledDecode,
+        backend: &B,
+    ) -> Result<<Self::TextValues as NativeTextValues>::Decode, B::Error>;
+
+    /// Error for a resource root still shared at an idle boundary.
+    fn busy() -> B::Error;
+
+    /// The selected device context.
+    fn context(backend: &B) -> &<Self::TextValues as NativeTextValues>::Context;
+
+    /// Publishes scores on the selected output rank.
+    fn publish_scores(
+        scores: <Self::TextValues as NativeTextValues>::Scores,
+        publish: bool,
+    ) -> Self::Output;
+
+    /// Validates that lifecycle operations target the exact installed native session.
+    fn validate_native_target(
+        &self,
+        retained: &Self::Retained,
+        backend: &B,
+    ) -> Result<(), B::Error>;
+
+    /// Rejects synchronization when communication has fenced the native session.
+    fn check_transport_active(retained: &Self::Retained) -> Result<(), BackendFailure>;
+
+    /// Waits for the native parameter and execution queues.
+    fn synchronize_queues(backend: &B) -> Result<(), B::Error>;
+
+    /// Transport bound to the selected distributed session.
+    type ControlTransport: crate::run_preparation::TextPreparationTransport<Error = B::Error>
+        + crate::parameters::ParameterOperationTransport
+        + Clone;
+
+    /// Borrows the retained cohort transport, if the session is distributed.
+    fn control_transport(retained: &Self::Retained) -> Option<&Self::ControlTransport>;
+
+    /// Exact participant identity for the retained transport.
+    fn control_transport_identity(
+        transport: &Self::ControlTransport,
+    ) -> crate::communication::CommunicationSessionIdentity;
+
+    /// Reports whether the retained cohort has bounded parameter control.
+    fn parameter_control_supported(transport: &Self::ControlTransport) -> bool;
+
+    /// Describes the native bounds for a fixed preparation exchange.
+    fn preparation_admission(
+        transport: &Self::ControlTransport,
+        words: usize,
+    ) -> Result<Option<crate::run_preparation::TextPreparationAdmission>, B::Error>;
+
+    /// Borrows the exact published score tensor, if this rank owns it.
+    fn output_scores(
+        output: &Self::Output,
+    ) -> Option<&<Self::TextValues as NativeTextValues>::Tensor>;
+
+    /// Reads completed native tensors in the supplied order. Retains the tensors,
+    /// invocation root and submission authority until native transfer settles.
+    fn read_observation_tensors(
+        &self,
+        lease: crate::SubmissionLease,
+        root: std::rc::Rc<dyn std::any::Any>,
+        backend: &B,
+        tensors: Vec<<Self::TextValues as NativeTextValues>::Tensor>,
+    ) -> Result<Vec<crate::observation::TensorObservation>, B::Error>;
+}
+
+/// Native reads for committed token storage at a settled mode boundary.
+pub trait CommittedTokenReadback<T, C, Queue: ?Sized, E> {
+    /// Reads the pending committed token.
+    fn pending_token(token: &T, queue: &Queue) -> Result<u32, E>;
+
+    /// Reads an authoritative refinement block in position order.
+    fn committed_block(tokens: &[C], queue: &Queue) -> Result<Vec<u32>, E>;
+}
+
+/// Numerical and completion mechanisms for sampling an admitted text submission.
+pub trait TextSamplingNative<B: TextGenerationBackend>: TextSessionNative<B> {
+    /// Native cancellation behavior for an outstanding text submission.
+    fn completion_cancellation_mode() -> Option<crate::CompletionCancellationMode>;
+
+    /// Exact completion for a sample from already submitted causal scores.
+    type SamplingCompletion: crate::Completion<Error = B::Error>;
+
+    /// Exact native numerical failure.
+    type SamplingError: std::error::Error + Send + Sync + 'static;
+
+    /// Native tensor and random stream operations selected for text sampling.
+    type Sampling: crate::sampling::SamplingBackend<
+        Context = <Self::TextValues as NativeTextValues>::Context,
+        Error = Self::SamplingError,
+    >;
+    /// Exact native resources retained while a token is derived from submitted scores.
+    type SamplingScope;
+
+    /// Attaches the token operation to the live score submission.
+    fn begin_sampling(completion: &Self::Completion) -> Result<Self::SamplingScope, B::Error>;
+
+    /// Returns the final physical score row when the backend owns the submitted output.
+    fn last_score_row(
+        output: &Self::Output,
+        context: &<Self::Sampling as crate::sampling::SamplingBackend>::Context,
+    ) -> Result<Option<<Self::Sampling as crate::sampling::SamplingBackend>::Logits>, B::Error>;
+
+    /// Observes the realized collective coordinates without submitting work.
+    fn sampling_group_coordinates(
+        group: &<Self::TextValues as NativeTextValues>::Group,
+    ) -> (usize, usize);
+
+    /// Broadcasts exactly one selected token on the admitted group.
+    fn exchange_sampled_token(
+        token: Option<<Self::Sampling as crate::sampling::SamplingBackend>::Token>,
+        rank: usize,
+        group: &<Self::TextValues as NativeTextValues>::Group,
+        authority: &crate::communication::CommunicationAuthority,
+        context: &<Self::Sampling as crate::sampling::SamplingBackend>::Context,
+    ) -> Result<<Self::Sampling as crate::sampling::SamplingBackend>::Token, B::Error>;
+
+    /// Combines score and token completion or safely retires a failed token operation.
+    fn finish_sampling(
+        scope: Self::SamplingScope,
+        completion: Self::Completion,
+        token: Result<<Self::Sampling as crate::sampling::SamplingBackend>::Token, B::Error>,
+        context: &<Self::Sampling as crate::sampling::SamplingBackend>::Context,
+    ) -> Result<Submission<Self::Token, Self::SamplingCompletion>, B::Error>;
+
+    /// Native token value consumed by one cached decode.
+    type Token;
+    /// Extracts the sampled value without preparing or submitting a decode.
+    fn sampled_token_value(token: Self::Token) -> Self::SampledDecode;
+}
+
+/// Native preparation and sampling state for text generation.
+pub trait TextGenerationBackend: BackendProvider {
+    /// Native tensor in prepared inputs. The driver owns their composition.
+    type InputTensor: Clone + 'static;
+    /// Backend-owned generated token handle.
+    type Token: TokenOutput<Error = Self::Error>;
+    /// Exact completion retaining model execution and token sampling.
+    type TextCompletion: Completion<Error = Self::Error>;
+}
+
+/// Native recovery and tensor conversion for portable text media preparation.
+pub trait TextMediaNative<B: TextGenerationBackend>: TextSessionNative<B> {
+    /// Scope retaining tensors created for the portable processor.
+    type ProcessorScope: crate::input::ProcessorPreparationScope<
+        Tensor = <Self::TextValues as NativeTextValues>::InputTensor,
+        Error = B::Error,
+    >;
+
+    /// Opens native allocation and submission recovery.
+    fn begin_processor() -> Result<Self::ProcessorScope, B::Error>;
+}
+
+/// Native values borrowed by the portable shared-target text driver.
+pub trait SharedTextNative: TextGenerationBackend {
+    /// Placement, submission, and retirement mechanisms for text.
+    type Native: TextSessionNative<Self>;
+    /// Borrows the already selected native target queue.
+    fn shared_queue(
+        &self,
+    ) -> &<<Self::Native as TextSessionNative<Self>>::TextValues as NativeTextValues>::Context;
+
+    /// Reads one completed native token.
+    fn shared_token_id(&self, token: &Self::Token) -> Result<u32, Self::Error>;
+
+    /// Native placeholder retained on a progress-only completion.
+    fn shared_progress_value(
+    ) -> <<Self::Native as TextSessionNative<Self>>::TextValues as NativeTextValues>::Scores;
+
+    /// Combines the exact model fence with completion of the retained progress value.
+    fn finish_shared_progress(
+        submission: Submission<
+            <<Self::Native as TextSessionNative<Self>>::TextValues as NativeTextValues>::Scores,
+            <Self::Native as TextSessionNative<Self>>::Completion,
+        >,
+    ) -> Result<Self::TextCompletion, Self::Error>;
+}
+
+/// Installed session operations used by the ordinary generation driver.
+pub trait TextExecutionSession<B: TextGenerationBackend>:
+    TextSessionLifecycle<B>
+    + CausalTextSession<B, Self::Prompt, B::Token, Self::TextGenerationState>
+    + TextOperationDriver<B>
+{
+}
+
+impl<B, S> TextExecutionSession<B> for S
+where
+    B: TextGenerationBackend,
+    S: TextSessionLifecycle<B>
+        + CausalTextSession<B, S::Prompt, B::Token, S::TextGenerationState>
+        + TextOperationDriver<B>,
+{
+}
+
+impl<B, S> ModelRuntime<B, S>
+where
+    B: TextGenerationBackend,
+    S: TextOperationDriver<B> + CausalTextSession<B, S::Prompt, B::Token, S::TextGenerationState>,
+{
+    /// Executes one declared text operation through the portable advancement protocol.
+    #[allow(clippy::type_complexity)]
+    pub fn submit_text_operation(
+        &mut self,
+        input: PendingTextInput<S::Prompt, B::Token>,
+        decision: Option<&TokenSamplingDecision<'_>>,
+        state: &mut S::TextGenerationState,
+        remaining_tokens: Option<usize>,
+    ) -> Result<
+        Submission<TextOperationOutput<S::Prompt, B::Token>, B::TextCompletion>,
+        TextOperationError<B::Error>,
+    > {
+        if S::text_operation_kind(self, &input, state) != TextOperationKind::CausalDecision {
+            return S::submit_specialized_text_operation(
+                self,
+                input,
+                decision,
+                state,
+                remaining_tokens,
+            );
+        }
+        let decision = decision.ok_or(TextOperationPolicyError::MissingDecision)?;
+        self.validate_session_admission()
+            .map_err(TextOperationError::Backend)?;
+        let (backend, session) = self.parts_mut();
+        let submission = match input {
+            PendingTextInput::Prefill(prompt) => {
+                session.submit_causal_prefill(backend, prompt, decision.capture_domain(), state)
+            }
+            PendingTextInput::Decode(token) => {
+                session.submit_causal_decode(backend, token, decision.capture_domain(), state)
+            }
+            PendingTextInput::Continue => session.submit_causal_continuation(backend, state),
+        }?;
+        let sampled =
+            session.sample_causal_submission(backend, submission, decision.filter(), state)?;
+        Ok(Submission {
+            output: TextOperationOutput::Token(sampled.output),
+            completion: sampled.completion,
+        })
+    }
 }
 
 /// Failure from backend preprocessing or backend-requested text encoding.
@@ -2210,19 +2941,18 @@ where
     Text(#[source] T),
 }
 
-/// Backend preparation of portable decoded media for one selected session.
+/// Preparation of decoded media by the installed session driver.
 ///
 /// Caller text is tokenized before this boundary. Some processors introduce
 /// checkpoint-defined framing text or video timestamps, so the callback keeps
-/// that work on the facade's tokenizer. The selected backend returns its
-/// existing opaque prompt type; core never observes tensors or streams.
-pub trait MultimodalPreparationBackend: TextGenerationBackend {
-    /// Converts ordered token and decoded-media segments into a backend prompt.
+/// that work on the facade's tokenizer. The driver returns its prepared prompt.
+pub trait MultimodalPreparationSession<B: TextGenerationBackend>: TextOperationDriver<B> {
+    /// Converts ordered token and decoded-media segments into the driver's prompt.
     fn prepare_multimodal_input<E>(
-        runtime: &ModelRuntime<Self>,
+        &self,
         request: &TokenizedMultimodalRequest,
         encode_backend_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
+    ) -> Result<Self::Prompt, MultimodalPreparationFailure<B::Error, E>>
     where
         E: std::error::Error + Send + Sync + 'static;
 }
@@ -2231,9 +2961,9 @@ pub trait MultimodalPreparationBackend: TextGenerationBackend {
 ///
 /// Implementations inspect the opaque model and cache already owned by
 /// [`ModelRuntime`]. The contract exposes only portable documents and the
-/// backend's existing opaque prompt type; tensor, stream, allocator, and
+/// driver's prepared prompt type. Tensor, stream, allocator, and
 /// executable types remain inside the adapter.
-pub trait ModelCapabilityBackend: TextGenerationBackend {
+pub trait ModelCapabilitySession<B: TextGenerationBackend>: TextOperationDriver<B> + Sized {
     /// Releases this execution's optional conversion-retention claims at an
     /// already settled boundary. Require healthy, idle submission authority;
     /// never settle pending controlled transactions or invalidate parameters.
@@ -2241,7 +2971,7 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
     /// Keep eligible bindings available for future bounded admission. Other
     /// owners and native graphs may keep physical storage alive.
     fn trim_parameter_conversions(
-        _runtime: &mut ModelRuntime<Self>,
+        _runtime: &mut ModelRuntime<B, Self>,
     ) -> Result<
         Vec<crate::residency::ParameterConversionRetentionTrimReport>,
         crate::residency::ParameterConversionTrimError,
@@ -2252,7 +2982,7 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
     /// Reads load-selected conversion-retention policy and live usage. This must
     /// not allocate execution resources, evaluate, synchronize or mutate state.
     fn parameter_conversion_retention(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
     ) -> Result<
         crate::Observed<Vec<crate::residency::ParameterConversionRetentionReport>>,
         crate::BackendFailure,
@@ -2264,12 +2994,12 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
 
     /// Reports validated model capabilities for the selected session.
     fn model_capabilities(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
     ) -> Result<ModelCapabilities, CapabilityError>;
 
     /// Counts text and backend-specific model positions in a prepared prompt.
     fn count_prepared_input(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
         input: &Self::Prompt,
     ) -> Result<InputTokenCount, CapabilityError>;
 
@@ -2278,7 +3008,7 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
     /// IDs for projected text. Never reconstructs IDs from embeddings. An adapter
     /// without alignment observation returns a typed unavailable-capability failure.
     fn prepared_input_token_ids(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
         _input: &Self::Prompt,
     ) -> Result<Vec<u32>, crate::BackendFailure> {
         Err(crate::BackendFailure::new(
@@ -2292,14 +3022,16 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
 
     /// Estimates persistent and transient request state for this session.
     fn estimate_runtime_state(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<B, Self>,
         input: InputTokenCount,
         max_output_tokens: u64,
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError>;
 
     /// Reports static model storage and current backend memory observations.
-    fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError>;
+    fn static_memory(
+        runtime: &ModelRuntime<B, Self>,
+    ) -> Result<StaticMemoryReport, CapabilityError>;
 }
 
 /// Input for the next ordinary prediction. A committed token may still be the
@@ -2380,13 +3112,14 @@ impl<T> ControlledToken<T> {
 }
 
 /// Backend-generic generation driven by a portable token-filter controller.
-pub struct ControlledTextGeneration<'a, B, C>
+pub struct ControlledTextGeneration<'a, B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
-    runtime: &'a mut ModelRuntime<B>,
-    inner: TextRequestDriver<B, C>,
+    runtime: &'a mut ModelRuntime<B, S>,
+    inner: TextRequestDriver<B, C, S>,
 }
 
 type ControlledGenerationResult<B, C> = Result<
@@ -2397,9 +3130,10 @@ type ControlledGenerationResult<B, C> = Result<
     >,
 >;
 
-impl<'a, B, C> ControlledTextGeneration<'a, B, C>
+impl<'a, B, C, S> ControlledTextGeneration<'a, B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
     /// Independent completed-work and authoritative-output coordinates.
@@ -2431,12 +3165,12 @@ where
     }
     /// Starts controlled generation from portable prompt token ids.
     pub fn new(
-        runtime: &'a mut ModelRuntime<B>,
+        runtime: &'a mut ModelRuntime<B, S>,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
+        let prompt = S::prepare_text_prompt(runtime.backend(), prompt_token_ids)
             .map_err(ControlledTextGenerationError::Backend);
         let prompt = runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Prompt,
@@ -2446,10 +3180,10 @@ where
         Self::from_prompt(runtime, prompt, config, controller)
     }
 
-    /// Starts controlled generation from an opaque backend-prepared prompt.
+    /// Starts controlled generation from the installed driver's prepared prompt.
     pub fn from_prompt(
-        runtime: &'a mut ModelRuntime<B>,
-        prompt: B::Prompt,
+        runtime: &'a mut ModelRuntime<B, S>,
+        prompt: S::Prompt,
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
@@ -2500,7 +3234,9 @@ where
                 "capture must be configured before generation".into(),
             ))
         } else {
-            B::configure_text_capture(self.runtime, &mut self.inner.backend_state, plan)
+            self.runtime
+                .session()
+                .configure_text_capture(&mut self.inner.backend_state, plan)
         };
         self.runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Instrumentation,
@@ -2521,8 +3257,7 @@ where
                 "interventions must be configured before generation".into(),
             ))
         } else {
-            B::configure_text_interventions(
-                self.runtime,
+            self.runtime.session().configure_text_interventions(
                 &mut self.inner.backend_state,
                 capture,
                 plan,
@@ -2544,8 +3279,8 @@ where
     /// The ordinary machine retains authority and handles errors/drop as before.
     #[cfg(feature = "tensor-capture")]
     pub fn take_captured_step(&mut self) -> Result<Option<crate::capture::CapturedStep>, B::Error> {
-        self.settle_step()?;
-        Ok(B::take_text_capture(&mut self.inner.backend_state))
+        self.inner.resolve_completions_before_decode()?;
+        Ok(S::take_text_capture(&mut self.inner.backend_state))
     }
 
     /// Completes one nonfinal prefill chunk without sampling or constraint
@@ -2560,9 +3295,10 @@ where
     }
 }
 
-impl<B, C> Iterator for ControlledTextGeneration<'_, B, C>
+impl<B, C, S> Iterator for ControlledTextGeneration<'_, B, C, S>
 where
     B: TextGenerationBackend,
+    S: TextExecutionSession<B>,
     C: TokenFilterController,
 {
     type Item =
@@ -2581,12 +3317,12 @@ where
 /// Dropping the iterator settles retained submissions. Drop cannot report
 /// settlement errors; use [`ModelRuntime::synchronize`] to establish successful
 /// settlement before reuse or eviction, and [`ModelRuntime::reset`] for a fresh run.
-pub struct TextGeneration<'a, B: TextGenerationBackend> {
-    runtime: &'a mut ModelRuntime<B>,
-    inner: TextRequestDriver<B, FixedTokenFilter>,
+pub struct TextGeneration<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> {
+    runtime: &'a mut ModelRuntime<B, S>,
+    inner: TextRequestDriver<B, FixedTokenFilter, S>,
 }
 
-impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
+impl<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> TextGeneration<'a, B, S> {
     /// Establishes a healthy settled boundary without consuming pending input.
     /// Completion failure closes the iterator; it must not resume unknown state.
     pub fn synchronize(&mut self) -> Result<(), BackendFailure> {
@@ -2607,9 +3343,9 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
     pub fn observation_parts(
         &self,
     ) -> (
-        &ModelRuntime<B>,
-        &B::TextGenerationState,
-        Option<PendingTextInput<&B::Prompt, &B::Token>>,
+        &ModelRuntime<B, S>,
+        &S::TextGenerationState,
+        Option<PendingTextInput<&S::Prompt, &B::Token>>,
     ) {
         (
             self.runtime,
@@ -2634,7 +3370,7 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
 
     /// Starts generation from portable prompt token ids.
     pub fn new(
-        runtime: &'a mut ModelRuntime<B>,
+        runtime: &'a mut ModelRuntime<B, S>,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
     ) -> Result<Self, BackendFailure> {
@@ -2645,12 +3381,12 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
     /// Tokenizer-owning callers supply their mapped IDs here; sampling, history,
     /// completions and limits use the same request driver as controlled generation.
     pub fn with_token_filter(
-        runtime: &'a mut ModelRuntime<B>,
+        runtime: &'a mut ModelRuntime<B, S>,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
         filter: TokenFilter,
     ) -> Result<Self, BackendFailure> {
-        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
+        let prompt = S::prepare_text_prompt(runtime.backend(), prompt_token_ids)
             .map_err(BackendFailure::from_error);
         let prompt = runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Prompt,
@@ -2662,10 +3398,10 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         Ok(Self { runtime, inner })
     }
 
-    /// Starts generation from an opaque backend-prepared prompt.
+    /// Starts generation from the installed driver's prepared prompt.
     pub fn from_prompt(
-        runtime: &'a mut ModelRuntime<B>,
-        prompt: B::Prompt,
+        runtime: &'a mut ModelRuntime<B, S>,
+        prompt: S::Prompt,
         config: TextGenerationConfig,
     ) -> Result<Self, BackendFailure> {
         let inner =
@@ -2689,7 +3425,7 @@ where
     }
 }
 
-impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> Iterator for TextGeneration<'_, B, S> {
     type Item = Result<B::Token, BackendFailure>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2762,12 +3498,25 @@ pub trait DistributedSession {
 }
 
 /// Backend extension exposing communication attached to a model session.
-pub trait DistributedBackend: BackendProvider {
+pub trait DistributedModelSession<B: BackendProvider>: BackendSession<B> {
     /// Selected distributed session implementation.
-    type DistributedSession: DistributedSession<Error = Self::Error>;
+    type DistributedSession: DistributedSession<Error = B::Error>;
 
     /// Returns communication for a distributed model session.
-    fn distributed_session(session: &Self::Session) -> Option<&Self::DistributedSession>;
+    fn distributed_session(&self) -> Option<&Self::DistributedSession>;
+}
+
+/// Native cache storage and completion operations for local components.
+pub trait LocalComponentStorage: eredu_nn::NeuralBackend {
+    /// Native tensors and transfers for the selected component cache.
+    type CacheStorage: crate::cache::mechanisms::CacheTensorStorage<Value = Self::Tensor>;
+
+    /// Establishes completion of the supplied values.
+    fn settle_local_values<'a>(
+        values: impl Iterator<Item = &'a Self::Tensor>,
+    ) -> Result<(), crate::BackendFailure>
+    where
+        Self::Tensor: 'a;
 }
 
 #[cfg(test)]
@@ -2864,28 +3613,12 @@ mod tests {
     }
     struct Mock;
     impl BackendProvider for Mock {
-        type ModelConfig = u32;
-        type Model = u32;
-        type Session = MockSession;
         type Error = Infallible;
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor::new("mock", "1")
         }
         fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
             Ok(vec![])
-        }
-        fn prepare_model(&self, config: u32) -> Result<PreparedModel<u32>, Self::Error> {
-            Ok(PreparedModel::new(config, SessionCapabilities::default()))
-        }
-        fn create_session(&self, model: PreparedModel<u32>) -> Result<MockSession, Self::Error> {
-            Ok(MockSession {
-                model: model.into_inner(),
-                tokens: vec![],
-                distributed: None,
-                prefill_lengths: Vec::new(),
-                cancel_on_prefill: None,
-                prepare_ingress: false,
-            })
         }
     }
 
@@ -2952,9 +3685,6 @@ mod tests {
         LoadingConfigurationResolver;
 
     impl BackendProvider for LoadingMock {
-        type ModelConfig = (ModelPreparationPlan, u32);
-        type Model = u32;
-        type Session = LoadingMockSession;
         type Error = std::convert::Infallible;
 
         fn descriptor(&self) -> BackendDescriptor {
@@ -2964,24 +3694,16 @@ mod tests {
         fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
             Ok(Vec::new())
         }
+    }
 
-        fn prepare_model(
-            &self,
-            (plan, model): Self::ModelConfig,
-        ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-            self.materializations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            assert_eq!(plan.inspection().configuration().family(), "llama");
-            Ok(PreparedModel::new(
-                model,
-                plan.admitted_session_capabilities(),
-            ))
-        }
+    impl ModelSessionInstaller<LoadingMock> for LoadingMockSession {
+        type Model = u32;
+        type Session = Self;
 
-        fn create_session(
-            &self,
-            _: PreparedModel<Self::Model>,
-        ) -> Result<Self::Session, Self::Error> {
+        fn install_session(
+            _: &LoadingMock,
+            _: PreparedModel<u32>,
+        ) -> Result<Self, std::convert::Infallible> {
             Ok(LoadingMockSession)
         }
     }
@@ -3042,24 +3764,42 @@ mod tests {
         }
     }
 
-    impl ModelLoadingBackend for LoadingMock {
-        type LoadOptions = u32;
-        type SelectedPreparation = (u32, crate::PreparationAdmission);
-        type ConfigurationResolver = LoadingConfigurationResolver;
+    struct RetainLoadingPlan(crate::PreparationAdmission);
 
-        fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
-            &LOADING_CONFIGURATION_RESOLVER
+    impl ModelSourcePreparation<()> for RetainLoadingPlan {
+        type Prepared = ModelPreparationPlan<()>;
+        type Error = Infallible;
+
+        fn admission(&self) -> crate::PreparationAdmission {
+            self.0
         }
 
-        fn select_preparation(
-            &self,
-            _: &ArtifactInspection,
-            options: &Self::LoadOptions,
-        ) -> Result<Self::SelectedPreparation, Self::Error> {
-            self.selections
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fn prepare(self, plan: ModelPreparationPlan<()>) -> Result<Self::Prepared, Self::Error> {
+            Ok(plan)
+        }
+    }
+
+    struct FixtureLoadFacts(u32);
+
+    impl DirectLoadFacts for FixtureLoadFacts {
+        type Request = u32;
+        type Mechanisms = ();
+        fn rank(_: &u32) -> Option<crate::ParallelRankTopology> {
+            None
+        }
+        fn from_request(options: u32, (): ()) -> Self {
+            Self(options)
+        }
+    }
+
+    impl ModelLoadAdmission<()> for FixtureLoadFacts {
+        type SourcePreparation = RetainLoadingPlan;
+        type Error = Infallible;
+
+        fn select(self, _: &ArtifactInspection) -> Result<Self::SourcePreparation, Self::Error> {
+            let Self(options) = self;
             let policy = crate::PreparationPolicy::default().with_required_session_capabilities(
-                SessionCapabilities::default().with_activation_inspection(*options == 99),
+                SessionCapabilities::default().with_activation_inspection(options == 99),
             );
             let request = crate::PreparationAdmissionRequest::new(
                 crate::LoadingProtocol::Model,
@@ -3080,26 +3820,48 @@ mod tests {
                     .with_residency(crate::ResidencyRequest::FullyResident, true)
                     .with_input_modalities(crate::InputModalities::TEXT)
                     .with_session(
-                        SessionCapabilities::default().with_activation_inspection(*options == 99),
+                        SessionCapabilities::default().with_activation_inspection(options == 99),
                     ),
             )
             .expect("mock admission facts are coherent");
-            Ok((*options, admission))
+            Ok(RetainLoadingPlan(admission))
+        }
+    }
+
+    impl ModelLoadingBackend for LoadingMock {
+        type LoadPlacement = u32;
+        type Binding = u32;
+        type LoadMechanisms = ();
+
+        fn load_mechanisms(&self) {
+            self.selections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        fn selected_preparation_admission(
+        fn bind_load_placement(
             &self,
-            selected: &Self::SelectedPreparation,
-        ) -> crate::PreparationAdmission {
-            selected.1
+            _: Option<crate::ParallelRankTopology>,
+            selected: Option<u32>,
+        ) -> Result<u32, Self::Error> {
+            Ok(selected.unwrap())
         }
+    }
 
-        fn model_config(
-            &self,
-            selected: SelectedModelPreparation<Self>,
-        ) -> Result<Self::ModelConfig, Self::Error> {
-            let (plan, (selected, _admission)) = selected.into_parts();
-            Ok((plan, selected))
+    impl BindModelSources<LoadingMock> for ModelPreparationPlan<()> {
+        type Model = u32;
+        fn construct_model(
+            self,
+            backend: &LoadingMock,
+            selected: u32,
+        ) -> Result<PreparedModel<u32>, BackendFailure> {
+            backend
+                .materializations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(self.inspection().configuration().family(), "llama");
+            Ok(PreparedModel::new(
+                selected,
+                self.admitted_session_capabilities(),
+            ))
         }
     }
 
@@ -3120,6 +3882,22 @@ mod tests {
         cancel_on_prefill: Option<crate::GenerationCancellationToken>,
         prepare_ingress: bool,
     }
+    impl ModelSessionInstaller<Mock> for MockSession {
+        type Model = u32;
+        type Session = Self;
+
+        fn install_session(_: &Mock, model: PreparedModel<u32>) -> Result<Self, Infallible> {
+            Ok(MockSession {
+                model: model.into_inner(),
+                tokens: vec![],
+                distributed: None,
+                prefill_lengths: Vec::new(),
+                cancel_on_prefill: None,
+                prepare_ingress: false,
+            })
+        }
+    }
+
     impl BackendSession<Mock> for MockSession {
         type PrefillInput = Vec<u32>;
         type DecodeInput = u32;
@@ -3163,62 +3941,62 @@ mod tests {
         }
     }
 
-    impl TextGenerationBackend for Mock {
-        fn prefill_text_prefix(
-            runtime: &mut ModelRuntime<Self>,
-            prompt: &mut Self::Prompt,
-            maximum: std::num::NonZeroUsize,
-            _: &mut Self::TextGenerationState,
-        ) -> Result<bool, Self::Error> {
-            if std::mem::take(&mut runtime.session_mut().prepare_ingress) {
-                return Ok(true);
-            }
-            if prompt.len() <= maximum.get() {
-                return Ok(false);
-            }
-            let suffix = prompt.split_off(maximum.get());
-            let prefix = std::mem::replace(prompt, suffix);
-            runtime.prefill(prefix)?.completion.wait()?;
-            Ok(true)
-        }
-
-        fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
-            session.tokens.clear();
+    impl TextSessionLifecycle<Mock> for MockSession {
+        fn reset_session(&mut self, _: &Mock) -> Result<(), BackendFailure> {
+            self.tokens.clear();
             Ok(())
         }
 
-        fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), BackendFailure> {
+        fn synchronize_session(&self, _: &Mock) -> Result<(), BackendFailure> {
             Ok(())
         }
+    }
 
+    impl CausalTextSession<Mock, Vec<u32>, u32, (u32, u64)> for MockSession {}
+
+    impl TextOperationDriver<Mock> for MockSession {
         type Prompt = Vec<u32>;
-        type Token = u32;
-        type TextGenerationState = (u32, u64);
-        type TextCompletion = Done;
-
-        fn start_text_generation(
-            _: &Self,
-            config: TextGenerationConfig,
-        ) -> Result<Self::TextGenerationState, Self::Error> {
-            Ok((config.sampling().top_k as u32, config.seed()))
-        }
-
         fn prepare_text_prompt(
-            _: &Self,
+            _: &Mock,
             prompt_token_ids: Vec<u32>,
-        ) -> Result<Self::Prompt, Self::Error> {
+        ) -> Result<
+            <MockSession as TextOperationDriver<Mock>>::Prompt,
+            <Mock as BackendProvider>::Error,
+        > {
             Ok(prompt_token_ids)
         }
 
-        fn submit_text_operation(
-            runtime: &mut ModelRuntime<Self>,
-            input: crate::PendingTextInput<Self::Prompt, Self::Token>,
+        type TextGenerationState = (u32, u64);
+
+        fn start_text_generation(
+            &self,
+            _: &Mock,
+            config: TextGenerationConfig,
+        ) -> Result<
+            <Self as TextOperationDriver<Mock>>::TextGenerationState,
+            <Mock as BackendProvider>::Error,
+        > {
+            Ok((config.sampling().top_k as u32, config.seed()))
+        }
+
+        fn submit_specialized_text_operation(
+            runtime: &mut ModelRuntime<Mock, MockSession>,
+            input: crate::PendingTextInput<
+                <MockSession as TextOperationDriver<Mock>>::Prompt,
+                <Mock as TextGenerationBackend>::Token,
+            >,
             decision: Option<&crate::TokenSamplingDecision<'_>>,
-            state: &mut Self::TextGenerationState,
+            state: &mut <Self as TextOperationDriver<Mock>>::TextGenerationState,
             _remaining_tokens: Option<usize>,
         ) -> Result<
-            Submission<crate::TextOperationOutput<Self::Prompt, Self::Token>, Self::TextCompletion>,
-            crate::TextOperationError<Self::Error>,
+            Submission<
+                crate::TextOperationOutput<
+                    <MockSession as TextOperationDriver<Mock>>::Prompt,
+                    <Mock as TextGenerationBackend>::Token,
+                >,
+                <Mock as TextGenerationBackend>::TextCompletion,
+            >,
+            crate::TextOperationError<<Mock as BackendProvider>::Error>,
         > {
             let decision = decision.ok_or(crate::TextOperationPolicyError::MissingDecision)?;
             let filter = decision.filter();
@@ -3226,7 +4004,7 @@ mod tests {
                 return Err(crate::TextOperationPolicyError::UnsupportedContinuation.into());
             }
             let submission =
-                || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+                || -> Result<Submission<<Mock as TextGenerationBackend>::Token, <Mock as TextGenerationBackend>::TextCompletion>, <Mock as BackendProvider>::Error> {
                     match input {
                         crate::PendingTextInput::Prefill(prompt) => {
                             let submission = runtime.prefill(prompt)?;
@@ -3256,14 +4034,45 @@ mod tests {
                 completion: submission.completion,
             })
         }
+
+        fn prefill_text_prefix(
+            runtime: &mut ModelRuntime<Mock, MockSession>,
+            prompt: &mut Vec<u32>,
+            maximum: std::num::NonZeroUsize,
+            _: &mut (u32, u64),
+        ) -> Result<bool, Infallible> {
+            if std::mem::take(&mut runtime.session_mut().prepare_ingress) {
+                return Ok(true);
+            }
+            if prompt.len() <= maximum.get() {
+                return Ok(false);
+            }
+            let suffix = prompt.split_off(maximum.get());
+            let prefix = std::mem::replace(prompt, suffix);
+            runtime.prefill(prefix)?.completion.wait()?;
+            Ok(true)
+        }
     }
 
-    impl MultimodalPreparationBackend for Mock {
+    impl AutomaticPromptCacheSession<Mock> for MockSession {}
+
+    impl TextGenerationBackend for Mock {
+        type InputTensor = u32;
+
+        type Token = u32;
+
+        type TextCompletion = Done;
+    }
+
+    impl MultimodalPreparationSession<Mock> for MockSession {
         fn prepare_multimodal_input<E>(
-            _: &ModelRuntime<Self>,
+            &self,
             request: &TokenizedMultimodalRequest,
             _: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-        ) -> Result<Self::Prompt, MultimodalPreparationFailure<Self::Error, E>>
+        ) -> Result<
+            <MockSession as TextOperationDriver<Mock>>::Prompt,
+            MultimodalPreparationFailure<<Mock as BackendProvider>::Error, E>,
+        >
         where
             E: std::error::Error + Send + Sync + 'static,
         {
@@ -3288,9 +4097,9 @@ mod tests {
         }
     }
 
-    impl ModelCapabilityBackend for Mock {
+    impl ModelCapabilitySession<Mock> for MockSession {
         fn model_capabilities(
-            _: &ModelRuntime<Self>,
+            _: &ModelRuntime<Mock, Self>,
         ) -> Result<ModelCapabilities, CapabilityError> {
             Ok(ModelCapabilities {
                 effective_model_type: "mock".into(),
@@ -3303,14 +4112,14 @@ mod tests {
         }
 
         fn count_prepared_input(
-            _: &ModelRuntime<Self>,
-            input: &Self::Prompt,
+            _: &ModelRuntime<Mock, Self>,
+            input: &<MockSession as TextOperationDriver<Mock>>::Prompt,
         ) -> Result<InputTokenCount, CapabilityError> {
             Ok(InputTokenCount::text(input.len() as u64))
         }
 
         fn estimate_runtime_state(
-            _: &ModelRuntime<Self>,
+            _: &ModelRuntime<Mock, Self>,
             input: InputTokenCount,
             max_output_tokens: u64,
             batch_size: u64,
@@ -3341,7 +4150,7 @@ mod tests {
         }
 
         fn static_memory(
-            runtime: &ModelRuntime<Self>,
+            runtime: &ModelRuntime<Mock, Self>,
         ) -> Result<StaticMemoryReport, CapabilityError> {
             let unavailable = || crate::Observed::unavailable("mock does not expose this counter");
             Ok(StaticMemoryReport {
@@ -3385,15 +4194,29 @@ mod tests {
     fn generic_loader_inspects_plans_and_prepares_on_the_selected_backend() {
         let root = tempfile::tempdir().unwrap();
         write_loading_fixture(root.path());
-        let prepared = load_model(&LoadingMock::default(), root.path(), 41).unwrap();
+        let prepared = load_model::<_, _, FixtureLoadFacts>(
+            &LoadingMock::default(),
+            root.path(),
+            &LOADING_CONFIGURATION_RESOLVER,
+            ModelLoadOptions::new(41).with_placement(41),
+        )
+        .unwrap();
         assert_eq!(*prepared, 41);
 
-        let runtime = ModelRuntime::load(LoadingMock::default(), root.path(), 7).unwrap();
+        let backend = LoadingMock::default();
+        let prepared = load_model::<_, _, FixtureLoadFacts>(
+            &backend,
+            root.path(),
+            &LOADING_CONFIGURATION_RESOLVER,
+            ModelLoadOptions::new(7).with_placement(7),
+        )
+        .unwrap();
+        let runtime = ModelRuntime::install::<LoadingMockSession>(backend, prepared).unwrap();
         assert_eq!(runtime.backend().descriptor().name, "loading-mock");
 
         let missing = root.path().join("missing");
         assert!(matches!(
-            load_model(&LoadingMock::default(), &missing, 1),
+            load_model::<_, _, FixtureLoadFacts>(&LoadingMock::default(), &missing, &LOADING_CONFIGURATION_RESOLVER, ModelLoadOptions::new(1).with_placement(1)),
             Err(ModelLoadError::Artifact(ArtifactError::MissingArtifact(path)))
                 if path == missing
         ));
@@ -3405,7 +4228,13 @@ mod tests {
         write_loading_fixture(root.path());
         let backend = LoadingMock::default();
 
-        let prepared = load_model(&backend, root.path(), 99).unwrap();
+        let prepared = load_model::<_, _, FixtureLoadFacts>(
+            &backend,
+            root.path(),
+            &LOADING_CONFIGURATION_RESOLVER,
+            ModelLoadOptions::new(99).with_placement(99),
+        )
+        .unwrap();
 
         assert_eq!(*prepared, 99);
         assert_eq!(
@@ -3465,9 +4294,6 @@ mod tests {
 
     struct PhasedMock;
     impl BackendProvider for PhasedMock {
-        type ModelConfig = u32;
-        type Model = u32;
-        type Session = MockSession;
         type Error = Infallible;
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor::new("phased_mock", "1")
@@ -3475,13 +4301,17 @@ mod tests {
         fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Infallible> {
             Mock.devices()
         }
-        fn prepare_model(&self, config: u32) -> Result<PreparedModel<u32>, Infallible> {
-            Mock.prepare_model(config)
-        }
-        fn create_session(&self, model: PreparedModel<u32>) -> Result<MockSession, Infallible> {
-            Mock.create_session(model)
+    }
+
+    impl ModelSessionInstaller<PhasedMock> for MockSession {
+        type Model = u32;
+        type Session = Self;
+
+        fn install_session(_: &PhasedMock, model: PreparedModel<u32>) -> Result<Self, Infallible> {
+            <Self as ModelSessionInstaller<Mock>>::install_session(&Mock, model)
         }
     }
+
     impl BackendSession<PhasedMock> for MockSession {
         type PrefillInput = Vec<u32>;
         type DecodeInput = u32;
@@ -3518,31 +4348,39 @@ mod tests {
         iterations: u32,
         block: u64,
     }
-    impl TextGenerationBackend for PhasedMock {
+    impl TextSessionLifecycle<PhasedMock> for MockSession {
+        fn reset_session(&mut self, _: &PhasedMock) -> Result<(), BackendFailure> {
+            <Self as TextSessionLifecycle<Mock>>::reset_session(self, &Mock)
+        }
+        fn synchronize_session(&self, _: &PhasedMock) -> Result<(), BackendFailure> {
+            <Self as TextSessionLifecycle<Mock>>::synchronize_session(self, &Mock)
+        }
+    }
+
+    impl CausalTextSession<PhasedMock, Vec<u32>, u32, PhasedState> for MockSession {}
+
+    impl TextOperationDriver<PhasedMock> for MockSession {
         type Prompt = Vec<u32>;
-        type Token = u32;
-        type TextGenerationState = PhasedState;
-        type TextCompletion = Done;
-        fn supports_block_refinement(_: &ModelRuntime<Self>) -> bool {
-            true
-        }
-        fn reset_session(_: &Self, session: &mut MockSession) -> Result<(), BackendFailure> {
-            Mock::reset_session(&Mock, session)
-        }
-        fn synchronize_session(_: &Self, session: &MockSession) -> Result<(), BackendFailure> {
-            Mock::synchronize_session(&Mock, session)
-        }
-        fn prepare_text_prompt(_: &Self, prompt: Vec<u32>) -> Result<Vec<u32>, Infallible> {
+        fn prepare_text_prompt(_: &PhasedMock, prompt: Vec<u32>) -> Result<Vec<u32>, Infallible> {
             Ok(prompt)
         }
+
+        type TextGenerationState = PhasedState;
+
         fn start_text_generation(
-            _: &Self,
+            &self,
+            _: &PhasedMock,
             _: TextGenerationConfig,
         ) -> Result<PhasedState, Infallible> {
             Ok(PhasedState::default())
         }
+
+        fn supports_block_refinement(&self) -> bool {
+            true
+        }
+
         fn text_operation_kind(
-            _: &ModelRuntime<Self>,
+            _: &ModelRuntime<PhasedMock, MockSession>,
             input: &PendingTextInput<Vec<u32>, u32>,
             state: &PhasedState,
         ) -> TextOperationKind {
@@ -3559,8 +4397,9 @@ mod tests {
                 }
             }
         }
-        fn submit_text_operation(
-            runtime: &mut ModelRuntime<Self>,
+
+        fn submit_specialized_text_operation(
+            runtime: &mut ModelRuntime<PhasedMock, MockSession>,
             input: PendingTextInput<Vec<u32>, u32>,
             decision: Option<&TokenSamplingDecision<'_>>,
             state: &mut PhasedState,
@@ -3614,6 +4453,16 @@ mod tests {
         }
     }
 
+    impl AutomaticPromptCacheSession<PhasedMock> for MockSession {}
+
+    impl TextGenerationBackend for PhasedMock {
+        type InputTensor = u32;
+
+        type Token = u32;
+
+        type TextCompletion = Done;
+    }
+
     #[test]
     fn mismatched_refinement_policy_is_rejected_before_context_or_sampling() {
         let sampling =
@@ -3627,7 +4476,11 @@ mod tests {
                 }),
             },
         ));
-        let mut runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
+        let mut runtime = ModelRuntime::<PhasedMock, MockSession>::install::<MockSession>(
+            PhasedMock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let controller = FixedController {
             queries: 0,
             tokens: vec![5],
@@ -3663,7 +4516,11 @@ mod tests {
             tokens: vec![5, 8],
             committed: 0,
         };
-        let mut ordinary_runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
+        let mut ordinary_runtime = ModelRuntime::<PhasedMock, MockSession>::install::<MockSession>(
+            PhasedMock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut ordinary = ControlledTextGeneration::new(
             &mut ordinary_runtime,
             vec![1, 2],
@@ -3677,7 +4534,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ordinary.inner.controller.queries, 2);
         drop(ordinary);
-        let mut runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
+        let mut runtime = ModelRuntime::<PhasedMock, MockSession>::install::<MockSession>(
+            PhasedMock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver.start(vec![1, 2], config, controller).unwrap();
         let mut actual = Vec::new();
@@ -3726,9 +4587,13 @@ mod tests {
 
     #[test]
     fn lifecycle_preserves_selected_target_and_loaded_parameters() {
-        let prepared = Mock.prepare_model(10).unwrap();
-        let mut runtime =
-            ModelRuntime::from_prepared_execution_plan_target(Mock, prepared, 42).unwrap();
+        let prepared = PreparedModel::new(10, SessionCapabilities::default());
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install_with_target::<MockSession>(
+            Mock,
+            prepared,
+            Some(42),
+        )
+        .unwrap();
         let capabilities = runtime.capabilities();
         assert_eq!(runtime.prefill(vec![1, 2]).unwrap().output, 12);
         runtime.synchronize().unwrap();
@@ -3746,7 +4611,11 @@ mod tests {
             let prompt = (0..length)
                 .map(|index| index as u32 + 1)
                 .collect::<Vec<_>>();
-            let mut ordinary_runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+            let mut ordinary_runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+                Mock,
+                PreparedModel::new(10, SessionCapabilities::default()),
+            )
+            .unwrap();
             let ordinary = TextGeneration::new(
                 &mut ordinary_runtime,
                 prompt.clone(),
@@ -3757,7 +4626,11 @@ mod tests {
             .unwrap()
             .map(|token| token.unwrap())
             .collect::<Vec<_>>();
-            let mut chunk_runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+            let mut chunk_runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+                Mock,
+                PreparedModel::new(10, SessionCapabilities::default()),
+            )
+            .unwrap();
             let chunked = ControlledTextGeneration::new(
                 &mut chunk_runtime,
                 prompt.clone(),
@@ -3784,7 +4657,11 @@ mod tests {
     #[test]
     fn cancellation_after_a_prefill_chunk_does_not_sample_or_decode() {
         let cancellation = crate::GenerationCancellationToken::new();
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         runtime.session_mut().cancel_on_prefill = Some(cancellation.clone());
         let config = continuation_config(4).with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
             std::num::NonZeroUsize::new(2).unwrap(),
@@ -3806,7 +4683,11 @@ mod tests {
 
     #[test]
     fn portable_text_generation_prefills_and_decodes_without_tensor_types() {
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let sampling = crate::resolve_generation_config(
             None,
             crate::GenerationConfigOverrides {
@@ -3829,7 +4710,11 @@ mod tests {
 
     #[test]
     fn portable_media_preparation_feeds_the_existing_generation_contract() {
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let request = crate::MultimodalRequest::new(vec![
             crate::MultimodalSegment::TokenIds(vec![7, 8]),
             crate::MultimodalSegment::Media(crate::Media::Image(
@@ -3840,10 +4725,10 @@ mod tests {
         .unwrap()
         .tokenize::<Infallible>(|_| unreachable!("request is already tokenized"))
         .unwrap();
-        let prompt = Mock::prepare_multimodal_input(&runtime, &request, &mut |_| {
-            Ok::<_, Infallible>(Vec::new())
-        })
-        .unwrap();
+        let prompt = runtime
+            .session()
+            .prepare_multimodal_input(&request, &mut |_| Ok::<_, Infallible>(Vec::new()))
+            .unwrap();
         assert_eq!(prompt, vec![7, 8, 1_001, 9]);
 
         let sampling = crate::resolve_generation_config(
@@ -3864,7 +4749,11 @@ mod tests {
 
     #[test]
     fn controlled_generation_applies_portable_filters_and_commits_tokens() {
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let sampling = crate::resolve_generation_config(
             None,
             crate::GenerationConfigOverrides {
@@ -3917,7 +4806,11 @@ mod tests {
 
     #[test]
     fn detached_prefill_advances_one_completed_chunk_without_sampling() {
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         runtime.session_mut().prepare_ingress = true;
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
@@ -3986,7 +4879,11 @@ mod tests {
     #[test]
     fn detached_prefill_cancellation_keeps_sampler_and_pending_input_untouched() {
         let cancellation = crate::GenerationCancellationToken::new();
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
             .start(
@@ -4019,7 +4916,11 @@ mod tests {
             tokens: vec![7, 8, 9],
             committed: 0,
         };
-        let mut ordinary_runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut ordinary_runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let ordinary: Vec<_> = ControlledTextGeneration::new(
             &mut ordinary_runtime,
             vec![1, 2],
@@ -4030,7 +4931,11 @@ mod tests {
         .map(|token| token.unwrap().token_id())
         .collect();
 
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
             .start(vec![1, 2], continuation_config(3), controller())
@@ -4071,8 +4976,16 @@ mod tests {
 
     #[test]
     fn detached_continuation_cannot_attach_to_another_driver() {
-        let mut first = ModelRuntime::prepare(Mock, 10).unwrap();
-        let mut other = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut first = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
+        let mut other = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut owner = TextGenerationDriver::new(&mut first);
         let mut state = owner
             .start(
@@ -4117,7 +5030,11 @@ mod tests {
                 Ok(false)
             }
         }
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
             .start(vec![1, 2], continuation_config(3), RejectCommit)
@@ -4155,7 +5072,11 @@ mod tests {
                 Ok(false)
             }
         }
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut runtime = ModelRuntime::<Mock, MockSession>::install::<MockSession>(
+            Mock,
+            PreparedModel::new(10, SessionCapabilities::default()),
+        )
+        .unwrap();
         let mut driver = TextGenerationDriver::new(&mut runtime);
         let mut state = driver
             .start(vec![1, 2], continuation_config(3), PanickingFilter)
@@ -4262,11 +5183,11 @@ mod tests {
         }
     }
 
-    impl DistributedBackend for Mock {
+    impl DistributedModelSession<Mock> for MockSession {
         type DistributedSession = MockDistributed;
 
-        fn distributed_session(session: &MockSession) -> Option<&Self::DistributedSession> {
-            session.distributed.as_ref()
+        fn distributed_session(&self) -> Option<&Self::DistributedSession> {
+            self.distributed.as_ref()
         }
     }
 
@@ -4317,7 +5238,7 @@ mod tests {
             prepare_ingress: false,
         };
         assert_eq!(
-            Mock::distributed_session(&model_session)
+            DistributedModelSession::<Mock>::distributed_session(&model_session)
                 .unwrap()
                 .descriptor(),
             session.descriptor()

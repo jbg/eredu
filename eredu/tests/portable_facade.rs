@@ -97,9 +97,6 @@ impl TokenOutput for MockToken {
 }
 
 impl BackendProvider for MockBackend {
-    type ModelConfig = ();
-    type Model = ();
-    type Session = MockSession;
     type Error = MockError;
 
     fn descriptor(&self) -> BackendDescriptor {
@@ -109,15 +106,19 @@ impl BackendProvider for MockBackend {
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
         Ok(Vec::new())
     }
+}
 
-    fn prepare_model(
-        &self,
-        _: Self::ModelConfig,
-    ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        Ok(PreparedModel::new((), SessionCapabilities::default()))
-    }
+impl eredu::api::TextSessionComposition for MockBackend {
+    type Model = ();
+    type Installed = MockSession;
+    type Installer = MockSession;
+}
 
-    fn create_session(&self, _: PreparedModel<Self::Model>) -> Result<Self::Session, Self::Error> {
+impl eredu_core::backend::ModelSessionInstaller<MockBackend> for MockSession {
+    type Model = ();
+    type Session = Self;
+
+    fn install_session(_: &MockBackend, _: PreparedModel<()>) -> Result<Self, MockError> {
         Ok(MockSession)
     }
 }
@@ -170,45 +171,63 @@ impl BackendSession<MockBackend> for MockSession {
     }
 }
 
-impl TextGenerationBackend for MockBackend {
-    fn reset_session(_: &Self, _: &mut Self::Session) -> Result<(), eredu_core::BackendFailure> {
+impl eredu_core::TextSessionLifecycle<MockBackend> for MockSession {
+    fn reset_session(&mut self, _: &MockBackend) -> Result<(), eredu_core::BackendFailure> {
         Ok(())
     }
 
-    fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), eredu_core::BackendFailure> {
+    fn synchronize_session(&self, _: &MockBackend) -> Result<(), eredu_core::BackendFailure> {
         Ok(())
     }
+}
 
+impl eredu_core::backend::CausalTextSession<MockBackend, Vec<u32>, MockToken, ()> for MockSession {}
+
+impl eredu_core::backend::TextOperationDriver<MockBackend> for MockSession {
     type Prompt = Vec<u32>;
-    type Token = MockToken;
-    type TextGenerationState = ();
-    type TextCompletion = Complete;
-
-    fn start_text_generation(
-        backend: &Self,
-        config: TextGenerationConfig,
-    ) -> Result<Self::TextGenerationState, Self::Error> {
-        backend.calls.borrow_mut().configs.push(config);
-        Ok(())
-    }
-
-    fn prepare_text_prompt(backend: &Self, ids: Vec<u32>) -> Result<Self::Prompt, Self::Error> {
+    fn prepare_text_prompt(
+        backend: &MockBackend,
+        ids: Vec<u32>,
+    ) -> Result<
+        <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+        <MockBackend as BackendProvider>::Error,
+    > {
         backend.calls.borrow_mut().prompts += 1;
         Ok(ids)
     }
 
-    fn submit_text_operation(
-        runtime: &mut ModelRuntime<Self>,
-        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+    type TextGenerationState = ();
+
+    fn start_text_generation(
+        &self,
+        backend: &MockBackend,
+        config: TextGenerationConfig,
+    ) -> Result<
+        <Self as eredu_core::backend::TextOperationDriver<MockBackend>>::TextGenerationState,
+        <MockBackend as BackendProvider>::Error,
+    > {
+        backend.calls.borrow_mut().configs.push(config);
+        Ok(())
+    }
+
+    fn submit_specialized_text_operation(
+        runtime: &mut ModelRuntime<MockBackend, MockSession>,
+        input: eredu_core::PendingTextInput<
+            <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+            <MockBackend as TextGenerationBackend>::Token,
+        >,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
-        _state: &mut Self::TextGenerationState,
+        _state: &mut <Self as eredu_core::backend::TextOperationDriver<MockBackend>>::TextGenerationState,
         _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
-            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
-            Self::TextCompletion,
+            eredu_core::TextOperationOutput<
+                <MockSession as eredu_core::backend::TextOperationDriver<MockBackend>>::Prompt,
+                <MockBackend as TextGenerationBackend>::Token,
+            >,
+            <MockBackend as TextGenerationBackend>::TextCompletion,
         >,
-        eredu_core::TextOperationError<Self::Error>,
+        eredu_core::TextOperationError<<MockBackend as eredu_core::BackendProvider>::Error>,
     > {
         let decision = decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
         let filter = decision.filter();
@@ -216,7 +235,7 @@ impl TextGenerationBackend for MockBackend {
             return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
         }
         let submission =
-            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+            || -> Result<Submission<<MockBackend as TextGenerationBackend>::Token, <MockBackend as TextGenerationBackend>::TextCompletion>, <MockBackend as eredu_core::BackendProvider>::Error> {
                 match input {
                     eredu_core::PendingTextInput::Prefill(prompt) => {
                         let submission = runtime.prefill(prompt)?;
@@ -243,6 +262,16 @@ impl TextGenerationBackend for MockBackend {
             completion: submission.completion,
         })
     }
+}
+
+impl eredu_core::AutomaticPromptCacheSession<MockBackend> for MockSession {}
+
+impl TextGenerationBackend for MockBackend {
+    type InputTensor = u32;
+
+    type Token = MockToken;
+
+    type TextCompletion = Complete;
 }
 
 #[test]
@@ -295,7 +324,11 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
             "<tool_call>\n<function=lookup>\n<parameter=value>\n7\n</parameter>\n</function>\n</tool_call><|im_end|>", false,
         ).unwrap().get_ids().iter().copied().collect();
     }
-    let runtime = ModelRuntime::prepare(backend, ()).unwrap();
+    let runtime = ModelRuntime::install::<MockSession>(
+        backend,
+        PreparedModel::new((), SessionCapabilities::default()),
+    )
+    .unwrap();
     let mut model = LoadedModel::from_runtime(
         runtime,
         tokenizer,
@@ -474,7 +507,11 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                     .copied()
                     .collect();
                 let mut model = LoadedModel::from_runtime(
-                    ModelRuntime::prepare(backend, ()).unwrap(),
+                    ModelRuntime::install::<MockSession>(
+                        backend,
+                        PreparedModel::new((), SessionCapabilities::default()),
+                    )
+                    .unwrap(),
                     ChatTokenizer::from_tokenizer(tokenizer.clone()),
                     LoadedTextModelConfig {
                         model_family: ModelKind::Qwen2,
@@ -660,7 +697,7 @@ fn portable_snapshot_checks_exact_membership_and_truncated_payloads() {
     assert!(eredu::api::inspect_safetensors_snapshot(directory.path()).is_err());
 }
 
-fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {
+fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend, MockSession> {
     sparse_vocabulary_model_with_backend(
         MockBackend {
             logits,
@@ -673,7 +710,7 @@ fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {
 fn sparse_vocabulary_model_with_backend(
     backend: MockBackend,
     checkpoint_generation_config: Option<eredu_core::generation::CheckpointGenerationConfig>,
-) -> LoadedModel<MockBackend> {
+) -> LoadedModel<MockBackend, MockSession> {
     let words = WordLevel::builder()
         .vocab(
             [
@@ -694,7 +731,11 @@ fn sparse_vocabulary_model_with_backend(
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     LoadedModel::from_runtime(
-        ModelRuntime::prepare(backend, ()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            backend,
+            PreparedModel::new((), SessionCapabilities::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -775,12 +816,12 @@ fn ordinary_generation_fails_if_no_mapped_id_is_executable() {
         .build()
         .unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(
+        ModelRuntime::install::<MockSession>(
             MockBackend {
                 logits: vec![100.0, 200.0],
                 ..Default::default()
             },
-            (),
+            PreparedModel::new((), SessionCapabilities::default()),
         )
         .unwrap(),
         ChatTokenizer::from_tokenizer(Tokenizer::new(words)),

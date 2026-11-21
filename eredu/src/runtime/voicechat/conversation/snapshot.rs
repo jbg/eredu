@@ -1,6 +1,7 @@
 //! Independent host carry; the enclosing publication owns restore admission.
 
 use super::*;
+use eredu_core::execution_control::SnapshotRetention;
 use eredu_core::{
     execution_control::{ExecutionControlError, SnapshotEstimate},
     BackendFailure,
@@ -73,7 +74,7 @@ impl SnapshotValue for ConversationState {
         ])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             turn: self.turn.copy_snapshot()?,
             channel: self.channel.copy_snapshot()?,
@@ -101,7 +102,7 @@ impl SnapshotValue for ConversationSnapshot {
         conversation_estimate(&self.state)
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             state: self.state.copy_snapshot_value(retention)?,
         })
@@ -147,7 +148,11 @@ impl VoiceChatConversation {
         self.validate_snapshot_idle()
             .map_err(BackendFailure::from_error)?;
         Ok(ConversationSnapshot {
-            state: self.owner.borrow().state.copy_snapshot_value(retention)?,
+            state: self
+                .owner
+                .borrow()
+                .state
+                .copy_snapshot_value(&retention.authority())?,
         })
     }
 

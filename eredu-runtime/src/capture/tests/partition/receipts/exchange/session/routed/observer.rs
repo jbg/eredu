@@ -75,6 +75,7 @@ impl CaptureBackend for ObserverBackend {
         _: &Value,
         _: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         unreachable!()
     }

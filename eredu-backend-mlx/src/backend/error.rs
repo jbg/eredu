@@ -1,15 +1,5 @@
 use safemlx::error::Exception;
 
-/// Backend-produced evidence that a failed model call did not advance state.
-/// The payload has no public constructor; native completion must still be
-/// proven independently before a session can accept another operation.
-#[derive(Debug, thiserror::Error)]
-#[error("architecture model error: {source}")]
-pub struct ModelStatePreservedError {
-    #[source]
-    source: Box<dyn std::error::Error + Send + Sync>,
-}
-
 fn format_keys(keys: &[String]) -> String {
     const LIMIT: usize = 50;
     if keys.is_empty() {
@@ -30,47 +20,6 @@ fn format_keys(keys: &[String]) -> String {
 /// Error type used by MLX model loading and execution.
 #[non_exhaustive]
 pub enum Error {
-    /// Explicit prepared-input transfer exceeded portable logical limits.
-    #[error(transparent)]
-    InputTransfer(#[from] eredu_runtime::input_transfer::InputTransferError),
-    /// Neutral selected bank catalog construction failed.
-    #[error(transparent)]
-    AddressableBankCatalog(#[from] eredu_runtime::AddressableBankCatalogError),
-    /// A portable independent bank entry declaration is invalid.
-    #[error(transparent)]
-    AddressableBankEntry(#[from] eredu_runtime::AddressableBankEntryError),
-    /// Portable rank-local addressable parameter projection failed.
-    #[error(transparent)]
-    AddressableBankPlacement(#[from] eredu_runtime::AddressableBankPlacementError),
-    /// Portable row lookup admission or specification failure.
-    #[error(transparent)]
-    RowLookup(#[from] eredu_runtime::RowLookupError),
-    /// Cold row mechanism selection failed before materialization.
-    #[error(transparent)]
-    RowLookupSelection(#[from] eredu_runtime::RowLookupSelectionError),
-
-    /// Cold text-run agreement or its selected transport failed.
-    #[error("text run preparation failed: {0}")]
-    RunPreparation(#[from] eredu_runtime::run_preparation::TextPreparationAgreementError),
-
-    /// Initial manifest agreement failed with its original transport cause.
-    #[error("parallel placement error: communication manifest consensus failed: {0}")]
-    CommunicationManifestConsensus(
-        #[source] Box<eredu_runtime::CommunicationManifestConsensusError<Error>>,
-    ),
-
-    /// Rank-local materialization or policy construction failed with its cause.
-    #[error("architecture model error: {0}")]
-    PartitionedRuntimeConstruction(
-        #[source] Box<eredu_runtime::PartitionedRuntimeConstructionError<eredu_nn::Error, Error>>,
-    ),
-
-    /// The prepared partition factory failed with its exact handoff error.
-    #[error("architecture model error: {0}")]
-    PartitionedSessionPreparation(
-        #[source] Box<eredu_runtime::PartitionedSessionPreparationError<Error>>,
-    ),
-
     /// Backend capability discovery, preparation, execution, or completion failed.
     #[error(transparent)]
     Backend(#[from] eredu_core::BackendError),
@@ -95,64 +44,13 @@ pub enum Error {
     #[error(transparent)]
     PromptCache(#[from] eredu_core::cache::PromptCacheError),
 
-    /// Invalid dense disk streaming configuration or background work.
-    #[error(transparent)]
-    DenseStream(#[from] crate::backend::runtime::residency::dense_stream::DenseStreamError),
-
-    /// Invalid backend-neutral dense-stream telemetry lifecycle.
-    #[error(transparent)]
-    DenseStreamTelemetry(#[from] eredu_runtime::DenseStreamTelemetryError),
-
-    /// Invalid backend-neutral immutable-weight residency policy.
-    #[error(transparent)]
-    WeightResidencyPolicy(#[from] eredu_runtime::WeightResidencyPolicyError),
-
-    /// Invalid backend-neutral dense transfer-window transition.
-    #[error(transparent)]
-    DenseTransferSchedule(#[from] eredu_runtime::DenseTransferScheduleError),
-
     /// Invalid composed architecture configuration or state usage.
     #[error("architecture model error: {0}")]
     ArchitectureModel(String),
 
-    /// A typed model adapter proved preflight rejection or successful rollback.
-    #[error(transparent)]
-    ModelStatePreserved(ModelStatePreservedError),
-
-    /// Invalid or failed layerwise model execution.
-    #[error(transparent)]
-    LayerwiseModel(#[from] crate::backend::runtime::execution::layerwise::LayerwiseModelError),
-
-    /// Invalid backend-neutral execution-group graph.
-    #[error(transparent)]
-    ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
-
-    /// An exact neutral materialization task or transform group is invalid.
-    #[error(transparent)]
-    ReplicatedTextContract(#[from] eredu_runtime::ReplicatedTextContractError),
-
-    /// Exact bindings disagree with retained parameter acquisition ownership.
-    #[error(transparent)]
-    ParameterAcquisition(#[from] eredu_runtime::ParameterAcquisitionError),
-
-    /// Invalid selected parameter-residency capacity.
-    #[error(transparent)]
-    ResidencySizing(#[from] eredu_runtime::BoundedResidencySizingError),
-
-    /// Invalid admitted execution-unit resource count or capacity.
-    #[error(transparent)]
-    ExecutionUnitPreparation(#[from] eredu_runtime::ExecutionUnitPreparationError),
-    /// Exact parameter plan admission failed.
-    #[error(transparent)]
-    ParameterResourcePreparation(#[from] eredu_runtime::ParameterResourcePreparationError),
-
-    /// Invalid logical-to-local execution-unit mapping or invocation.
-    #[error(transparent)]
-    ExecutionUnitAddressMap(#[from] eredu_runtime::ExecutionUnitAddressMapError),
-
-    /// Invalid backend-neutral pipeline execution-group lifecycle.
-    #[error(transparent)]
-    LayeredPipelineSchedule(#[from] eredu_runtime::LayeredPipelineScheduleError),
+    /// An operation reported a neutral failure with its exact cause.
+    #[error("{0}")]
+    Operation(#[from] eredu_core::BackendFailure),
 
     /// Backend-neutral neural operator or parameter-topology failure.
     #[error(transparent)]
@@ -160,15 +58,15 @@ pub enum Error {
 
     /// Invalid backend-neutral weight binding or offload-unit declaration.
     #[error(transparent)]
-    ResidencyDeclaration(#[from] eredu_runtime::ResidencyDeclarationError),
+    ResidencyDeclaration(
+        #[from] eredu_core::residency::parameter_binding::ResidencyDeclarationError,
+    ),
 
     /// Invalid backend-neutral bounded selection for a weight binding.
     #[error(transparent)]
-    WeightBindingSelection(#[from] eredu_runtime::WeightBindingSelectionError),
-
-    /// Invalid backend-neutral ordered weight-residency window.
-    #[error(transparent)]
-    ResidencyWindow(#[from] eredu_runtime::ResidencyWindowError),
+    WeightBindingSelection(
+        #[from] eredu_core::residency::parameter_binding::WeightBindingSelectionError,
+    ),
 
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
@@ -230,10 +128,6 @@ pub enum Error {
     #[error("media processor error: {0}")]
     Processor(String),
 
-    /// Portable preprocessing buffer budget rejected the request.
-    #[error(transparent)]
-    ProcessorResources(eredu_runtime::processor_resources::ProcessorResourceError),
-
     /// MLX speculative execution failed.
     #[error("MLX speculative generation failed: {0}")]
     Speculative(String),
@@ -280,61 +174,19 @@ impl Error {
     pub(crate) fn before_model_mutation(
         error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Self {
-        Self::ModelStatePreserved(ModelStatePreservedError {
-            source: error.into(),
-        })
-    }
-
-    pub(crate) fn after_model_call(
-        error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-        before: Option<u64>,
-        after: Option<u64>,
-    ) -> Self {
-        if matches!((before, after), (Some(before), Some(after)) if after > before) {
-            Self::before_model_mutation(error)
-        } else {
-            Self::Other(error.into())
-        }
-    }
-
-    /// The shared runtime alone establishes whether admission preceded mutable
-    /// state access. A rejection witness never substitutes for native completion.
-    pub(crate) fn after_replicated_model_call<A, P, M>(
-        error: eredu_runtime::ReplicatedTextSessionError<A, P, M>,
-        before: Option<u64>,
-        after: Option<u64>,
-    ) -> Self
-    where
-        A: std::error::Error + Send + Sync + 'static,
-        P: std::error::Error + Send + Sync + 'static,
-        M: std::error::Error + Send + Sync + 'static,
-    {
-        if matches!(
-            error,
-            eredu_runtime::ReplicatedTextSessionError::BeforeStateMutation(_)
-        ) {
-            Self::before_model_mutation(error)
-        } else {
-            Self::after_model_call(error, before, after)
-        }
+        eredu_core::BackendFailure::from_boxed_error(error.into())
+            .with_model_state_preserved(true)
+            .into()
     }
 
     pub(crate) const fn model_state_preserved(&self) -> bool {
-        matches!(self, Self::ModelStatePreserved(_))
+        matches!(self, Self::Operation(error) if error.model_state_preserved())
     }
 }
 
-impl From<eredu_runtime::PartitionedRuntimeConstructionError<eredu_nn::Error, Error>> for Error {
-    fn from(
-        error: eredu_runtime::PartitionedRuntimeConstructionError<eredu_nn::Error, Error>,
-    ) -> Self {
-        Self::PartitionedRuntimeConstruction(Box::new(error))
-    }
-}
-
-impl From<eredu_runtime::PartitionedSessionPreparationError<Error>> for Error {
-    fn from(error: eredu_runtime::PartitionedSessionPreparationError<Error>) -> Self {
-        Self::PartitionedSessionPreparation(Box::new(error))
+impl From<eredu_core::parameters::ParameterError> for Error {
+    fn from(error: eredu_core::parameters::ParameterError) -> Self {
+        eredu_nn::Error::backend_source(error).into()
     }
 }
 
@@ -355,12 +207,6 @@ impl From<eredu_checkpoint::recipe::RecipeError> for Error {
     }
 }
 
-impl From<eredu_runtime::ParallelPlanError> for Error {
-    fn from(error: eredu_runtime::ParallelPlanError) -> Self {
-        Self::Parallel(error.to_string())
-    }
-}
-
 impl From<eredu_checkpoint::Error> for Error {
     fn from(error: eredu_checkpoint::Error) -> Self {
         Self::Quantization(error.to_string())
@@ -376,5 +222,11 @@ impl From<eredu_core::TopologyError> for Error {
 impl From<eredu_core::scheduler::SchedulerError> for Error {
     fn from(error: eredu_core::scheduler::SchedulerError) -> Self {
         Self::Parallel(error.to_string())
+    }
+}
+
+impl From<eredu_core::speculative::SpeculativeDriverError<Exception>> for Error {
+    fn from(error: eredu_core::speculative::SpeculativeDriverError<Exception>) -> Self {
+        Self::Exception(Exception::from_source(error))
     }
 }

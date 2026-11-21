@@ -4,32 +4,72 @@ use eredu::api::{
     PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest, TextSamplingStrategy,
 };
 use eredu::runtime::chat::{ChatTemplateRequest, PreparedChat};
+use eredu::runtime::speculative::SpeculativeBatchBackend;
 use eredu_core::generation::{CheckpointGenerationConfig, GenerationError};
 use eredu_core::{
-    SpeculativeCapability, SpeculativeDraft, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
-    SpeculativeGenerationVisitor, SpeculativeTokenFilterController,
+    SpeculativeDraft, SpeculativeGenerationBatchOutput, SpeculativeGenerationVisitor,
+    SpeculativeTokenFilterController,
 };
+use eredu_runtime::speculative::autoregressive::ResidentBatchRoute;
+use eredu_runtime::speculative::autoregressive::SpeculativeGenerationBackend;
 
-impl SpeculativeGenerationBackend for MockBackend {
+impl SpeculativeGenerationBackend<MockSession> for MockBackend {
     type Drafter = ();
+}
 
-    fn speculative_capability(_: &ModelRuntime<Self>) -> SpeculativeCapability {
-        SpeculativeCapability::Unavailable
+impl SpeculativeBatchBackend<MockSession> for MockBackend {
+    fn execute_resident_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        _route: ResidentBatchRoute,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        Self::execute_fixture_batch(runtime, lanes, visitor)
     }
 
-    fn with_speculative_execution<C, V>(
-        runtime: &mut ModelRuntime<Self>,
-        mut request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
-        _: V,
+    fn execute_external_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        _draft: &mut Self::Drafter,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        Self::execute_fixture_batch(runtime, lanes, visitor)
+    }
+
+    fn execute_embedded_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, Self::Error>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        Self::execute_fixture_batch(runtime, lanes, visitor)
+    }
+}
+
+impl MockBackend {
+    fn execute_fixture_batch<C, V>(
+        runtime: &mut ModelRuntime<Self, MockSession>,
+        lanes: Vec<eredu_core::SpeculativeGenerationLane<'_, Vec<u32>, C>>,
+        _: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, MockError>
     where
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
         let mut calls = runtime.backend().calls.borrow_mut();
         calls.speculative += 1;
-        for mut lane in request.take_lanes() {
+        for mut lane in lanes {
             assert_eq!(
                 lane.config().temperature,
                 lane.generation().sampling().temperature
@@ -44,7 +84,7 @@ impl SpeculativeGenerationBackend for MockBackend {
     }
 }
 
-fn chat(model: &mut LoadedModel<MockBackend>) -> PreparedChat {
+fn chat(model: &mut LoadedModel<MockBackend, MockSession>) -> PreparedChat {
     model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role": "user", "content": "a"})],

@@ -1,5 +1,12 @@
 //! Model-independent pipeline traversal over architecture-owned ingress and boundaries.
-use crate::{ArchitectureBoundary, PipelineActivationDtype, RoutedTensorReductions};
+mod component_driver;
+use component_driver::ComponentPipelinePlan;
+pub use component_driver::{ComponentPipeline, ComponentPipelineResources};
+use eredu_core::communication::pipeline::NativeComponentRank;
+
+use crate::{ArchitectureBoundary, ParameterUnitMechanisms, RoutedTensorReductions};
+use eredu_core::communication::PipelineActivationDtype;
+use eredu_core::communication::{PartitionTensorAllocator, RankCommunication};
 use eredu_nn::Tensor as _;
 use std::{borrow::Borrow, marker::PhantomData, ops::Range};
 
@@ -12,11 +19,14 @@ pub struct PreparedComponentPipeline<A> {
     /// Logical invocations and physical storage owners.
     pub invocations: crate::ExecutionUnitAddressMap,
     /// Bindings retained across invocations.
-    pub pinned: Vec<crate::WeightBinding>,
+    pub pinned: Vec<eredu_core::residency::parameter_binding::WeightBinding>,
     /// Bindings addressed by physical storage owner.
-    pub units: Vec<(crate::ExecutionUnitAddress, Vec<crate::WeightBinding>)>,
+    pub units: Vec<(
+        crate::ExecutionUnitAddress,
+        Vec<eredu_core::residency::parameter_binding::WeightBinding>,
+    )>,
     /// Exact selected communication.
-    pub manifest: crate::CommunicationManifest,
+    pub manifest: eredu_core::communication::CommunicationManifest,
     /// Selected execution and publication plan.
     pub plan: crate::PartitionedExecutionPlan,
     /// Optional collective within the pipeline stage.
@@ -25,6 +35,122 @@ pub struct PreparedComponentPipeline<A> {
     pub activation_dtype: PipelineActivationDtype,
     /// Selected parameter residency.
     pub residency: crate::LayerWeightResidency,
+}
+
+impl<A> PreparedComponentPipeline<A> {
+    /// Establishes native communication and storage, then builds resident units.
+    pub fn bind<B, S, C, M>(
+        self,
+        mechanisms: &M,
+        communication: &C,
+    ) -> Result<(M::Pipeline<A>, crate::LayerwiseModelMetadata), eredu_core::BackendFailure>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: crate::RuntimeState<B>,
+        M: ComponentRankMechanisms<B, S, C>,
+        A: PipelinePartitionArchitecture<B, S> + 'static,
+        A::Error: From<eredu_nn::Error>,
+        A::Unit: eredu_nn::Parameterized<B::Tensor> + 'static,
+    {
+        use eredu_core::checkpoint_mechanisms::unit_binding::ComponentPreparationScope as _;
+
+        let Self {
+            mut architecture,
+            source,
+            invocations,
+            pinned,
+            units,
+            manifest,
+            plan,
+            tensor_group,
+            activation_dtype,
+            residency,
+        } = self;
+        mechanisms.validate_pipeline_communication(&manifest, tensor_group)?;
+        let prepared = mechanisms
+            .open_pipeline_setup(communication)
+            .map(|transport| {
+                crate::communication::prepare_world_communication(transport, &manifest)
+            })
+            .transpose()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let rank = mechanisms.realize_pipeline_rank(communication, prepared)?;
+        let parallel = tensor_group
+            .map(|id| {
+                rank.coordinated_tensor_context(id).ok_or_else(|| {
+                    eredu_core::BackendFailure::from_error(std::io::Error::other(
+                        "component pipeline requires readiness-ordered tensor resources",
+                    ))
+                })
+            })
+            .transpose()?;
+        let (transport, _, executor) =
+            crate::PartitionCommunication::bind_rank(rank, manifest, None)?;
+        let scope = mechanisms.begin_unit_binding()?;
+        let result = (|| {
+            use eredu_core::BackendFailure;
+            if !units.iter().map(|(address, _)| *address).eq((0..invocations
+                .storage_layout()
+                .len())
+                .map(|ordinal| {
+                    invocations
+                        .storage_layout()
+                        .address(ordinal)
+                        .expect("declared physical owner")
+                }))
+            {
+                return Err(BackendFailure::from_error(std::io::Error::other(
+                    "addressed bindings differ from retained physical owners",
+                )));
+            }
+
+            let (storage, metadata) =
+                crate::parameter_units::materialize_component_storage::<B, S, A, M>(
+                    mechanisms,
+                    &mut architecture,
+                    source,
+                    &invocations,
+                    residency,
+                    pinned,
+                    units.into_iter().map(|(_, bindings)| bindings).collect(),
+                    None,
+                )?;
+            let policy = if residency.is_fully_resident() {
+                let resident = crate::build_resident_units::<B, S, A>(
+                    &architecture,
+                    &invocations,
+                    mechanisms.pipeline_context(),
+                )?;
+                crate::parameter_units::bind_component_resident_units(
+                    mechanisms, storage, resident,
+                )?
+            } else {
+                <M::UnitPolicy<A::Unit> as crate::bounded_execution::units::BindBoundedPolicy<
+                    _,
+                    _,
+                >>::bind_bounded(storage)
+            };
+            let selected = ComponentPipelinePlan {
+                addresses: invocations.logical_addresses().collect(),
+                plan,
+                activation_dtype,
+                tensor_group,
+                residency,
+            };
+            let pipeline = mechanisms.assemble_pipeline(
+                architecture,
+                selected,
+                ComponentPipelineResources {
+                    policy,
+                    communication: transport,
+                    parallel,
+                    executor,
+                },
+            )?;
+            Ok((pipeline, metadata))
+        })();
+        scope.finish(result)
+    }
 }
 
 /// Execution mechanisms for an already bound component pipeline.
@@ -42,7 +168,7 @@ where
         &mut self,
         descriptor: [u64; 8],
         ready: bool,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), eredu_core::BackendFailure>;
 
     /// Reports whether all ranks accepted a caller-owned decision.
@@ -50,7 +176,7 @@ where
         &mut self,
         descriptor: [u64; 8],
         ready: bool,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<bool, eredu_core::BackendFailure>;
 
     /// Publishes an invocation and settles its candidate state and typed output before commit.
@@ -62,7 +188,7 @@ where
         state: &mut S,
         descriptor: [u64; 8],
         epoch: eredu_core::DistributedCommitEpoch,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         project: impl FnOnce(B::Tensor) -> Result<(R, Vec<B::Tensor>), eredu_core::BackendFailure>,
     ) -> Result<(R, eredu_core::DistributedCommitOutcome), eredu_core::BackendFailure>
     where
@@ -76,7 +202,7 @@ where
         state: &mut S,
         descriptor: [u64; 8],
         epoch: eredu_core::DistributedCommitEpoch,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(B::Tensor, eredu_core::DistributedCommitOutcome), eredu_core::BackendFailure>
     where
         S: eredu_nn::RetainedTensorRoots<B::Tensor>,
@@ -90,7 +216,7 @@ where
     fn publish_readout(
         &mut self,
         roots: Vec<B::Tensor>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         project: impl FnOnce(
             &mut A,
             Option<&B::ParallelContext>,
@@ -101,7 +227,7 @@ where
     fn commit_candidate(
         &mut self,
         epoch: eredu_core::DistributedCommitEpoch,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), eredu_core::BackendFailure>;
 
     /// Completes native storage retained by an advanced cursor.
@@ -133,7 +259,7 @@ pub trait DecoderPipelineState<B: eredu_nn::NeuralBackend>:
     /// Forks the installed state for an unpublished invocation.
     fn fork_pipeline_state(
         &self,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self, eredu_core::BackendFailure>;
 
     /// Reads the committed decoder position.
@@ -154,7 +280,12 @@ pub trait UnitPolicyResidency {
 /// Native tensor cohort and its failure-agreement hook for layered traversal.
 pub trait LayeredTensorCohort<B: eredu_nn::NeuralBackend> {
     /// Exact manifest and group realized by this cohort.
-    fn selection(&self) -> (&crate::CommunicationManifest, eredu_core::CollectiveGroupId);
+    fn selection(
+        &self,
+    ) -> (
+        &eredu_core::communication::CommunicationManifest,
+        eredu_core::CollectiveGroupId,
+    );
 
     /// Derives the tensor-only rank coordinates from the retained manifest.
     fn tensor_topology(
@@ -182,75 +313,214 @@ pub trait LayeredTensorCohort<B: eredu_nn::NeuralBackend> {
         &self,
         descriptor: [u64; 8],
         ready: bool,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<bool, eredu_core::BackendFailure>;
 
     /// Agrees local traversal results using the same authority as the collectives.
     fn traversal_hook<C, E: From<eredu_core::BackendFailure>>(
         &self,
-    ) -> impl crate::LayeredTraversalHook<B, C, E> + '_;
+    ) -> impl crate::LayeredTraversalHook<B, C, E> + '_ {
+        CohortTraversalAgreement(self)
+    }
+}
+
+impl<B: eredu_nn::NeuralBackend> LayeredTensorCohort<B> for std::convert::Infallible {
+    fn selection(
+        &self,
+    ) -> (
+        &eredu_core::communication::CommunicationManifest,
+        eredu_core::CollectiveGroupId,
+    ) {
+        match *self {}
+    }
+
+    fn parallel_context(&self) -> &B::ParallelContext {
+        match *self {}
+    }
+
+    fn agree(
+        &self,
+        _: [u64; 8],
+        _: bool,
+        _: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<bool, eredu_core::BackendFailure> {
+        match *self {}
+    }
+}
+
+struct CohortTraversalAgreement<'a, C: ?Sized>(&'a C);
+
+impl<B, C, S, E> crate::LayeredTraversalHook<B, S, E> for CohortTraversalAgreement<'_, C>
+where
+    B: eredu_nn::NeuralBackend,
+    C: LayeredTensorCohort<B> + ?Sized,
+    E: From<eredu_core::BackendFailure>,
+{
+    fn local_phase(
+        &mut self,
+        phase: crate::LayeredLocalPhase,
+        success: bool,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        use crate::LayeredLocalPhase;
+        let (kind, group, index) = match phase {
+            LayeredLocalPhase::Initialization => (0, 0, 0),
+            LayeredLocalPhase::PolicyBegin => (1, 0, 0),
+            LayeredLocalPhase::GroupIngress { group } => (2, group, 0),
+            LayeredLocalPhase::BeforeUnit { group, index } => (3, group, index),
+            LayeredLocalPhase::Acquisition { group, index } => (4, group, index),
+            LayeredLocalPhase::UnitExecution { group, index } => (5, group, index),
+            LayeredLocalPhase::UnitCompletion { group, index } => (6, group, index),
+            LayeredLocalPhase::GroupCompletion { group } => (7, group, 0),
+            LayeredLocalPhase::Finish => (8, 0, 0),
+        };
+        let accepted = self.0.agree(
+            [
+                0x4c415945524544,
+                kind,
+                group as u64,
+                index as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            success,
+            context,
+        )?;
+        if !accepted {
+            return Err(eredu_core::BackendFailure::from_error(eredu_nn::Error::backend(format!(
+                "a participant failed local layered preparation at {phase:?} (local success: {success})",
+            )))
+            .into());
+        }
+        Ok(())
+    }
 }
 
 /// Certifies immutable parameter bindings in a matching execution context.
 pub trait ImmutableParameterPolicy<B: eredu_nn::NeuralBackend> {
+    /// Native immutable storage certificate.
+    type Certificate;
+
+    /// Retains the certificate alongside the portable policy.
+    fn set_immutable_certificate(&mut self, certificate: Self::Certificate);
+
     /// Identifies parameters eligible for reusing deterministic results.
     fn immutable_parameters_identity(
         &self,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Option<&eredu_core::resources::ResourceIdentity>;
 }
 
-/// Native materialization of independently addressable learned parameter units.
-pub trait ParameterUnitMechanisms<B: eredu_nn::NeuralBackend> {
-    /// Selected residency policy for a sequence of parameterized units.
-    type UnitPolicy<U>: crate::LayerwisePolicy<B, U, Error: std::error::Error + Send + Sync + 'static>
-        + UnitPolicyResidency
-        + ImmutableParameterPolicy<B>
-        + 'static
-    where
-        U: eredu_nn::Parameterized<B::Tensor> + 'static;
-
-    /// Binds a unit sequence and returns its parameter materialization metadata.
-    fn bind_units<U>(
-        &self,
-        source: eredu_checkpoint::store::SharedCheckpointSource,
-        invocations: crate::ExecutionUnitAddressMap,
-        units: Vec<Vec<crate::WeightBinding>>,
-        residency: crate::LayerWeightResidency,
-        build: &dyn Fn() -> Result<Vec<U>, eredu_core::BackendFailure>,
-    ) -> Result<(Self::UnitPolicy<U>, crate::LayerwiseModelMetadata), eredu_core::BackendFailure>
-    where
-        U: eredu_nn::Parameterized<B::Tensor> + 'static;
-}
-
-/// Native realization of prepared composite rank components.
-pub trait ComponentRankMechanisms<B: eredu_nn::NeuralBackend, S: crate::RuntimeState<B>, C>:
-    ParameterUnitMechanisms<B>
+/// Portable composition of admitted component ranks.
+pub trait ComponentRankMechanisms<B, S, C>:
+    NativeComponentRank<B, C> + ParameterUnitMechanisms<B>
+where
+    B: eredu_nn::NeuralBackend,
+    S: crate::RuntimeState<B>,
 {
-    /// Bound pipeline execution for a portable layer architecture.
+    /// Bound pipeline execution for the selected architecture.
     type Pipeline<A>: BoundComponentPipeline<A, B, S> + 'static
     where
-        A: crate::PipelinePartitionArchitecture<B, S> + 'static,
+        A: PipelinePartitionArchitecture<B, S> + 'static,
         A::Error: From<eredu_nn::Error>,
         A::Unit: 'static;
 
-    /// Validates native communication capabilities before allocating rank resources.
+    /// Validates the selected communication and the backend's ability to realize it.
     fn validate_pipeline_communication(
         &self,
-        manifest: &crate::CommunicationManifest,
+        manifest: &eredu_core::communication::CommunicationManifest,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
-    ) -> Result<(), eredu_core::BackendFailure>;
+    ) -> Result<(), eredu_core::BackendFailure> {
+        if manifest.completion_policy().is_none() {
+            return Err(eredu_core::BackendFailure::from_error(
+                PipelineLocalAgreementError::Contract(
+                    "component pipeline requires bounded completion",
+                ),
+            ));
+        }
+        if let Some(group) = tensor_group {
+            let cohort = pipeline_local_agreement(manifest, group)
+                .map_err(eredu_core::BackendFailure::from_error)?;
+            if !self.supports_independent_agreement(manifest.world_size(), cohort.members()) {
+                return Err(eredu_core::BackendFailure::from_error(
+                    PipelineLocalAgreementError::Contract(
+                        "native cohort agreement requires inactive-stage participation",
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 
-    /// Realizes an admitted pipeline and returns its parameter materialization metadata.
-    fn bind_pipeline<A>(
+    /// Assembles the portable pipeline and its selected execution policy.
+    fn assemble_pipeline<A>(
         &self,
-        prepared: crate::PreparedComponentPipeline<A>,
-        communication: &C,
-    ) -> Result<(Self::Pipeline<A>, crate::LayerwiseModelMetadata), eredu_core::BackendFailure>
+        architecture: A,
+        selected: ComponentPipelinePlan,
+        resources: ComponentPipelineResources<Self::PipelineRank, Self::UnitPolicy<A::Unit>>,
+    ) -> Result<Self::Pipeline<A>, eredu_core::BackendFailure>
     where
-        A: crate::PipelinePartitionArchitecture<B, S> + 'static,
+        A: PipelinePartitionArchitecture<B, S> + 'static,
         A::Error: From<eredu_nn::Error>,
-        A::Unit: eredu_nn::Parameterized<B::Tensor> + 'static;
+        A::Unit: 'static;
+}
+
+impl<B, S, C, M> ComponentRankMechanisms<B, S, C> for M
+where
+    B: eredu_core::communication::PointToPointBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_core::communication::BroadcastBackend
+        + eredu_core::communication::FailureAgreementBackend
+        + eredu_core::communication::SumReductionBackend
+        + eredu_core::communication::UnevenGatherBackend
+        + 'static,
+    B::ParallelContext: Sized,
+    S: crate::RuntimeState<B> + 'static,
+    M: NativeComponentRank<
+            B,
+            C,
+            PipelineRank: RankCommunication<Backend = B, Parallel = B::ParallelContext>,
+        > + ParameterUnitMechanisms<B>,
+    M::PipelineAllocator: 'static,
+    M::PipelineExecution: 'static,
+    <M::PipelineRank as RankCommunication>::Group: 'static,
+    <M::PipelineRank as RankCommunication>::Route: 'static,
+    <M::PipelineRank as RankCommunication>::Metadata: 'static,
+{
+    type Pipeline<A>
+        = ComponentPipeline<
+        A,
+        B,
+        S,
+        M::UnitPolicy<A::Unit>,
+        M::PipelineAllocator,
+        <M::PipelineRank as RankCommunication>::Group,
+        <M::PipelineRank as RankCommunication>::Route,
+        <M::PipelineRank as RankCommunication>::Metadata,
+        M::PipelineExecution,
+    >
+    where
+        A: PipelinePartitionArchitecture<B, S> + 'static,
+        A::Error: From<eredu_nn::Error>,
+        A::Unit: 'static;
+
+    fn assemble_pipeline<A>(
+        &self,
+        architecture: A,
+        selected: ComponentPipelinePlan,
+        resources: ComponentPipelineResources<Self::PipelineRank, Self::UnitPolicy<A::Unit>>,
+    ) -> Result<Self::Pipeline<A>, eredu_core::BackendFailure>
+    where
+        A: PipelinePartitionArchitecture<B, S> + 'static,
+        A::Error: From<eredu_nn::Error>,
+        A::Unit: 'static,
+    {
+        let native =
+            self.pipeline_mechanisms(resources.communication.native_groups().cloned().collect());
+        component_driver::assemble_component_pipeline(native, architecture, selected, resources)
+    }
 }
 
 /// Architecture-owned ingress and output geometry for the shared pipeline executor.
@@ -282,7 +552,7 @@ where
         expected: Option<&crate::StateLayout>,
         first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         observer: &mut O,
     ) -> Result<crate::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
     where
@@ -375,38 +645,6 @@ where
     }
 }
 
-/// Mechanical backend allocation used only for receive/publication placeholders.
-pub trait PartitionTensorAllocator<B>
-where
-    B: eredu_nn::NeuralBackend,
-{
-    /// Converts one source activation to the selected pipeline wire dtype.
-    ///
-    /// This runs while the source execution group is still local work, before
-    /// distributed readiness agreement. Implementations must reject unsupported
-    /// conversions instead of leaving a native-dtype tensor for the route.
-    fn tensor_to_wire(
-        &mut self,
-        _tensor: B::Tensor,
-        _logical_dtype: crate::BoundaryTensorDtype,
-        _activation_dtype: PipelineActivationDtype,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<B::Tensor, eredu_nn::Error> {
-        Err(eredu_nn::Error::backend(
-            "partition tensor allocator does not support pipeline wire conversion",
-        ))
-    }
-
-    /// Allocates an activation tensor with the selected pipeline wire dtype.
-    fn tensor_placeholder(
-        &mut self,
-        shape: &[i32],
-        logical_dtype: crate::BoundaryTensorDtype,
-        activation_dtype: PipelineActivationDtype,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<B::Tensor, eredu_nn::Error>;
-}
-
 /// Statically selected per-unit behavior for one pipeline partition.
 ///
 /// The pipeline executor owns traversal, residency, state, and boundary
@@ -414,9 +652,9 @@ where
 /// any provider state which that call must retain across invocations.
 pub trait PipelinePartitionUnitStrategy<A, B, S>
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
+        > + eredu_core::communication::CommunicationBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S>,
     B::ParallelContext: Sized,
@@ -450,12 +688,12 @@ where
         parallel: Option<&B::ParallelContext>,
         communication: &crate::PartitionCommunication<B, G, R, I>,
         communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, A::Error>
     where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
-        I: crate::CommunicationTensorMetadata<B>;
+        I: eredu_core::communication::CommunicationTensorMetadata<B>;
 
     /// Executes internal component boundaries through the selected unit strategy.
     /// Strategies with specialized providers override this alongside their ordinary call.
@@ -472,13 +710,13 @@ where
         parallel: Option<&B::ParallelContext>,
         communication: &crate::PartitionCommunication<B, G, R, I>,
         communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         _observer: &mut O,
     ) -> Result<B::Tensor, A::Error>
     where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
-        I: crate::CommunicationTensorMetadata<B>,
+        I: eredu_core::communication::CommunicationTensorMetadata<B>,
         O: crate::ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.forward_unit(
@@ -510,13 +748,13 @@ where
         parallel: Option<&B::ParallelContext>,
         communication: &crate::PartitionCommunication<B, G, R, I>,
         communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         observer: Option<&mut O>,
     ) -> Result<B::Tensor, A::Error>
     where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
-        I: crate::CommunicationTensorMetadata<B>,
+        I: eredu_core::communication::CommunicationTensorMetadata<B>,
         O: crate::ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         match observer {
@@ -565,14 +803,15 @@ where
         _activation_dtype: PipelineActivationDtype,
         _batch: i32,
         _sequence: i32,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), A::Error>
     where
-        B: crate::SumReductionBackend + crate::UnevenGatherBackend,
+        B: eredu_core::communication::SumReductionBackend
+            + eredu_core::communication::UnevenGatherBackend,
         F: PartitionTensorAllocator<B>,
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
-        I: crate::CommunicationTensorMetadata<B>,
+        I: eredu_core::communication::CommunicationTensorMetadata<B>,
     {
         Ok(())
     }
@@ -584,9 +823,9 @@ pub struct OrdinaryPipelinePartitionUnitStrategy;
 
 impl<A, B, S> PipelinePartitionUnitStrategy<A, B, S> for OrdinaryPipelinePartitionUnitStrategy
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
+        > + eredu_core::communication::CommunicationBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S>,
     B::ParallelContext: Sized,
@@ -613,12 +852,12 @@ where
         parallel: Option<&B::ParallelContext>,
         _communication: &crate::PartitionCommunication<B, G, R, I>,
         _communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, A::Error>
     where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
-        I: crate::CommunicationTensorMetadata<B>,
+        I: eredu_core::communication::CommunicationTensorMetadata<B>,
     {
         match parallel {
             Some(parallel) => architecture.forward_unit_parallel(
@@ -655,13 +894,13 @@ where
         parallel: Option<&B::ParallelContext>,
         _communication: &crate::PartitionCommunication<B, G, R, I>,
         _communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, A::Error>
     where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
-        I: crate::CommunicationTensorMetadata<B>,
+        I: eredu_core::communication::CommunicationTensorMetadata<B>,
         O: crate::ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         match parallel {
@@ -722,10 +961,10 @@ fn pipeline_backend_source<E: From<eredu_nn::Error>>(
 pub enum PipelineLocalAgreementError {
     /// The selected communicator does not cover exact failure propagation.
     #[error(transparent)]
-    Capability(#[from] crate::CommunicationCapabilityError),
+    Capability(#[from] eredu_core::communication::CommunicationCapabilityError),
     /// A communicator requirement is malformed.
     #[error(transparent)]
-    Manifest(#[from] crate::CommunicationManifestError),
+    Manifest(#[from] eredu_core::communication::CommunicationManifestError),
     /// Missing local membership or bounded completion authority.
     #[error("invalid pipeline local agreement: {0}")]
     Contract(&'static str),
@@ -733,9 +972,16 @@ pub enum PipelineLocalAgreementError {
 /// Validates the exact stage cohort before native realization or parameter reads.
 /// Inactive pipeline stages do not participate in this unit-local agreement.
 pub fn validate_pipeline_local_agreement(
-    manifest: &crate::CommunicationManifest,
+    manifest: &eredu_core::communication::CommunicationManifest,
     group: eredu_core::CollectiveGroupId,
 ) -> Result<(), PipelineLocalAgreementError> {
+    pipeline_local_agreement(manifest, group).map(|_| ())
+}
+
+fn pipeline_local_agreement(
+    manifest: &eredu_core::communication::CommunicationManifest,
+    group: eredu_core::CollectiveGroupId,
+) -> Result<&eredu_core::communication::CommunicationGroupDescriptor, PipelineLocalAgreementError> {
     use PipelineLocalAgreementError::Contract;
     let selected = manifest
         .groups()
@@ -747,9 +993,13 @@ pub fn validate_pipeline_local_agreement(
             "cohort membership and bounded completion are required",
         ));
     }
-    crate::CommunicationCapabilities::new(selected.requirements().operations().iter().cloned())?
-        .validate_requirement(&crate::CommunicationOperationRequirement::failure_agreement(true))?;
-    Ok(())
+    eredu_core::communication::CommunicationCapabilities::new(
+        selected.requirements().operations().iter().cloned(),
+    )?
+    .validate_requirement(
+        &eredu_core::communication::CommunicationOperationRequirement::failure_agreement(true),
+    )?;
+    Ok(selected)
 }
 
 fn agree_pipeline_local<B, G, R, I, T, E>(
@@ -761,10 +1011,11 @@ fn agree_pipeline_local<B, G, R, I, T, E>(
     executor: &B::Executor,
 ) -> Result<T, E>
 where
-    B: crate::CommunicationBackend + crate::FailureAgreementBackend,
+    B: eredu_core::communication::CommunicationBackend
+        + eredu_core::communication::FailureAgreementBackend,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
-    I: crate::CommunicationTensorMetadata<B>,
+    I: eredu_core::communication::CommunicationTensorMetadata<B>,
     E: From<eredu_nn::Error>,
 {
     use crate::PartitionCommitAgreement;
@@ -812,9 +1063,9 @@ where
 /// retaining prepared ingress and forward context between groups on this rank.
 pub struct PipelinePartitionExecutor<A, B, S, P, F, U = OrdinaryPipelinePartitionUnitStrategy>
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
+        > + eredu_core::communication::CommunicationBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S>,
     P: crate::LayerwisePolicy<B, A::Unit>,
@@ -835,9 +1086,9 @@ where
 
 impl<A, B, S, P, F> PipelinePartitionExecutor<A, B, S, P, F, OrdinaryPipelinePartitionUnitStrategy>
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
+        > + eredu_core::communication::CommunicationBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S>,
     P: crate::LayerwisePolicy<B, A::Unit>,
@@ -867,9 +1118,9 @@ where
 
 impl<A, B, S, P, F, U> PipelinePartitionExecutor<A, B, S, P, F, U>
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
+        > + eredu_core::communication::CommunicationBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S>,
     P: crate::LayerwisePolicy<B, A::Unit>,
@@ -991,10 +1242,12 @@ where
 impl<A, B, S, P, F, U, G, R, I> crate::PartitionedGroupExecutor<A, B, S, G, R, I>
     for PipelinePartitionExecutor<A, B, S, P, F, U>
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
-    B: crate::SumReductionBackend + crate::UnevenGatherBackend + crate::FailureAgreementBackend,
+        > + eredu_core::communication::CommunicationBackend,
+    B: eredu_core::communication::SumReductionBackend
+        + eredu_core::communication::UnevenGatherBackend
+        + eredu_core::communication::FailureAgreementBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S> + 'static,
     A::Error: From<eredu_nn::Error>,
@@ -1003,7 +1256,7 @@ where
     F: PartitionTensorAllocator<B>,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
-    I: crate::CommunicationTensorMetadata<B>,
+    I: eredu_core::communication::CommunicationTensorMetadata<B>,
     U: PipelinePartitionUnitStrategy<A, B, S>,
     B::ParallelContext: Sized,
 {
@@ -1031,7 +1284,7 @@ where
         input: A::Input<'a>,
         _state: &mut S,
         pass: crate::ExpertPass,
-        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Pass<'a>, A::Error> {
         let (batch, tokens) = self.architecture.partition_input_dimensions(&input)?;
         if batch <= 0 || tokens <= 0 {
@@ -1079,7 +1332,7 @@ where
         state: &mut S,
         communication: &crate::PartitionCommunication<B, G, R, I>,
         communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         observer: &mut O,
     ) -> Result<(), A::Error> {
         if active {
@@ -1118,7 +1371,7 @@ where
         state: &mut S,
         communication: &crate::PartitionCommunication<B, G, R, I>,
         communication_executor: &B::Executor,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
         observer: &mut O,
     ) -> Result<(), A::Error> {
         let local_agreement = self.local_agreement;
@@ -1428,7 +1681,7 @@ where
         route: &crate::PartitionBoundaryRoute,
         schema: &crate::ResolvedBoundaryWireSchema,
         source: bool,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Vec<crate::ArchitectureBoundaryValue<B::Tensor>>, A::Error> {
         let expected = if source {
             self.addresses.last().unwrap().group()
@@ -1598,7 +1851,7 @@ where
         &mut self,
         mut pass: Self::Pass<'_>,
         _state: &mut S,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(B::Tensor, A::ForwardContext), A::Error> {
         if pass.next_unit != self.addresses.len() {
             return Err(pipeline_backend_error::<A::Error>(
@@ -1613,7 +1866,7 @@ where
             Some(crate::LayeredPartitionOutput::Boundary { .. }) | None => {
                 self.allocator.tensor_placeholder(
                     &pass.output_shape,
-                    crate::BoundaryTensorDtype::Activation,
+                    eredu_core::communication::BoundaryTensorDtype::Activation,
                     self.activation_dtype,
                     context,
                 )?
@@ -1625,7 +1878,7 @@ where
     fn prediction_target_capture(
         &mut self,
         forward: &A::ForwardContext,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, A::Error> {
         if let Some(capture) =
             <A as crate::LayeredArchitecture<B, S>>::prediction_target_capture(forward)
@@ -1653,7 +1906,7 @@ where
             .map(|shape| {
                 self.allocator.tensor_placeholder(
                     &shape,
-                    crate::BoundaryTensorDtype::Activation,
+                    eredu_core::communication::BoundaryTensorDtype::Activation,
                     self.activation_dtype,
                     context,
                 )
@@ -1668,7 +1921,7 @@ where
         state: &mut S,
         operation: O,
         transport: &mut X,
-        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        context: &<<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<O::Output>, A::Error>
     where
         O: crate::PredictionTargetOperation<A, B, S>,
@@ -1689,9 +1942,9 @@ where
 impl<A, B, S, P, F, U> crate::parameter_operations::LayeredParameterOwner<B, S>
     for PipelinePartitionExecutor<A, B, S, P, F, U>
 where
-    B: crate::SubmissionBackend<
+    B: eredu_core::SubmissionBackend<
             Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + crate::CommunicationBackend,
+        > + eredu_core::communication::CommunicationBackend,
     S: crate::RuntimeState<B>,
     A: PipelinePartitionArchitecture<B, S>,
     P: crate::LayerwisePolicy<B, A::Unit>,
@@ -1700,6 +1953,10 @@ where
 {
     type Architecture = A;
     type Policy = P;
+    fn parameter_policy(&self) -> Option<&Self::Policy> {
+        Some(&self.policy)
+    }
+
     fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
         Some((&mut self.architecture, &mut self.policy))
     }
@@ -1708,10 +1965,11 @@ where
 #[cfg(test)]
 mod local_agreement_tests {
     use super::*;
-    use crate::{
+    use eredu_core::communication::CommunicationOperation;
+    use eredu_core::communication::{
         CommunicationCapabilityError, CommunicationCompletionPolicy, CommunicationGroupDescriptor,
-        CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
-        CommunicationOperationRequirement, CommunicationTensorLimits,
+        CommunicationGroupRequirements, CommunicationManifest, CommunicationOperationRequirement,
+        CommunicationTensorLimits,
     };
     use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, CompletionCancellationMode};
 

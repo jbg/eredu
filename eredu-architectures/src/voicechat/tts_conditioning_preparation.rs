@@ -1,19 +1,20 @@
 //! Cold exact binding plans for independently leased TTS conditioning units.
 
+use eredu_core::SubmissionBackend;
+
 use super::tts_conditioning_layered::{BoundConditioning, ConditioningKernel, ConditioningUnit};
 use std::collections::BTreeMap;
 
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::SharedCheckpointSource,
 };
-use eredu_runtime::{
-    ComponentPreparationError, LocalModelLayout, PreparedComponent, WeightBinding,
-};
+use eredu_core::residency::parameter_binding::WeightBinding;
+use eredu_runtime::{ComponentPreparationError, LocalModelLayout, PreparedComponent};
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
@@ -118,10 +119,10 @@ impl PreparedConditioningBindings {
         let selected = if let Some(cohort) = &cohort {
             let (manifest, group) = cohort.selection();
             let character = self.dimensions().character;
-            let sum = eredu_runtime::CommunicationOperationRequirement::tensors(
-                eredu_runtime::CommunicationOperation::AllReduceSum,
+            let sum = eredu_core::communication::CommunicationOperationRequirement::tensors(
+                eredu_core::communication::CommunicationOperation::AllReduceSum,
                 [eredu_core::checkpoint::TensorDtype::F32],
-                eredu_runtime::CommunicationTensorLimits::new(
+                eredu_core::communication::CommunicationTensorLimits::new(
                     1,
                     3,
                     character.width.max(character.output_width) as usize,

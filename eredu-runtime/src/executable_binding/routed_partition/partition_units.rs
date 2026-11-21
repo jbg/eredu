@@ -1,0 +1,248 @@
+//! Borrow selected scalar coordinates through every partition bank provider path.
+use std::collections::BTreeMap;
+
+use eredu_core::component::RoutedComponentCoordinateMap;
+use eredu_nn::{GroupedNeuralBackend, Tensor};
+
+use super::RoutedTextExecutionError;
+use crate::{
+    ParameterProvider, RoutedBankId, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
+    TensorParallelParameterProvider,
+};
+
+/// Attaches the retained scalar coordinates to grouped provider observations.
+pub struct PartitionUnitProvider<P> {
+    inner: P,
+    coordinates: BTreeMap<usize, RoutedComponentCoordinateMap>,
+}
+impl<P> PartitionUnitProvider<P> {
+    /// Binds the checked invocation map to the selected provider.
+    pub fn new(coordinates: BTreeMap<usize, RoutedComponentCoordinateMap>, inner: P) -> Self {
+        Self { inner, coordinates }
+    }
+}
+
+fn with_coordinates<T: Tensor, R>(
+    coordinates: &BTreeMap<usize, RoutedComponentCoordinateMap>,
+    request: RoutedExpertRequest<'_, '_, T>,
+    execute: impl FnOnce(RoutedExpertRequest<'_, '_, T>) -> Result<R, RoutedTextExecutionError>,
+) -> Result<R, RoutedTextExecutionError> {
+    if request.unit_observer.is_none() {
+        return execute(request);
+    }
+    let coordinates = coordinates.get(&request.layer);
+    let RoutedExpertRequest {
+        bank,
+        layer,
+        input,
+        routes,
+        pass,
+        unit_observer,
+    } = request;
+    crate::with_routed_unit_invocation(
+        unit_observer,
+        crate::RoutedUnitInvocation {
+            input,
+            origins: None,
+            unit_coordinates: coordinates.map(|coordinates| coordinates.units()),
+        },
+        |mut observer| {
+            let coordinates = coordinates.ok_or_else(|| {
+                RoutedTextExecutionError::Contract(
+                    "selected partition bank has no scalar coordinates for this invocation".into(),
+                )
+            })?;
+            crate::with_partition_unit_observer(&mut observer, coordinates.units(), |observer| {
+                execute(RoutedExpertRequest {
+                    bank,
+                    layer,
+                    input,
+                    routes,
+                    pass,
+                    unit_observer: observer,
+                })
+            })
+        },
+        RoutedTextExecutionError::from_error,
+    )
+}
+
+impl<B, P> ParameterProvider<B> for PartitionUnitProvider<P>
+where
+    B: GroupedNeuralBackend,
+    P: ParameterProvider<B, Error = RoutedTextExecutionError>,
+{
+    type Error = RoutedTextExecutionError;
+    fn has_row_parameter(&self, parameter: &eredu_nn::ParameterId) -> bool {
+        self.inner.has_row_parameter(parameter)
+    }
+    fn lookup_rows(
+        &mut self,
+        spec: &crate::RowLookupSpec,
+        rows: &[u64],
+        access: crate::ParameterBankAccess,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, crate::RowLookupError> {
+        self.inner.lookup_rows(spec, rows, access, context)
+    }
+    fn routing_control(
+        &mut self,
+        bank: RoutedBankId,
+        rows: u64,
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
+        self.inner.routing_control(bank, rows)
+    }
+    fn routing_applied(
+        &mut self,
+        bank: RoutedBankId,
+        original: Option<crate::RoutingDecision<'_, B::Tensor>>,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        self.inner.routing_applied(bank, original, effective)
+    }
+    fn routing_failed(&mut self, bank: RoutedBankId, message: &str) {
+        self.inner.routing_failed(bank, message);
+    }
+    fn forward_compact_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_compact_grouped_uncombined(resident, request, context)
+                .map_err(RoutedTextExecutionError::from_error)
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn forward_grouped_uncombined(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_grouped_uncombined(resident, request, context)
+                .map_err(RoutedTextExecutionError::from_error)
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn forward_grouped(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner.forward_grouped(resident, request, context)
+        })
+    }
+    fn forward_compact_grouped(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_compact_grouped(resident, request, context)
+        })
+    }
+    fn forward_relu2_routed(
+        &mut self,
+        resident: &mut B::Relu2Groups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner.forward_relu2_routed(resident, request, context)
+        })
+    }
+    fn forward_linear_routed(
+        &mut self,
+        resident: &mut B::LinearGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        // A linear bank has no FFN unit map; preserve its existing unsupported hook.
+        self.inner.forward_linear_routed(resident, request, context)
+    }
+}
+impl<B, P> TensorParallelParameterProvider<B> for PartitionUnitProvider<P>
+where
+    B: GroupedNeuralBackend,
+    P: TensorParallelParameterProvider<B, Error = RoutedTextExecutionError>,
+{
+    fn forward_compact_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_compact_grouped_uncombined_tensor_parallel(
+                    resident, request, partitions, context,
+                )
+                .map_err(RoutedTextExecutionError::from_error)
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn forward_grouped_uncombined_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, eredu_nn::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_grouped_uncombined_tensor_parallel(resident, request, partitions, context)
+                .map_err(RoutedTextExecutionError::from_error)
+        })
+        .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_grouped_tensor_parallel(resident, request, partitions, context)
+        })
+    }
+    fn forward_compact_grouped_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_compact_grouped_tensor_parallel(resident, request, partitions, context)
+        })
+    }
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident: &mut B::Relu2Groups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        with_coordinates(&self.coordinates, request, |request| {
+            self.inner
+                .forward_relu2_routed_tensor_parallel(resident, request, partitions, context)
+        })
+    }
+}

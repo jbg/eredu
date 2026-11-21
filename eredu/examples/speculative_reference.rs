@@ -204,23 +204,27 @@ fn main() -> anyhow::Result<()> {
     save(&report)?;
     let started = Instant::now();
     println!("Loading one bounded target and its selected external assistant through the facade");
-    let mut factory = MlxBackendFactory::default();
-    if topology.world_size() > 1 {
+    let (factory, parallel) = if topology.world_size() > 1 {
         let parallel = eredu_runtime::ParallelLoadRequest::new(
             rank,
             eredu_runtime::PipelineWireContract::new(
-                eredu_runtime::PipelineActivationDtype::Float32,
+                eredu_core::communication::PipelineActivationDtype::Float32,
             ),
             1,
             32,
-            eredu_runtime::CommunicationCompletionPolicy::new(
+            eredu_core::communication::CommunicationCompletionPolicy::new(
                 Duration::from_secs(300),
                 CompletionCancellationMode::QuarantineUntilComplete,
             )?,
         )?;
-        factory = factory.with_parallel_execution(parallel, "ring".parse()?);
-    }
-    let mut planned = LoadedModel::load_execution_plan(&factory, &target, &plan)?;
+        (
+            MlxBackendFactory::default().with_world_backend("ring".parse()?),
+            Some(parallel),
+        )
+    } else {
+        (MlxBackendFactory::default(), None)
+    };
+    let mut planned = LoadedModel::load_execution_plan(&factory, &target, &plan, parallel)?;
     anyhow::ensure!(planned.drafting().is_enabled(), "assistant is not enabled");
     report["load_seconds"] = json!(started.elapsed().as_secs_f64());
     report["allocator_cache_policy"] = json!(eredu_backend_mlx::allocator_cache_policy()?);

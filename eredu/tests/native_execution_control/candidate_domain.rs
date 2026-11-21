@@ -68,7 +68,7 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     let execution =
         ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap());
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution, None)
             .unwrap()
             .into_parts();
     let chat = model.prepare_chat(ChatTemplateRequest {

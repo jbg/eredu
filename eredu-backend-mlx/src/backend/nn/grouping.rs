@@ -184,13 +184,3 @@ pub fn topk_group_plan(
 ) -> Result<GroupedSelectionPlan> {
     group_by_id(group_indices, stream)
 }
-
-#[cfg(test)]
-pub fn segment_sum_by_index(
-    values: impl AsRef<Array>,
-    indices: impl AsRef<Array>,
-    num_segments: i32,
-    stream: impl AsRef<Stream>,
-) -> Result<Array> {
-    safemlx::ops::segment_sum(values, indices, num_segments, 0, stream)
-}

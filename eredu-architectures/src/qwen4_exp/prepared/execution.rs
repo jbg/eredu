@@ -196,18 +196,19 @@ impl SelectedTargetExecution {
         mut visitor: V,
     ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
     where
-        B: GroupedNeuralBackend + DistributedNeuralBackend,
+        B: eredu_core::SubmissionBackend<
+                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+            > + GroupedNeuralBackend
+            + DistributedNeuralBackend,
         S: LayerRuntimeState<B>,
         S::LayerState:
             AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
-        V: RoutedTextArchitectureVisitor<B, S>,
+        V: RoutedTextArchitectureVisitor<B, S, crate::SelectedRoutedBank>,
     {
         let (prepared, source) = self
             .prepare_with::<B, S>(context, || visitor.construction_started())
             .map_err(|e| RoutedTextDispatchError::Architecture(e.to_string()))?;
-        visitor
-            .visit(prepared, source)
-            .map_err(RoutedTextDispatchError::Backend)
+        crate::routed_text::bind_selected_routed_text(prepared, source, visitor)
     }
 
     /// Retains the concrete architecture type for target/prediction session composition.

@@ -5,11 +5,13 @@
 //! allocation ceiling is a separate capability and must never be inferred from these
 //! logical bounds. Backends must reserve before retaining or materializing a value.
 
+mod workspace;
+pub use workspace::{CaptureWorkspaceModel, RoutedCaptureWorkspace};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-#[cfg(feature = "tensor-capture")]
 mod candidate_tests;
 mod invocation;
 mod prefill;
@@ -18,7 +20,6 @@ mod prepared_geometry_tests;
 pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape, CaptureMediaShape};
 pub use prefill::CapturePrefillSpan;
 mod routed;
-#[cfg(feature = "tensor-capture")]
 mod tensor_wire;
 pub use routed::*;
 
@@ -53,7 +54,6 @@ pub enum CapturePhase {
 
 /// Half-open selection of prediction indices (zero is the prefill prediction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureSchedule {
     /// Whether prompt-prefill observations are selected.
     pub prefill: bool,
@@ -67,7 +67,6 @@ pub struct CaptureSchedule {
     pub every: u64,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl Default for CaptureSchedule {
     fn default() -> Self {
         Self {
@@ -80,7 +79,6 @@ impl Default for CaptureSchedule {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureSchedule {
     /// Returns selected prediction count and last index within a bounded run.
     pub fn count_and_last(
@@ -183,7 +181,6 @@ pub struct CaptureSlice {
 /// A transform is applied after axis selection. Full tensors require explicit opt-in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CaptureTransform {
     /// Raw selected expert units with original token/route/expert/coefficient
     /// identity. Only valid at a declared sparse routed-unit boundary.
@@ -240,7 +237,6 @@ pub enum CaptureTransformKind {
     TokenScores,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureTransform {
     /// Transformation category for capability matching.
     pub fn kind(&self) -> CaptureTransformKind {
@@ -273,7 +269,6 @@ pub struct CaptureCapabilities {
 
 /// One exact path, schedule, axis selection, and transformation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureSelection {
     /// Unique caller identity, allowing several transforms at one observation point.
     pub id: String,
@@ -374,7 +369,6 @@ pub enum CaptureProvenance {
 
 /// Serializable request; only admission produces execution authority.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CapturePlan {
     /// Wire schema version; unsupported versions are rejected.
     pub schema_version: u32,
@@ -387,7 +381,6 @@ pub struct CapturePlan {
     pub limits: CaptureLimits,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CapturePlan {
     /// Creates an explicit capture-none plan with zero capture budgets.
     pub fn none() -> Self {
@@ -767,7 +760,6 @@ impl CaptureRequestShape {
 
 /// Immutable admission proof. Deserialization cannot forge admission.
 #[derive(Debug, Clone)]
-#[cfg(feature = "tensor-capture")]
 pub struct AdmittedCapturePlan {
     plan: CapturePlan,
     points: Vec<ObservationPoint>,
@@ -777,7 +769,6 @@ pub struct AdmittedCapturePlan {
     identity: String,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl AdmittedCapturePlan {
     /// Stable digest of the plan, selected catalog semantics, and request shape.
     pub fn identity(&self) -> &str {
@@ -827,7 +818,6 @@ impl AdmittedCapturePlan {
         }
     }
     /// Revalidates this same geometry authority against current selected discovery.
-    #[cfg(feature = "tensor-capture")]
     pub fn readmit(&self, discovery: &CaptureDeclarations) -> Result<Self, CaptureError> {
         self.plan.clone().admit_geometry(
             &discovery.catalog,
@@ -872,9 +862,7 @@ pub enum PartitionCaptureCombination {
     SumF64ToF32,
 }
 
-#[cfg(feature = "tensor-capture")]
 mod partition_wire;
-#[cfg(feature = "tensor-capture")]
 pub use partition_wire::{
     PartitionCaptureContext, PartitionCaptureContributionRecord, PartitionCaptureEvidence,
     PartitionCaptureFragmentRecord, PartitionCaptureProducerRecord, PartitionCaptureRegion,
@@ -895,7 +883,6 @@ pub struct ResolvedCaptureSlice {
 }
 
 /// Checks axis selection against actual extents without touching tensor payloads.
-#[cfg(feature = "tensor-capture")]
 pub fn resolve_slice(
     point: &ObservationPoint,
     selection: &CaptureSelection,
@@ -941,7 +928,6 @@ pub fn resolve_slice(
 /// accumulated in F64. Integer raw captures remain exact; integer statistics may
 /// round. Empty/all-nonfinite inputs have None aggregates, never fabricated zeros.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureSummary {
     /// Total element count, including non-finite values.
     pub elements: u64,
@@ -967,7 +953,6 @@ pub struct CaptureSummary {
 
 /// Bounded finite-value histogram with explicit excluded-value counts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureHistogram {
     /// Finite, strictly increasing bin edges.
     pub edges: Vec<f32>,
@@ -984,7 +969,6 @@ pub struct CaptureHistogram {
 /// Bounded portable output from one native transformation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CapturePayload {
     /// Raw or sliced tensor values; integer identifiers retain exact precision.
     Tensor(#[serde(with = "tensor_wire")] TensorObservation),
@@ -1002,7 +986,6 @@ pub enum CapturePayload {
 
 /// One selected token evaluated against the complete raw model distribution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureTokenScore {
     /// Exact selected ID and raw F32 score, with separate sampling-domain membership.
     pub target: CaptureCandidate,
@@ -1019,7 +1002,6 @@ pub struct CaptureTokenScore {
 /// Normalization includes every model output ID, including tokenizer holes/padding.
 /// Domain membership is evidence only; it does not alter this distribution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureTokenScores {
     /// Explicit raw score stage; nonlinear architecture output transforms have already run.
     pub stage: CandidateScoreStage,
@@ -1038,7 +1020,6 @@ pub struct CaptureTokenScores {
 /// The processing stage represented by a candidate score.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CandidateScoreStage {
     /// Raw model logits before token filtering, penalties, temperature, top-k/p,
     /// Mirostat processing or normalization. These are not probabilities.
@@ -1048,7 +1029,6 @@ pub enum CandidateScoreStage {
 /// Whether raw candidates precede or follow mutation at the logits hook.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CandidateLogitsSource {
     /// Before interventions at this hook; earlier hooks may already have changed it.
     #[default]
@@ -1059,7 +1039,6 @@ pub enum CandidateLogitsSource {
 
 /// One exact vocabulary identity and finite raw model score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureCandidate {
     /// Canonical tokenizer vocabulary ID.
     pub token_id: u32,
@@ -1072,7 +1051,6 @@ pub struct CaptureCandidate {
     pub allowed: bool,
 }
 
-#[cfg(feature = "tensor-capture")]
 fn candidate_allowed_default() -> bool {
     true
 }
@@ -1120,7 +1098,6 @@ impl CaptureTokenDomain<'_> {
 
 /// Bounded highest-score candidates for the last row of the current model logits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureCandidates {
     /// Explicit score-processing stage; never inferred to be a probability.
     pub stage: CandidateScoreStage,
@@ -1153,7 +1130,6 @@ pub enum CaptureBudget {
 /// Measured data and diagnostic outcomes remain distinct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CaptureOutcome {
     /// The requested result is present.
     Captured,
@@ -1183,7 +1159,6 @@ pub enum CaptureOutcome {
 /// Portable capture-failure categories; diagnostic text is separately bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CaptureFailureReason {
     /// The requested reservation exceeded an admitted budget.
     Limit {
@@ -1220,7 +1195,6 @@ pub enum CaptureSkipReason {
 /// One result linked back to a catalog point. The enclosing generation record owns
 /// run/session identity, prediction token, phase, positions, and timing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureRecord {
     /// Wire schema version; unsupported versions are rejected.
     pub schema_version: u32,
@@ -1312,14 +1286,12 @@ impl CaptureReservation for CaptureQuota {
 
 /// Monotone per-run ledger. Reservations cannot be refunded after work begins.
 #[derive(Debug)]
-#[cfg(feature = "tensor-capture")]
 pub struct CaptureLedger {
     limits: CaptureLimits,
     step: CaptureUsage,
     total: CaptureUsage,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureLedger {
     /// Creates a fresh run ledger with the admitted limits.
     pub fn new(plan: &AdmittedCapturePlan) -> Self {
@@ -1385,7 +1357,6 @@ impl CaptureLedger {
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureReservation for CaptureLedger {
     fn reserve(&mut self, usage: CaptureUsage) -> Result<Option<CaptureSkipReason>, CaptureError> {
         CaptureLedger::reserve(self, usage)
@@ -1439,12 +1410,39 @@ pub fn mul(a: u64, b: u64) -> Result<u64, CaptureError> {
     a.checked_mul(b).ok_or(CaptureError::Overflow)
 }
 
+/// Resolves the exact flattened score row for an admitted transform.
+pub fn resolve_capture_score_row(
+    transform: &CaptureTransform,
+    shape: &[u64],
+) -> Result<Option<u64>, CaptureError> {
+    let requested = match transform {
+        CaptureTransform::TopCandidates { .. } => None,
+        CaptureTransform::TokenScores { position, .. } => *position,
+        _ => return Ok(None),
+    };
+    let (width, leading) = shape
+        .split_last()
+        .ok_or_else(|| CaptureError::Invalid("score capture requires a vocabulary axis".into()))?;
+    let rows = elements(leading)?;
+    if *width == 0 || rows == 0 {
+        return Err(CaptureError::Invalid(
+            "score capture has no vocabulary row".into(),
+        ));
+    }
+    let row = requested.unwrap_or(rows - 1);
+    if row >= rows {
+        return Err(CaptureError::Invalid(
+            "selected score position lies outside the invocation".into(),
+        ));
+    }
+    Ok(Some(row))
+}
+
 /// Backend mechanism for capture. The estimator is side-effect-free and must
 /// conservatively cover all collector-owned native storage (including retained
 /// backing arrays and dependencies), host buffers/transfers, and JSON payloads.
 /// `transform` may run only after successful reservation. It must not retain the
 /// tensor beyond the call or fall back to copying an unsliced source to the host.
-#[cfg(feature = "tensor-capture")]
 pub trait CaptureBackend {
     /// Backend-native tensor type; never crosses the host-record boundary.
     type Tensor;
@@ -1542,18 +1540,19 @@ pub trait CaptureBackend {
         self.estimate(prototype, selection, slice)
     }
     /// Performs the reserved transformation without retaining native handles after return.
+    /// Score transforms receive the exact flattened row selected by the driver.
     fn transform(
         &mut self,
         tensor: &Self::Tensor,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error>;
 }
 
 /// Outcome of the enclosing model forward, distinct from each capture operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg(feature = "tensor-capture")]
 pub enum CaptureStepOutcome {
     /// A low-level caller or older serialized record supplied no transaction evidence.
     #[default]
@@ -1569,7 +1568,6 @@ pub enum CaptureStepOutcome {
 /// Timing is measured separately from native forward/sampling time; synchronous
 /// callback costs are included in end-to-end time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg(feature = "tensor-capture")]
 pub struct CapturedStep {
     /// Actual model transaction outcome; absence in older records is untracked.
     #[serde(default)]
@@ -1589,7 +1587,6 @@ pub struct CapturedStep {
     /// Verified global ownership and forward provenance for partitioned records.
     /// Evidence is published only after the enclosing model transaction commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg(feature = "tensor-capture")]
     pub partitions: Vec<PartitionCaptureEvidence>,
     /// Attributed intervention outcomes and optional evidence sharing these budgets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1632,4 +1629,150 @@ impl CaptureDiscovery {
             support: self.support.clone(),
         }
     }
+}
+
+/// Side-effect-free native bounds for one producer fragment. The creation bound
+/// covers a deferred input factory in addition to the ordinary capture estimate;
+/// unused credits are not refunded when this point uses an existing tensor.
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionCaptureNativeEstimate {
+    /// Same conservative source/transform/host/record bound as `CaptureBackend::estimate`.
+    pub capture: CaptureUsage,
+    /// Maximum separately declared native work for a deferred source factory.
+    pub generated_creation_bytes: u64,
+}
+
+/// Native transformation primitives used by the portable speculative observer.
+pub trait SpeculativeCapturePrimitives: CaptureWorkspace + 'static {
+    /// Queue identity and dependency submission for this invocation.
+    type Queues: crate::speculative::SpeculativeQueueMechanisms<
+        Queue: Clone,
+        Error = Self::InvocationError,
+    >;
+    /// Exact native transport used by the installed partition.
+    type Transport: Clone + 'static;
+    /// Tensor handle used by the target invocation observer.
+    type InvocationTensor;
+    /// Error domain used by the target invocation observer.
+    type ObserverError;
+    /// Score handle returned by the observed target invocation.
+    type Scores;
+    /// Native tensor at the observation boundary.
+    type Tensor;
+    /// Native transform failure.
+    type Error: std::error::Error + Send + Sync + 'static;
+    /// Error reported to the enclosing numerical invocation.
+    type InvocationError: std::error::Error + Send + Sync + 'static;
+    /// Native transformations borrowed for one observer invocation.
+    type Backend<'a>: crate::intervention::InterventionBackend<
+        Tensor = Self::Tensor,
+        Error = Self::Error,
+    >;
+
+    /// Lends native operations over the exact queue and retained transport.
+    fn capture_backend<'a>(
+        queue: &'a <Self::Queues as crate::speculative::SpeculativeQueueMechanisms>::Queue,
+        transport: Option<&'a Self::Transport>,
+    ) -> Self::Backend<'a>;
+
+    /// Native intervention capability facts.
+    fn intervention_mechanisms() -> crate::intervention::InterventionMechanisms;
+    /// Side-effect-free native intervention cost estimate.
+    fn intervention_estimator() -> std::sync::Arc<dyn crate::intervention::InterventionEstimator>;
+    /// Native projection-input allocation for the exact generated fragment.
+    fn generated_creation_bytes(shape: &[u64]) -> Result<u64, CaptureError>;
+    /// Preserves the error source at the observation boundary.
+    fn observation_failure(error: crate::BackendFailure) -> Self::Error;
+    /// Preserves the error description at the numerical invocation boundary.
+    fn invocation_failure(error: &dyn std::error::Error) -> Self::InvocationError;
+}
+
+/// Side-effect-free workspace facts for capture admission and forecasting.
+pub trait CaptureWorkspace {
+    /// Returns native size limits, retained storage costs, and scratch bounds.
+    fn capture_workspace() -> CaptureWorkspaceModel;
+}
+
+/// Native intervention support and exact retained transport for capture.
+pub trait TextCaptureNative<Retained>: CaptureWorkspace {
+    /// Native distributed collector retained by the session.
+    type Transport: Clone + 'static;
+    /// Exact tensor transformations available on the retained transport.
+    type Collector: CaptureTensorOperations<Self::Transport>;
+
+    /// Active native transport and its exact retained setup identity.
+    fn capture_transport(
+        retained: &Retained,
+    ) -> Option<(
+        &Self::Transport,
+        crate::communication::CommunicationSessionIdentity,
+    )>;
+    /// Exact activation operations supported by the installed collector.
+    fn intervention_mechanisms() -> crate::intervention::InterventionMechanisms;
+    /// Native allocation and work estimates for admitted interventions.
+    fn intervention_estimator() -> impl crate::intervention::InterventionEstimator + 'static;
+}
+
+/// Native tensor transformations and resource estimates for portable collectors.
+pub trait CaptureTensorOperations<T: 'static>: CaptureWorkspace {
+    /// Selected native execution context.
+    type Context;
+    /// Native tensor exposed to observation.
+    type Tensor;
+    /// Typed observation failure.
+    type Error: std::error::Error + From<crate::BackendFailure> + Send + Sync + 'static;
+    /// Native tensor operations and bounded staging for one observer.
+    type Native<'a>: crate::intervention::InterventionBackend<Tensor = Self::Tensor, Error = Self::Error>
+        + 'a;
+
+    /// Opens native tensor mechanisms for the selected context and transport.
+    fn native<'a>(
+        context: &'a Self::Context,
+        domain: Option<CaptureTokenDomain<'a>>,
+        transport: Option<&'a T>,
+    ) -> Self::Native<'a>;
+
+    /// Native projection-input allocation for the exact generated fragment.
+    fn generated_creation_bytes(shape: &[u64]) -> Result<u64, CaptureError>;
+}
+
+/// Native facts and shared failure ownership for a capture receipt exchange.
+/// Implementations reuse their selected portable-word transport. Estimates must
+/// include retained input/output and native temporaries plus host resolution;
+/// runtime separately prices its framing buffers. These are logical reservations,
+/// never an assertion about physical allocator ceilings.
+pub trait PartitionCaptureTransport: crate::consensus::BoundedConsensusTransport {
+    /// Rank in the exact retained participant topology.
+    fn capture_rank(&self) -> usize;
+    /// Selected bounded wait, if configured; querying it must not submit work.
+    fn capture_wait(&self) -> Option<crate::BoundedCompletionWait>;
+    /// Rejects a previously failed shared execution/communication owner.
+    fn ensure_capture_active(&self) -> Result<(), crate::BackendFailure>;
+    /// Side-effect-free upper bound for one equal-word gather and host resolution.
+    fn estimate_capture_gather(&self, local_words: usize) -> Result<CaptureUsage, CaptureError>;
+    /// Fences this execution after transport or unagreed protocol failure. This does not establish
+    /// native completion: the exact completion owner still settles or quarantines
+    /// submitted work before releasing resources, including on polling errors.
+    fn fence_capture_exchange(&self);
+}
+
+/// Native status agreement on an exact architecture-declared invocation group.
+/// This is separate from world receipt transport: inactive pipeline ranks must
+/// never enter a hook collective. Implementations validate retained membership
+/// and the selected failure-agreement requirement before returning a cold bound.
+pub trait PartitionCaptureHookTransport: PartitionCaptureTransport {
+    /// Status whose host resolution is permitted only after exact completion.
+    type HookOutput;
+    /// Cold per-member logical bound, including completion and host resolution.
+    /// Called on every world rank, including nonmembers. Must submit no work.
+    fn estimate_capture_hook(&self, members: &[usize]) -> Result<CaptureUsage, CaptureError>;
+    /// Submits one payload-free success vote on the declared invocation group.
+    /// Runtime settles singleton groups locally without calling this method.
+    fn submit_capture_hook(
+        &self,
+        members: &[usize],
+        success: bool,
+    ) -> Result<crate::Submission<Self::HookOutput, Self::Completion>, Self::Error>;
+    /// True only when every invocation-group member reported success.
+    fn resolve_capture_hook(&self, output: Self::HookOutput) -> Result<bool, Self::Error>;
 }

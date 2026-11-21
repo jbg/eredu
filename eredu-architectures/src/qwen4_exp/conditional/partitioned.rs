@@ -4,7 +4,6 @@ use super::super::{
     target::TargetTensorPartition,
 };
 use super::*;
-use crate::composite_execution::ParallelCompositeArchitecture;
 use eredu_nn::{GroupedGatedProductSpec, TensorParallelGroupedNeuralBackend};
 
 impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
@@ -168,7 +167,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> ConditionalKernel<B> {
     }
 }
 
-impl<B, S> ParallelCompositeArchitecture<B, S> for ConditionalModel<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for ConditionalKernel<B>
 where
     B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,

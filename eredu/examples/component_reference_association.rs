@@ -7,8 +7,11 @@ use eredu_core::{
 };
 use std::{collections::BTreeMap, ops::ControlFlow};
 
-pub fn run<B: ParameterBackend>(
-    model: &mut LoadedModel<B>,
+pub fn run<
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + ParameterSession<B>,
+>(
+    model: &mut LoadedModel<B, S>,
     architecture: &ArchitectureDescriptor,
     reference: &serde_json::Value,
 ) -> anyhow::Result<()> {

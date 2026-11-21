@@ -5,9 +5,7 @@
 //! carry. Magnitude/phase conversion and inverse STFT are separate components.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use eredu_nn::RetainedTensorRoots;
 
@@ -49,7 +47,7 @@ impl SnapshotValue for DecoderConfig {
             self.rates.estimate_snapshot_value(),
         ])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             latent_size: self.latent_size,
             base_hidden_size: self.base_hidden_size,
@@ -228,7 +226,7 @@ impl<T: Tensor + SnapshotValue> SnapshotValue for DecoderUnitState<T> {
     fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
         snapshot_value_estimate::<Self>([self.convolution.estimate_snapshot_value()])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             convolution: self.convolution.copy_snapshot_value(retention)?,
             spec: self.spec,
@@ -268,7 +266,7 @@ impl<T: Tensor + SnapshotValue> SnapshotValue for DecoderState<T> {
     fn estimate_snapshot_value(&self) -> Result<SnapshotEstimate, BackendFailure> {
         snapshot_value_estimate::<Self>([self.units.estimate_snapshot_value()])
     }
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             units: self.units.copy_snapshot_value(retention)?,
             batch: self.batch,

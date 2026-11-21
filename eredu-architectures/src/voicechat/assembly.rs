@@ -20,11 +20,11 @@ use eredu_codec::{
     ear_encoder_layered::EncoderExecution,
     prvq::ResidualQuantizer,
 };
+use eredu_core::sampling::TokenDomain;
 use eredu_core::BackendFailure;
 use eredu_nn::{
     DistributedNeuralBackend, GroupedNeuralBackend, NeuralBackend, Parameterized, Tensor,
 };
-use eredu_runtime::TokenDomain;
 
 use super::{
     channels::{ChannelFusion, FunctionHead},

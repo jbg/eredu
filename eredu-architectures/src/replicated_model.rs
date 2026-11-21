@@ -4,9 +4,8 @@ use std::{marker::PhantomData, sync::Arc};
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    AttentionCache, AttentionRequest, BlockwiseAttentionBackend, CompressedAttentionBlock,
-    CompressedAttentionCache, CompressedAttentionScan, CompressedAttentionState,
-    CompressedAttentionView, Error, NeuralBackend, Parameterized, Tensor,
+    AttentionCache, AttentionRequest, BlockwiseAttentionBackend, CompressedAttentionCache,
+    CompressedAttentionState, CompressedAttentionView, Error, NeuralBackend, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ComponentAdapter, ComponentDefinition, ComponentEquations, ComponentKernel,
@@ -475,6 +474,12 @@ impl<B: NeuralBackend, C: CompressedAttentionCache<B::Tensor> + RuntimeLayerStat
     CompressedAttentionCache<B::Tensor> for CompressedLayer<'_, B, C>
 {
     type Checkpoint = C::Checkpoint;
+    type History = C::History;
+
+    fn history(&self) -> Option<&Self::History> {
+        self.inner.history()
+    }
+
     fn offset(&self) -> i32 {
         self.inner.offset()
     }
@@ -487,17 +492,6 @@ impl<B: NeuralBackend, C: CompressedAttentionCache<B::Tensor> + RuntimeLayerStat
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<CompressedAttentionView<B::Tensor>, Error> {
         self.inner.append(state, context)
-    }
-    fn visit_blocks<F>(
-        &mut self,
-        query_tokens: i32,
-        context: &<B::Tensor as Tensor>::Context,
-        visitor: F,
-    ) -> Result<CompressedAttentionScan, Error>
-    where
-        F: FnMut(CompressedAttentionBlock<B::Tensor>) -> Result<u64, Error>,
-    {
-        self.inner.visit_blocks(query_tokens, context, visitor)
     }
     fn checkpoint(&self) -> Self::Checkpoint {
         self.inner.checkpoint()

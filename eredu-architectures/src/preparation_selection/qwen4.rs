@@ -479,7 +479,7 @@ fn prediction_streams(
     spec: &crate::qwen4_exp::mtp::PredictionSpec,
     request: &NormalizedLoadRequest,
     limits: crate::qwen4_exp::mtp::PredictionLimits,
-) -> Vec<eredu_runtime::AppendStreamBinding> {
+) -> Vec<eredu_core::cache::append_stream::AppendStreamBinding> {
     let append = request
         .bounded_execution()
         .expect("normalized policy")
@@ -492,15 +492,17 @@ fn prediction_streams(
                 .state
                 .streams()
                 .into_iter()
-                .map(|spec| eredu_runtime::AppendStreamBinding {
-                    layer,
-                    lanes: limits.qsa.batch as u32,
-                    spec,
-                    limits: append.limits(),
-                    payload_bytes: append.payload_bytes(),
-                    scratch_bytes: append.scratch_bytes(),
-                    catalog_bytes: append.catalog_bytes(),
-                })
+                .map(
+                    |spec| eredu_core::cache::append_stream::AppendStreamBinding {
+                        layer,
+                        lanes: limits.qsa.batch as u32,
+                        spec,
+                        limits: append.limits(),
+                        payload_bytes: append.payload_bytes(),
+                        scratch_bytes: append.scratch_bytes(),
+                        catalog_bytes: append.catalog_bytes(),
+                    },
+                )
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         })

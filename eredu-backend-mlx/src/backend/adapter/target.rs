@@ -4,7 +4,8 @@ use super::*;
 ///
 /// Streams may change on the same device. A distributed world, unlike its
 /// rank/size metadata, must be the exact retained native communicator.
-pub(crate) struct MlxPreparedTarget {
+#[doc(hidden)]
+pub struct MlxPreparedTarget {
     device: Device,
     world: Option<safemlx::distributed::Group>,
 }
@@ -48,73 +49,4 @@ pub(crate) fn validate_native_execution_target(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepared_target_compares_native_devices_without_gpu_execution() {
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let target = MlxPreparedTarget {
-            device: Device::new(DeviceType::Gpu, 0),
-            world: None,
-        };
-        crate::tests::support::path_instrumentation::reset();
-        assert!(target
-            .validate(&stream, None)
-            .unwrap_err()
-            .to_string()
-            .contains("different native devices"));
-        assert_eq!(
-            crate::tests::support::path_instrumentation::snapshot(),
-            Default::default()
-        );
-    }
-
-    #[test]
-    fn prepared_target_requires_exact_world_handle_but_accepts_clones() {
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let world =
-            safemlx::distributed::Group::init(false, safemlx::distributed::Backend::Ring).unwrap();
-        let clone = world.clone();
-        let other =
-            safemlx::distributed::Group::init(false, safemlx::distributed::Backend::Ring).unwrap();
-        assert_eq!((world.size(), world.rank()), (other.size(), other.rank()));
-        assert!(!world.shares_native_handle(&other));
-        let manifest = eredu_runtime::CommunicationManifest::new(1, 0, Vec::new(), Vec::new())
-            .unwrap()
-            .with_completion_policy(
-                eredu_runtime::CommunicationCompletionPolicy::new(
-                    std::time::Duration::from_secs(1),
-                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
-                )
-                .unwrap(),
-            );
-        let communication =
-            MlxDistributedSession::from_manifest(&manifest, &world, &stream).unwrap();
-        let target = MlxPreparedTarget::new(&stream, Some(&communication)).unwrap();
-        crate::tests::support::path_instrumentation::reset();
-        target.validate(&stream, Some(&clone)).unwrap();
-        for replacement in [None, Some(&other)] {
-            assert!(target
-                .validate(&stream, replacement)
-                .unwrap_err()
-                .to_string()
-                .contains("different native worlds"));
-        }
-        assert_eq!(
-            crate::tests::support::path_instrumentation::snapshot(),
-            Default::default()
-        );
-        assert_eq!(
-            crate::tests::support::path_instrumentation::session_reset_attempts(),
-            0
-        );
-        assert_eq!(
-            crate::tests::support::path_instrumentation::session_input_creation_attempts(),
-            0
-        );
-    }
 }

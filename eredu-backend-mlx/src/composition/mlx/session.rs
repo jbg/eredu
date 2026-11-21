@@ -1,17 +1,7 @@
 //! Architecture-erased MLX model-session execution.
 
-use eredu_core::{
-    BackendSession, Completion, InputModality, ModelRuntime, ObservationSet, ObservationValue,
-    SessionAdmission, SessionAuthority, Submission, SubmissionLease, TensorObservation,
-    TensorObservationData, TextGenerationBackend, TextGenerationConfig, TextSamplingStrategy,
-    TokenFilter, TokenOutput,
-};
+use eredu_core::{Completion, Submission, TensorObservation, TensorObservationData, TokenOutput};
 use eredu_nn::Tensor as _;
-use eredu_runtime::{
-    ActivationObserver as RuntimeActivationObserver, GenerationSampler, MirostatV2Sampler, Sampler,
-    SamplingBackend,
-};
-use ref_cast::RefCast;
 use safemlx::{
     error::Exception,
     ops::indexing::{NewAxis, TryIndexOp},
@@ -26,48 +16,27 @@ use crate::{
     backend::runtime::media::input,
     MlxTensor,
 };
-#[cfg(any(feature = "image", feature = "audio"))]
-use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
-use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
-use eredu_core::SpeculativeCapability;
-use eredu_runtime::CacheResidencyPolicy;
 
-use super::{
-    execution::prefill_model, Executable, MlxBackend, MlxCompletion, MlxDistributedSession,
-    MlxModel,
-};
+use super::{MlxBackend, MlxCompletion, MlxDistributedSession};
 
-#[cfg(feature = "tensor-capture")]
 pub(crate) mod bounded_capture;
+
 mod generation;
-#[cfg(feature = "tensor-capture")]
 pub(crate) mod intervention;
-mod model_session;
+pub(super) mod model_session;
 mod observation;
 mod output_completion;
 mod score_readout;
 mod text_snapshot;
 pub(super) use crate::backend::submission_recovery as recovery;
 
-pub use generation::{MlxTextGenerationState, MlxTextSamplingState};
-pub(in crate::composition::mlx) use model_session::SpeculativePartitionBinding;
-pub use model_session::{MlxModelInput, MlxModelSession, MlxNativeTextState};
+pub use model_session::MlxSessionMechanisms;
 pub use output_completion::{
     MlxModelOutput, MlxSessionCompletion, MlxTextCompletion, MlxTextToken,
 };
 
-use generation::sample_text_submission;
-pub(crate) use generation::MlxTextSampler;
-#[cfg(test)]
-use model_session::model_submission;
 use observation::observe_tensor;
-pub(in crate::composition::mlx) use observation::ArrayObserverAdapter;
 use output_completion::MlxSessionCompletionKind;
-
-#[cfg(test)]
-mod recovery_tests;
-#[cfg(test)]
-mod tests;
 
 pub(super) fn capture_capabilities() -> eredu_core::capture::CaptureCapabilities {
     #[cfg(feature = "tensor-capture")]

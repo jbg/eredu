@@ -11,7 +11,7 @@ use eredu_core::{
     RealtimeChannelDeclaration, RealtimeChannelFeedback, RealtimeChannelId, RealtimeChannelLayout,
     RealtimeChannelPayload,
 };
-use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
+use eredu_runtime::execution_control::{SnapshotRetention, SnapshotValue};
 use eredu_runtime::{
     RealtimeFrameContract, RealtimeGenerationContract, RealtimeIdentity,
     RealtimeScheduleDescriptor, RealtimeScheduleState,
@@ -347,7 +347,7 @@ impl SnapshotValue for SchedulePolicy {
         })
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(self.clone())
     }
 }
@@ -361,7 +361,7 @@ impl SnapshotValue for ScheduleState {
         })
     }
 
-    fn copy_snapshot_value(&self, _: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, _: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(self.clone())
     }
 }

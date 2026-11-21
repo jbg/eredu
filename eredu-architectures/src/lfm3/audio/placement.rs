@@ -48,7 +48,7 @@ pub(super) struct PreparedAudioCodec {
     declaration: eredu_codec::liquid::Declaration,
     source: eredu_checkpoint::store::SharedCheckpointSource,
     invocations: eredu_runtime::ExecutionUnitAddressMap,
-    units: Vec<Vec<eredu_runtime::WeightBinding>>,
+    units: Vec<Vec<eredu_core::residency::parameter_binding::WeightBinding>>,
 }
 
 impl PreparedAudioCodec {
@@ -96,11 +96,8 @@ impl PreparedAudioCodec {
             self.invocations,
             self.units,
             context,
-            |source, addresses, units, build| {
-                mechanisms
-                    .bind_units(source, addresses, units, residency, build)
-                    .map(|(policy, _)| policy)
-            },
+            residency,
+            mechanisms,
         )
     }
 }
@@ -127,7 +124,7 @@ pub(super) fn prepare_audio_units<'a>(
 ) -> Result<
     (
         eredu_checkpoint::store::SharedCheckpointSource,
-        Vec<Vec<eredu_runtime::WeightBinding>>,
+        Vec<Vec<eredu_core::residency::parameter_binding::WeightBinding>>,
     ),
     ArtifactError,
 > {
@@ -186,12 +183,13 @@ pub(super) fn prepare_audio_units<'a>(
 pub(super) fn admit_audio_weights(
     component: &str,
     invocations: &eredu_runtime::ExecutionUnitAddressMap,
-    units: &[Vec<eredu_runtime::WeightBinding>],
+    units: &[Vec<eredu_core::residency::parameter_binding::WeightBinding>],
     pinned: u64,
     residency: eredu_runtime::LayerWeightResidency,
 ) -> Result<u64, super::ResidentAudioError> {
     use super::artifact::checkpoint;
-    use eredu_runtime::{execution_unit_parameter_window_bytes, physical_binding_bytes};
+    use eredu_core::residency::parameter_binding::physical_binding_bytes;
+    use eredu_runtime::execution_unit_parameter_window_bytes;
     let units = units
         .iter()
         .map(|unit| physical_binding_bytes(unit))

@@ -173,46 +173,7 @@ pub struct InputScoreAttentionWorkspace {
     pub mechanism: Option<InputScoreAttentionMechanism>,
 }
 
-/// Side-effect-free native facts for tiled explicit input-score attention.
-/// Copies and score bytes are conservative live-buffer allowances, not payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InputScoreAttentionMechanism {
-    /// Query-by-key elements per head before query tiling.
-    pub score_tile_elements: u64,
-    /// Maximum query rows in one tile.
-    pub max_query_rows: u64,
-    /// Fallback expanded K/V and contiguous projection copies per query tile,
-    /// used when `full_key_tiles` is absent or does not cover the key length.
-    pub key_value_copies: u64,
-    /// Working bytes per score element, including precision conversions.
-    pub score_bytes: u64,
-    /// Optional full-key layout reuse and bounded tile-graph retention. Missing
-    /// facts retain the legacy per-tile copy allowance for all key lengths.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_key_tiles: Option<FullKeyAttentionTiles>,
-}
-
-/// Native retention contract for tiles that each attend to the entire key row.
-/// Beyond this contract's key limit, the mechanism's legacy allowances apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FullKeyAttentionTiles {
-    /// Largest key row covered by shared preparation and bounded evaluation.
-    pub max_key_positions: u64,
-    /// Expanded K/V and native contiguous layouts, in query-width payloads.
-    /// This is charged once per invocation rather than once per query tile.
-    pub shared_key_value_copies: u64,
-    /// Largest number of unevaluated query tiles retained simultaneously.
-    pub max_live_query_tiles: u64,
-    /// Whole-query output payloads retained, including final concatenation.
-    pub retained_output_copies: u64,
-    /// When the query tile count exceeds `max_live_query_tiles`, each batch,
-    /// including the last, completes synchronously and detaches evaluated input
-    /// dependency graphs. This releases unowned intermediates, not owner-held
-    /// residuals, state views, completed outputs, parameters or allocator cache.
-    /// Absent legacy facts do not establish an upstream release boundary.
-    #[serde(default)]
-    pub evaluates_input_dependencies: bool,
-}
+pub use eredu_core::attention::{FullKeyAttentionTiles, InputScoreAttentionMechanism};
 
 /// Selected attention implementation's workspace behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

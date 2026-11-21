@@ -1,6 +1,7 @@
 //! Constrained commitment of one position from a completed refinement block.
 
-use crate::generation::{SamplingBackend, TokenDomain};
+use eredu_core::refinement::{PositionScoreClass, RefinementFinalizationBackend};
+use eredu_core::sampling::TokenDomain;
 use eredu_core::{refinement::PredictionScoreKind, TokenFilter};
 use eredu_nn::{Index, Tensor};
 
@@ -10,27 +11,6 @@ pub struct RefinementSelection<'a, T> {
     pub tokens: &'a T,
     /// A mask denotes tentative state and cannot become a finalized token.
     pub mask_token_id: u32,
-}
-
-/// Native candidate validation for position-wise constrained finalization.
-pub trait RefinementFinalizationBackend: SamplingBackend {
-    /// Borrows one already selected canvas position as an immutable scalar token.
-    fn candidate_at(
-        candidates: &Self::Token,
-        position: usize,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
-    /// Whether a selected token still has a finite score after current filtering.
-    fn candidate_is_admissible(
-        candidate: &Self::Token,
-        scores: &Self::Logits,
-        context: &Self::Context,
-    ) -> Result<bool, Self::Error>;
-    /// Rejects NaN/positive infinity and reports whether a finite candidate remains.
-    fn position_has_candidate(
-        scores: &Self::Logits,
-        context: &Self::Context,
-    ) -> Result<bool, Self::Error>;
 }
 
 /// A canonical candidate and the position scores restricted by current constraints.
@@ -56,6 +36,9 @@ pub enum FinalizationError<E> {
     /// Scores do not describe the requested position in the admitted domain.
     #[error("refinement finalization requires an admitted nonempty position score matrix")]
     Geometry,
+    /// A score row contains NaN or positive infinity.
+    #[error("invalid finalization position scores")]
+    InvalidScores,
     /// The numerical mechanism rejected filtering or candidate selection.
     #[error("refinement finalization failed: {0}")]
     Backend(#[source] E),
@@ -111,8 +94,10 @@ where
         scores = B::apply_token_filter(&scores, &TokenFilter::Allowed(allowed), context)
             .map_err(FinalizationError::Backend)?;
     }
-    if !B::position_has_candidate(&scores, context).map_err(FinalizationError::Backend)? {
-        return Err(FinalizationError::NoAdmissibleToken);
+    match B::classify_position_scores(&scores, context).map_err(FinalizationError::Backend)? {
+        PositionScoreClass::Invalid => return Err(FinalizationError::InvalidScores),
+        PositionScoreClass::NoFinite => return Err(FinalizationError::NoAdmissibleToken),
+        PositionScoreClass::HasFinite => {}
     }
     let candidate = selected
         .map(|selection| B::candidate_at(selection.tokens, position, context))
@@ -120,7 +105,7 @@ where
         .map_err(FinalizationError::Backend)?;
     let admissible = candidate
         .as_ref()
-        .map(|candidate| B::candidate_is_admissible(candidate, &scores, context))
+        .map(|candidate| B::candidate_score_is_finite(candidate, &scores, context))
         .transpose()
         .map_err(FinalizationError::Backend)?
         .unwrap_or(false);

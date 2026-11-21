@@ -1,37 +1,7 @@
 //! Instance identity agreed with the complete communication setup transcript.
 use super::*;
+use eredu_core::communication::CommunicationSessionIdentity;
 use sha2::{Digest, Sha256};
-
-/// Common identity of one successful communication setup, not execution authority.
-///
-/// It distinguishes repeated setups with identical manifests when native
-/// composition supplies fresh instance nonces. Copying or serializing this host
-/// value never grants access to a communicator, model, run, or capture quota.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
-pub struct CommunicationSessionIdentity {
-    digest: [u8; 32],
-    participants: usize,
-}
-
-impl CommunicationSessionIdentity {
-    /// Fixed-width identity suitable for bounded host provenance records.
-    pub const fn bytes(&self) -> &[u8; 32] {
-        &self.digest
-    }
-    /// Participant count committed by this exact setup transcript.
-    pub const fn participant_count(&self) -> usize {
-        self.participants
-    }
-}
-
-impl std::fmt::Display for CommunicationSessionIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.digest {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
 
 /// Complete compatible setup declarations and their common instance identity.
 pub struct AgreedCommunicationSession {
@@ -120,10 +90,11 @@ pub fn establish_communication_session<T: ConsensusTransport>(
     }
     validate_compatible_communication_manifests(&manifests)?;
     Ok(AgreedCommunicationSession {
-        identity: CommunicationSessionIdentity {
-            digest: hash.finalize().into(),
-            participants: manifests.len(),
-        },
+        identity: CommunicationSessionIdentity::from_transcript_digest(
+            hash.finalize().into(),
+            std::num::NonZeroUsize::new(manifests.len())
+                .ok_or(CommunicationManifestConsensusError::EmptyTopology)?,
+        ),
         manifests,
     })
 }

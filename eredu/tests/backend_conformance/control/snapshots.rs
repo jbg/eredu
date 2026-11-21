@@ -8,21 +8,21 @@ use eredu_runtime::execution_control::TextSnapshotBackend;
 // retains only the consumed-input position and pending canonical input. Native storage conformance runs separately
 // against actual dense, convolution/recurrent and MoE fixtures.
 pub(crate) struct Native(String, u64);
-impl NativeTextStateBackend for MockBackend {
+impl NativeTextStateSession<MockBackend> for MockSession {
     type NativeTextState = Native;
     fn estimate_native_text_growth(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, MockSession>,
         saved: &Native,
         _: u64,
     ) -> Result<Option<u64>, MockError> {
         Self::validate_native_text_state(runtime, saved)?;
         Ok(Some(0))
     }
-    fn native_text_state_support(_: &ModelRuntime<Self>) -> ControlSupport {
+    fn native_text_state_support(_: &ModelRuntime<MockBackend, MockSession>) -> ControlSupport {
         ControlSupport::Supported
     }
     fn estimate_native_text_state(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, MockSession>,
         saved: Option<&Native>,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
         runtime.session().authority.require_idle()?;
@@ -35,7 +35,9 @@ impl NativeTextStateBackend for MockBackend {
             copy_bytes: bytes,
         }))
     }
-    fn capture_native_text_state(runtime: &mut ModelRuntime<Self>) -> Result<Native, MockError> {
+    fn capture_native_text_state(
+        runtime: &mut ModelRuntime<MockBackend, MockSession>,
+    ) -> Result<Native, MockError> {
         runtime.session().authority.require_idle()?;
         Ok(Native(
             runtime.session().intervention_identity.clone(),
@@ -43,14 +45,14 @@ impl NativeTextStateBackend for MockBackend {
         ))
     }
     fn copy_native_text_state(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<MockBackend, MockSession>,
         saved: &Native,
     ) -> Result<Native, MockError> {
         Self::validate_native_text_state(runtime, saved)?;
         Ok(Native(saved.0.clone(), saved.1))
     }
     fn validate_native_text_state(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<MockBackend, MockSession>,
         saved: &Native,
     ) -> Result<(), MockError> {
         runtime.session().authority.require_idle()?;
@@ -60,7 +62,7 @@ impl NativeTextStateBackend for MockBackend {
         Ok(())
     }
     fn exchange_native_text_state(
-        runtime: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<MockBackend, MockSession>,
         saved: &mut Native,
     ) -> Result<(), MockError> {
         Self::validate_native_text_state(runtime, saved)?;
@@ -69,10 +71,10 @@ impl NativeTextStateBackend for MockBackend {
     }
 }
 use observed_mock::Sampling;
-impl TextSnapshotBackend for MockBackend {
+impl TextSnapshotBackend<MockSession> for MockBackend {
     type SamplingState = Sampling;
     fn continuation_input_tokens(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self, MockSession>,
         sampling: &Self::SamplingState,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
         predictions: u64,
@@ -104,14 +106,14 @@ impl TextSnapshotBackend for MockBackend {
         }
     }
     fn decoding_settlement_input_tokens(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, MockSession>,
         sampling: &Sampling,
         _: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
     ) -> Option<u64> {
         Some((sampling.mode_suffix.len() + sampling.mode_candidates.len()) as u64)
     }
     fn estimate_sampling_growth(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self, MockSession>,
         _: &Sampling,
         _: u64,
     ) -> Result<Option<u64>, MockError> {
@@ -137,7 +139,7 @@ impl TextSnapshotBackend for MockBackend {
         sampling.prediction
     }
     fn estimate_sampling_state(
-        runtime: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self, MockSession>,
         sampling: &Sampling,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
         let bytes = if runtime.session().switchable {
@@ -152,13 +154,13 @@ impl TextSnapshotBackend for MockBackend {
         }))
     }
     fn copy_sampling_state(
-        _: &mut ModelRuntime<Self>,
+        _: &mut ModelRuntime<Self, MockSession>,
         sampling: &Sampling,
     ) -> Result<Sampling, MockError> {
         Ok(sampling.clone())
     }
     fn estimate_pending_input(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, MockSession>,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
         let bytes = match input {
@@ -172,7 +174,7 @@ impl TextSnapshotBackend for MockBackend {
         }))
     }
     fn copy_pending_input(
-        _: &mut ModelRuntime<Self>,
+        _: &mut ModelRuntime<Self, MockSession>,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
     ) -> Result<Option<PendingTextInput<Vec<u32>, MockToken>>, MockError> {
         Ok(input.map(|input| match input {
@@ -191,7 +193,7 @@ impl TextSnapshotBackend for MockBackend {
     }
     #[cfg(feature = "tensor-capture")]
     fn estimate_child_capture(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, MockSession>,
         shape: &[u64],
         _: &eredu_core::capture::CaptureSelection,
         _: &eredu_core::capture::ResolvedCaptureSlice,
@@ -200,7 +202,7 @@ impl TextSnapshotBackend for MockBackend {
     }
     #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
-        _: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self, MockSession>,
     ) -> Result<
         std::sync::Arc<dyn eredu_core::intervention::InterventionEstimator>,
         eredu_core::capture::CaptureError,
@@ -210,7 +212,7 @@ impl TextSnapshotBackend for MockBackend {
 }
 
 fn snapshot_setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
@@ -221,7 +223,7 @@ fn snapshot_setup() -> (
 fn snapshot_setup_with_tool_choice(
     tool_choice: eredu::runtime::chat::ToolChoice,
 ) -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
@@ -1099,7 +1101,11 @@ fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_he
 #[test]
 fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
     let (_, chat, settings, first) = snapshot_setup();
-    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    let runtime = ModelRuntime::install::<MockSession>(
+        MockBackend,
+        fixture_prepared_model(Default::default()),
+    )
+    .unwrap();
     super::super::conversion_retention::retain_fixture(&runtime);
     let mut model = unicode_model_with_runtime(Some(first), 512, QWEN_TEMPLATE, runtime);
     let prepared = model

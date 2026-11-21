@@ -4,23 +4,25 @@ use std::path::Path;
 
 use eredu_checkpoint::{prepared_cache::PreparedCheckpointCachePolicy, recipe::RecipeDtype};
 use eredu_core::{
-    decision::{DecisionEvaluation, DecisionQuestion},
+    decision::{DecisionBinding, DecisionBindingFactory, DecisionEvaluation, DecisionQuestion},
     Audio, BackendFailure, DevicePlan, ExecutionPlanBackendFactory, Media, MediaCompanionSources,
 };
 use eredu_nn::{
     AttentionCache, DistributedNeuralBackend, Tensor, TensorParallelGroupedNeuralBackend,
 };
 use eredu_runtime::{
-    ComponentRankMechanisms, DecoderPipelineState, LayerWeightResidency, LocalComponentMechanisms,
-    RuntimeStateComponents,
+    decision_binding::PreparedDecisionProgram, ComponentRankMechanisms, DecoderPipelineState,
+    LayerWeightResidency, LocalComponentMechanisms, RuntimeStateComponents,
 };
 
 use crate::lfm3::decision::{self, execution::TextChoiceModel, PreparedTextChoiceModel};
 
 /// Binds a retained decision artifact using a configured backend factory.
-pub trait DecisionBackendFactory: ExecutionPlanBackendFactory {
+pub trait DecisionBackendFactory:
+    ExecutionPlanBackendFactory<crate::processor_plan::ArtifactArchitecturePlan>
+    + DecisionBindingFactory
+{
     /// Realizes the retained artifact on the plan's selected device.
-    /// Synchronizes native load work when completion must be observed.
     fn bind_decision(
         &self,
         model: PreparedDecisionModel,
@@ -28,6 +30,40 @@ pub trait DecisionBackendFactory: ExecutionPlanBackendFactory {
         residency: LayerWeightResidency,
         synchronize_load: bool,
     ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError>;
+}
+
+impl<D, F> DecisionBackendFactory for F
+where
+    D: DecisionBinding,
+    F: ExecutionPlanBackendFactory<crate::processor_plan::ArtifactArchitecturePlan>
+        + DecisionBindingFactory<Binding = D>,
+    <D::Backend as eredu_core::backend::LocalComponentStorage>::CacheStorage:
+        eredu_runtime::state::HybridCacheStorage,
+    PreparedDecisionModel: PreparedDecisionProgram<
+        D::Backend,
+        eredu_runtime::decision_binding::DecisionState<D::Backend>,
+        D,
+        D::Parallel,
+        D::InputLowering,
+        Model = Box<dyn BoundDecisionModel>,
+        Error = DecisionTaskError,
+    >,
+{
+    fn bind_decision(
+        &self,
+        model: PreparedDecisionModel,
+        device: &DevicePlan,
+        residency: LayerWeightResidency,
+        synchronize_load: bool,
+    ) -> Result<Box<dyn BoundDecisionModel>, DecisionTaskError> {
+        eredu_runtime::decision_binding::bind_decision_model(
+            self,
+            model,
+            device,
+            residency,
+            synchronize_load,
+        )
+    }
 }
 
 /// Media requirements for selecting a finite decision task.
@@ -236,9 +272,41 @@ impl PreparedDecisionModel {
     }
 }
 
+impl<B, S, M, C, I> eredu_runtime::decision_binding::PreparedDecisionProgram<B, S, M, C, I>
+    for PreparedDecisionModel
+where
+    B: TensorParallelGroupedNeuralBackend + DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    <B::Tensor as Tensor>::Context: Clone + 'static,
+    S: DecoderPipelineState<B> + 'static,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    M: LocalComponentMechanisms<B, S> + ComponentRankMechanisms<B, S, C> + 'static,
+    C: 'static,
+    I: DecisionInputLowering<B::Tensor> + 'static,
+{
+    type Model = Box<dyn BoundDecisionModel>;
+    type Error = DecisionTaskError;
+
+    fn bind(
+        self,
+        residency: LayerWeightResidency,
+        mechanisms: &M,
+        context: &<B::Tensor as Tensor>::Context,
+        input_lowering: I,
+    ) -> Result<Self::Model, Self::Error> {
+        PreparedDecisionModel::bind::<B, S, M, C, I>(
+            self,
+            residency,
+            mechanisms,
+            context,
+            input_lowering,
+        )
+    }
+}
+
 /// Input lowering required by the configured decision media features.
 #[cfg(feature = "image")]
-pub use crate::processor_execution::MediaInputLowering as DecisionInputLowering;
+pub use eredu_core::input::MediaInputLowering as DecisionInputLowering;
 
 /// Text-only decisions require no native media ingress mechanisms.
 #[cfg(not(feature = "image"))]

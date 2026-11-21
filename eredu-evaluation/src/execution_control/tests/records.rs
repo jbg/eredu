@@ -164,6 +164,7 @@ impl CaptureBackend for Records {
         value: &Vec<f32>,
         _: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        _: Option<u64>,
     ) -> io::Result<CapturePayload> {
         let value = self.select_region(value, slice)?;
         Ok(CapturePayload::Tensor(

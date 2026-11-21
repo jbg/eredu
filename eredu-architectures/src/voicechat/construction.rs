@@ -439,7 +439,7 @@ impl<'a> PreparedSpeechConstruction<'a> {
     ) -> Result<super::assembly::LearnedSpeechComponents<B>, super::assembly::AssemblyError>
     where
         B: NeuralBackend,
-        P: eredu_runtime::ParameterBackend<Parameter = B::Tensor>,
+        P: eredu_core::checkpoint_mechanisms::CheckpointParameterBackend<Parameter = B::Tensor>,
     {
         use super::assembly::AssemblyError;
         // Missing companion roles fail before construction or any payload read.

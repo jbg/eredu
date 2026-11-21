@@ -277,13 +277,16 @@ impl Delivery {
     }
 }
 
-struct Source<'a, 'b, B: TextGenerationBackend, F> {
-    driver: &'a mut TextGenerationDriver<'b, B>,
-    state: &'a mut ManagedTextContinuation<B, ControlConstraints>,
+struct Source<'a, 'b, B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>, F> {
+    driver: &'a mut TextGenerationDriver<'b, B, S>,
+    state: &'a mut ManagedTextContinuation<B, ControlConstraints, S>,
     delivery: &'a RefCell<(&'a mut Delivery, &'a mut F)>,
 }
-impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFlow<()>>
-    CommittedTokenSource for Source<'_, '_, B, F>
+impl<
+        B: TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B>,
+        F: FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+    > CommittedTokenSource for Source<'_, '_, B, S, F>
 {
     type Error = TextContinuationError<B::Error, ControlConstraintError>;
     fn finish_step<T, E>(
@@ -396,9 +399,13 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
 /// It exclusively borrows its loaded model and retains incremental decoding,
 /// constraints, pending input and the backend's existing completion owner.
 /// Native objects remain thread-affine; `control_handle` may cross threads.
-pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
-    driver: TextGenerationDriver<'a, B>,
-    state: ManagedTextContinuation<B, ControlConstraints>,
+pub struct ControlledGenerationSession<
+    'a,
+    B: TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B>,
+> {
+    driver: TextGenerationDriver<'a, B, S>,
+    state: ManagedTextContinuation<B, ControlConstraints, S>,
     vocabulary: std::sync::Arc<tokenizers::Tokenizer>,
     tokenizer_identity: [u8; 32],
     snapshot_budget: Option<eredu_runtime::execution_control::SnapshotBudget>,
@@ -409,7 +416,9 @@ pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
     delivery: Delivery,
 }
 
-impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
+    ControlledGenerationSession<'_, B, S>
+{
     pub(super) fn step_with_refinement_readout(
         &mut self,
         selections: Vec<eredu_core::refinement::RefinementScoreSelection>,
@@ -508,7 +517,11 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         result.step = ControlSupport::Supported;
         result.pause_resume = ControlSupport::Supported;
         result.force_next_token = ControlSupport::Supported;
-        result.sampling_overrides = B::text_sampling_control_support(self.driver.runtime());
+        result.sampling_overrides = self
+            .driver
+            .runtime()
+            .session()
+            .text_sampling_control_support(self.driver.runtime().backend());
         if self.snapshot_budget.is_some() {
             result.snapshot = ControlSupport::Supported;
             result.restore = ControlSupport::Supported;
@@ -826,7 +839,9 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     }
 }
 
-impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextSamplingControlBackend<S>, S: eredu_core::TextExecutionSession<B>>
+    ControlledGenerationSession<'_, B, S>
+{
     /// Current temperature and RNG/adaptive compatibility facts at a quiescent
     /// boundary. No sampler or model work occurs.
     pub fn sampling_state(&mut self) -> Result<SamplingStateFacts, ControlledGenerationError> {
@@ -890,7 +905,7 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
     }
 }
 
-impl<B: TextGenerationBackend> LoadedModel<B> {
+impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>> LoadedModel<B, S> {
     /// Agrees a caller-owned preparation result before entering a distributed run.
     /// Use this around fallible media or opaque-prompt preparation. Every peer
     /// must call the same stage in the same order, including on local failure.
@@ -931,12 +946,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// No prediction occurs until advancement; unsupported policies fail admission.
     pub fn start_controlled<'a>(
         &'a mut self,
-        prepared: PreparedObservedGeneration<B>,
+        prepared: PreparedObservedGeneration<S::Prompt>,
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
         mode: OutputMode,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
+    ) -> Result<ControlledGenerationSession<'a, B, S>, ControlledGenerationError> {
         let control = prepared.control_handle.clone().unwrap_or(control);
         let cancellation = prepared
             .cancellation
@@ -954,8 +969,10 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 )
                 .into());
             }
-            if let ControlSupport::Unsupported { reason } =
-                B::text_execution_control_support(&self.runtime)
+            if let ControlSupport::Unsupported { reason } = self
+                .runtime
+                .session()
+                .text_execution_control_support(self.runtime.backend())
             {
                 return Err(CaptureError::Unsupported(reason).into());
             }
@@ -1020,7 +1037,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 decoder: self.text_decoder(true),
             };
             let vocabulary = std::sync::Arc::clone(&decoder.decoder.tokenizer);
-            let domain = eredu_runtime::TokenDomain::new(
+            let domain = eredu_core::sampling::TokenDomain::new(
                 self.token_validity
                     .allowed_mask()
                     .expect("facade always supplies a closed token domain")
@@ -1094,7 +1111,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 })?;
         let prompt = match prepared.prompt {
             Some(prompt) => Ok(prompt),
-            None => B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids),
+            None => S::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids),
         }
         .map_err(|error| PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error)));
         let prompt = self.runtime.finish_text_preparation(
@@ -1156,7 +1173,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     }
 }
 
-impl<B: eredu_core::ModelCapabilityBackend> ControlledGenerationSession<'_, B> {
+impl<
+        B: eredu_core::TextGenerationBackend,
+        S: eredu_core::TextExecutionSession<B> + eredu_core::ModelCapabilitySession<B>,
+    > ControlledGenerationSession<'_, B, S>
+{
     /// Releases optional conversions at a completed, drained boundary without
     /// settling pending work. Preserves tokens, sampling state, epochs, snapshots
     /// and observation budgets. Subsequent inference can repopulate retention.
@@ -1194,6 +1215,6 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlledGenerationSession<'_, B> {
         eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
         eredu_core::BackendFailure,
     > {
-        B::parameter_conversion_retention(self.driver.runtime())
+        S::parameter_conversion_retention(self.driver.runtime())
     }
 }

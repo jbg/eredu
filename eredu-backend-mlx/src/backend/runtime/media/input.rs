@@ -1,5 +1,6 @@
 //! Typed runtime inputs for model prefill.
 
+use eredu_core::input::PreparedInputInspector;
 use safemlx::{
     error::Exception,
     ops::{concatenate_axis, indexing::NewAxis, indexing::TryIndexOp},
@@ -10,10 +11,7 @@ use eredu_core::{
     checkpoint::TensorDtype, CapabilityError, InputExtent, InputMetadataKey, InputModality,
     InputTensorIdentity, PreparedInputError,
 };
-use eredu_runtime::{
-    PreparedInputCacheIdentity, PreparedInputInspector, PreparedInputPart as RuntimeInputPart,
-    PreparedInputPayload,
-};
+use eredu_core::{PreparedInputPart as RuntimeInputPart, PreparedInputPayload};
 
 /// MLX specialization of the backend-neutral runtime input part.
 pub type InputPart = RuntimeInputPart<Array>;
@@ -44,101 +42,6 @@ pub(crate) fn host_token_ids(tokens: &Array) -> Result<Vec<u32>, crate::backend:
         _ => Err(Error::ArchitectureModel(
             "decoder alignment requires integer token IDs".into(),
         )),
-    }
-}
-
-/// Checks prepared inputs against the exact representation selected for the session.
-pub(crate) fn validate_composite_input_selection(
-    processor: &eredu_runtime::SelectedProcessorExecution,
-    input: ModelInput<'_>,
-) -> Result<(), crate::backend::error::Error> {
-    use crate::backend::error::Error;
-    if let Some(modality) = input
-        .parts
-        .iter()
-        .map(|part| part.modality())
-        .find(|modality| !processor.modalities().contains(modality))
-    {
-        return Err(Error::ArchitectureModel(format!(
-            "prepared input modality {} is outside the selected composite modalities {:?}",
-            modality.as_str(),
-            processor.modalities()
-        )));
-    }
-    if !processor.prepared_tensors()
-        && input
-            .parts
-            .iter()
-            .any(|part| part.modality() != InputModality::Text)
-    {
-        return Err(Error::ArchitectureModel(
-            "prepared media tensors were not admitted by processor selection".into(),
-        ));
-    }
-    if let Some(modality) = input.parts.iter().find_map(|part| {
-        matches!(part.payload(), InputPayload::Embeddings(_))
-            .then_some(part.modality())
-            .filter(|modality| !processor.projected_modalities().contains(modality))
-    }) {
-        return Err(Error::ArchitectureModel(format!(
-            "projected {} embeddings were not admitted by processor selection",
-            modality.as_str()
-        )));
-    }
-    Ok(())
-}
-
-/// Ordered runtime input for model prefill.
-#[derive(Debug, Clone, Copy)]
-pub struct ModelInput<'a> {
-    /// Ordered input parts consumed by the model.
-    pub parts: &'a [InputPart],
-    cache_identity: Option<&'a PreparedInputCacheIdentity>,
-    prefill_fragment: bool,
-}
-
-impl<'a> ModelInput<'a> {
-    /// Creates a typed input from ordered parts.
-    pub fn new(parts: &'a [InputPart]) -> Self {
-        Self {
-            parts,
-            cache_identity: None,
-            prefill_fragment: false,
-        }
-    }
-
-    /// Creates a typed input carrying its exact cache-relevant semantic identity.
-    pub fn with_cache_identity(
-        parts: &'a [InputPart],
-        cache_identity: &'a PreparedInputCacheIdentity,
-    ) -> Self {
-        Self {
-            parts,
-            cache_identity: Some(cache_identity),
-            prefill_fragment: false,
-        }
-    }
-
-    /// Internal prefix ownership: only the final suffix carries the admitted
-    /// whole-request identity. Public prepared-input identities remain exact.
-    pub(crate) fn prefill_fragment(
-        parts: &'a [InputPart],
-        identity: Option<&'a PreparedInputCacheIdentity>,
-    ) -> Self {
-        Self {
-            parts,
-            cache_identity: identity,
-            prefill_fragment: true,
-        }
-    }
-
-    pub(crate) const fn is_prefill_fragment(self) -> bool {
-        self.prefill_fragment
-    }
-
-    /// Returns the identity coupled to these exact prepared values, when supplied.
-    pub const fn cache_identity(self) -> Option<&'a PreparedInputCacheIdentity> {
-        self.cache_identity
     }
 }
 
@@ -232,123 +135,13 @@ impl PreparedInputInspector<crate::MlxTensor> for MlxTensorInputInspector {
         MlxInputInspector.i32_values(tensor.as_array())
     }
 
+    fn token_ids(&self, tensor: &crate::MlxTensor) -> Result<Vec<u32>, eredu_core::BackendFailure> {
+        host_token_ids(tensor.as_array()).map_err(eredu_core::BackendFailure::from_error)
+    }
+
     fn bool_values(&self, tensor: &crate::MlxTensor) -> Result<Vec<bool>, CapabilityError> {
         MlxInputInspector.bool_values(tensor.as_array())
     }
-}
-
-/// Converts the common native prompt representation without copying its tensors.
-pub(crate) fn prepared_composite_input(
-    input: ModelInput<'_>,
-) -> Result<eredu_runtime::PreparedModelInput<crate::MlxTensor>, crate::backend::error::Error> {
-    use crate::{backend::error::Error, MlxTensor};
-    use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedInputPayload};
-
-    validate(input)?;
-    let parts = input
-        .parts
-        .iter()
-        .map(|part| {
-            let payload = match part.payload() {
-                InputPayload::TokenIds(value) => {
-                    PreparedInputPayload::TokenIds(MlxTensor::from_array(value.clone()))
-                }
-                InputPayload::Tensor(value) => {
-                    PreparedInputPayload::Tensor(MlxTensor::from_array(value.clone()))
-                }
-                InputPayload::Embeddings(value) => {
-                    PreparedInputPayload::Embeddings(MlxTensor::from_array(value.clone()))
-                }
-                _ => {
-                    return Err(eredu_core::PreparedInputError::BackendTensorIdentity(
-                        "MLX prepared input contains an unknown payload kind".into(),
-                    ))
-                }
-            };
-            PreparedInputPart::new_with_extents(
-                part.modality(),
-                payload,
-                part.metadata()
-                    .iter()
-                    .map(|(key, value)| (*key, MlxTensor::from_array(value.clone()))),
-                part.extents().iter().copied(),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-    let inspector = MlxTensorInputInspector;
-    eredu_runtime::PreparedModelInput::new(parts, |tensor| inspector.identity(tensor))
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
-}
-
-/// Validates basic modality/payload compatibility.
-pub fn validate(input: ModelInput<'_>) -> Result<(), Exception> {
-    if input.parts.is_empty() {
-        return Err(Exception::custom(
-            "model input must contain at least one part",
-        ));
-    }
-    for part in input.parts {
-        match (part.modality(), part.payload()) {
-            (InputModality::Text, InputPayload::TokenIds(tokens)) => validate_token_ids(tokens)?,
-            (InputModality::Text, InputPayload::Embeddings(embeddings)) => {
-                validate_embeddings(embeddings, "text embeddings")?
-            }
-            (InputModality::Text, InputPayload::Tensor(_)) => {
-                return Err(Exception::custom(
-                    "text input does not accept tensor payloads",
-                ));
-            }
-            (
-                InputModality::Image | InputModality::Audio | InputModality::Video,
-                InputPayload::Tensor(tensor),
-            ) => {
-                validate_rank_at_least(tensor, 2, part.modality().as_str())?;
-            }
-            (
-                InputModality::Image | InputModality::Audio | InputModality::Video,
-                InputPayload::Embeddings(embeddings),
-            ) => validate_embeddings(embeddings, part.modality().as_str())?,
-            (
-                InputModality::Image | InputModality::Audio | InputModality::Video,
-                InputPayload::TokenIds(_),
-            ) => {
-                return Err(Exception::custom(format!(
-                    "{} input does not accept token-id payloads",
-                    part.modality().as_str()
-                )));
-            }
-            _ => {
-                return Err(Exception::custom(
-                    "model input uses an unsupported modality or payload",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Builds a `[batch, sequence]` token array from text-only typed input.
-pub fn text_token_ids(input: ModelInput<'_>, stream: &Stream) -> Result<Array, Exception> {
-    validate(input)?;
-    let mut parts = Vec::new();
-    for part in input.parts {
-        match (part.modality(), part.payload()) {
-            (InputModality::Text, InputPayload::TokenIds(tokens)) => parts.push(tokens.clone()),
-            (InputModality::Text, InputPayload::Embeddings(_)) => {
-                return Err(Exception::custom(
-                    "text embeddings are not supported by this model",
-                ));
-            }
-            _ => {
-                return Err(Exception::custom(format!(
-                    "{} input is not supported by this model",
-                    part.modality().as_str()
-                )));
-            }
-        }
-    }
-    concatenate_token_parts(&parts, stream)
 }
 
 /// Converts a slice of token IDs to a batch-1 text input array.
@@ -375,104 +168,28 @@ fn portable_dtype(dtype: Dtype) -> TensorDtype {
     }
 }
 
-fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Exception> {
-    if parts.is_empty() {
-        return Err(Exception::custom("text input must contain token ids"));
+pub(crate) fn concatenate_token_parts(
+    parts: &[&Array],
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    for tokens in parts {
+        validate_token_ids(tokens)?;
     }
-    if parts.len() == 1 {
-        return Ok(parts[0].clone());
+    match parts {
+        [] => Err(Exception::custom("text input must contain token ids")),
+        [tokens] => Ok((*tokens).clone()),
+        parts => concatenate_axis(parts, 1, stream),
     }
-    let refs = parts.iter().collect::<Vec<_>>();
-    concatenate_axis(&refs, 1, stream)
 }
 
 fn validate_token_ids(tokens: &Array) -> Result<(), Exception> {
-    let shape = tokens.shape();
-    if shape.len() != 2 {
-        return Err(Exception::custom(format!(
-            "token ids must be shaped [batch, sequence], got {shape:?}"
-        )));
-    }
-    if shape[0] <= 0 || shape[1] <= 0 {
-        return Err(Exception::custom(format!(
-            "token ids must have non-empty batch and sequence dimensions, got {shape:?}"
-        )));
-    }
-    if !matches!(tokens.dtype(), Dtype::Int32 | Dtype::Uint32) {
-        return Err(Exception::custom(format!(
-            "public token ids must use int32 or uint32 storage, got {:?}",
-            tokens.dtype()
-        )));
-    }
-    Ok(())
+    validate_decoder_tensor(eredu_core::InputPayloadKind::TokenIds, tokens)
 }
 
-fn validate_embeddings(embeddings: &Array, name: &str) -> Result<(), Exception> {
-    let shape = embeddings.shape();
-    if shape.len() != 3 {
-        return Err(Exception::custom(format!(
-            "{name} must be shaped [batch, sequence, hidden], got {shape:?}"
-        )));
-    }
-    if shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0 {
-        return Err(Exception::custom(format!(
-            "{name} must have non-empty dimensions, got {shape:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_rank_at_least(tensor: &Array, min_rank: usize, name: &str) -> Result<(), Exception> {
-    if tensor.shape().len() < min_rank {
-        return Err(Exception::custom(format!(
-            "{name} tensor must have rank at least {min_rank}, got shape {:?}",
-            tensor.shape()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{input_part, validate, InputPayload, ModelInput};
-    use eredu_core::InputModality;
-    use safemlx::Array;
-
-    #[test]
-    fn integer_inspection_checks_unsigned_range_without_float_conversion() {
-        use eredu_runtime::PreparedInputInspector;
-        let inspector = super::MlxInputInspector;
-        let input = Array::from_slice(&[0_u32, 16_777_217, i32::MAX as u32], &[3]);
-        assert_eq!(
-            inspector.i32_values(&input).unwrap(),
-            [0, 16_777_217, i32::MAX]
-        );
-        for value in [i32::MAX as u32 + 1, u32::MAX] {
-            let input = Array::from_slice(&[0_u32, value], &[2]);
-            assert!(matches!(
-                inspector.i32_values(&input),
-                Err(eredu_core::CapabilityError::Observation(_))
-            ));
-        }
-        let signed = Array::from_slice(&[i32::MIN, -1, i32::MAX], &[3]);
-        assert_eq!(
-            inspector.i32_values(&signed).unwrap(),
-            [i32::MIN, -1, i32::MAX]
-        );
-        assert!(inspector
-            .i32_values(&Array::from_slice(&[1_f32], &[1]))
-            .is_err());
-    }
-
-    #[test]
-    fn rejects_public_int64_token_part() {
-        let tokens = Array::from_slice(&[1_i64, 2], &[1, 2]);
-        let parts =
-            [input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
-
-        let error = validate(ModelInput::new(&parts)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("public token ids must use int32 or uint32"));
-    }
+fn validate_decoder_tensor(
+    kind: eredu_core::InputPayloadKind,
+    tensor: &Array,
+) -> Result<(), Exception> {
+    kind.validate_decoder_tensor(&portable_dtype(tensor.dtype()), tensor.shape())
+        .map_err(|error| Exception::custom(error.to_string()))
 }

@@ -91,8 +91,8 @@ the checkout. Custom Python code is fetched from the same immutable revision.
 ```sh
 python eredu-evaluation/scripts/download_component_fixture.py /private/tmp/lfm3-source --model lfm3
 python eredu-evaluation/scripts/prefill_reference.py /private/tmp/lfm3-source/provenance.json /private/tmp/lfm3-reference.json --f32-checkpoint /private/tmp/lfm3-f32 --trust-remote-code --decode 5,8,13,21,34,55,3,2
-cargo run -p eredu-backend-mlx --no-default-features --example checkpoint_probe -- --model /private/tmp/lfm3-f32 --device cpu --input-ids 1,3,2,5,8,13,21,34,55 --teacher-forced-ids 5,8,13,21,34,55,3,2 --warmup-runs 0 --output /private/tmp/lfm3-actual
-cargo test -p eredu-backend-mlx --no-default-features --test chunked_prefill cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation -- --exact
+cargo run -p eredu --no-default-features --features mlx --example checkpoint_probe -- --model /private/tmp/lfm3-f32 --device cpu --input-ids 1,3,2,5,8,13,21,34,55 --teacher-forced-ids 5,8,13,21,34,55,3,2 --warmup-runs 0 --output /private/tmp/lfm3-actual
+cargo test -p eredu --no-default-features --features mlx --test chunked_prefill cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation -- --exact
 ```
 
 `validation/reference_runner.py` also produces the ordinary shared comparison
@@ -158,8 +158,8 @@ not establish native BF16 component parity.
 ```sh
 python -c 'from huggingface_hub import snapshot_download; snapshot_download("LiquidAI/LFM3-VL-2B", revision="23387beda43c60310348e83e25f78f33c3140d3a", local_dir="/private/tmp/lfm3-vl-source", allow_patterns=["*.py", "*.json", "*.jinja", "*.safetensors"])'
 HF_HOME=/private/tmp/lfm3-hf HF_MODULES_CACHE=/private/tmp/lfm3-hf/modules python validation/lfm3_vision_reference.py /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-reference
-cargo run -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference -- /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference /private/tmp/lfm3-vl-reference/cpu-results.json --device cpu
-MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features metal --example lfm3_vision_reference -- /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference /private/tmp/lfm3-vl-reference/metal-results.json --device gpu
+cargo run -p eredu --no-default-features --features mlx --example lfm3_vision_reference -- /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference /private/tmp/lfm3-vl-reference/cpu-results.json --device cpu
+MLX_ENABLE_TF32=0 cargo run -p eredu --no-default-features --features mlx,metal --example lfm3_vision_reference -- /private/tmp/lfm3-vl-reference/f32-component /private/tmp/lfm3-vl-reference /private/tmp/lfm3-vl-reference/metal-results.json --device gpu
 ```
 
 The reference runner needs PyTorch, Transformers, SafeTensors, torchvision and
@@ -189,7 +189,7 @@ IDs match exactly and are `[334, 34, 334, 34, 334, 34, 334, 34]`.
 ```sh
 HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_vision_reference.py \
   /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-conditional --conditional
-cargo run -p eredu-backend-mlx --no-default-features --features image --example lfm3_vision_reference -- \
+cargo run -p eredu --no-default-features --features mlx,image --example lfm3_vision_reference -- \
   /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-conditional \
   /private/tmp/lfm3-vl-conditional/eredu-cpu.json --released-checkpoint
 ```
@@ -257,7 +257,7 @@ fixture yields identical comparison results to uninterrupted execution.
 
 ```sh
 for mode in resident host disk; do
-  cargo run -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference -- \
+  cargo run -p eredu --no-default-features --features mlx --example lfm3_vision_reference -- \
     /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-conditional \
     "/private/tmp/lfm3-vl-conditional/eredu-${mode}.json" \
     --released-checkpoint --pre-sized-only --residency "$mode"
@@ -339,7 +339,7 @@ greedy IDs. The maximum absolute errors against the publisher are
 reports 3,458,006,016 decoder and 757,521,408 vision device parameter bytes.
 
 ```sh
-cargo build -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference
+cargo build -p eredu --no-default-features --features mlx --example lfm3_vision_reference
 printf '%s\n' '[["127.0.0.1:53101"],["127.0.0.1:53102"]]' > /private/tmp/lfm3-vl-ring.json
 for rank in 0 1; do
   MLX_HOSTFILE=/private/tmp/lfm3-vl-ring.json MLX_RANK="$rank" \
@@ -417,7 +417,7 @@ and `5.923e-7` for the video.
 ```sh
 HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_vision_reference.py \
   /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-bf16 --conditional --dtype bfloat16
-cargo build -p eredu-backend-mlx --no-default-features --features image,metal \
+cargo build -p eredu --no-default-features --features mlx,image,metal \
   --example lfm3_vision_reference
 MLX_ENABLE_TF32=0 target/debug/examples/lfm3_vision_reference \
   /private/tmp/lfm3-vl-source /private/tmp/lfm3-vl-bf16 \
@@ -593,7 +593,7 @@ eviction and reload.
 
 ```sh
 "$gguf_reference" "$backbone" "$scores" 1,3,2,5,8,13,21,34,55 5,8,13,21,34,55,3,2 gpu --single-row
-MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features metal \
+MLX_ENABLE_TF32=0 cargo run -p eredu --no-default-features --features mlx,metal \
   --example lfm3_vision_reference -- "$assets" "${scores%.safetensors}.json" "$report" \
   --decoder-rows --device gpu --residency disk \
   --gguf-backbone "$backbone" --gguf-projector "$projector"
@@ -919,7 +919,7 @@ and remove `conditional` in the fixture metadata. Use rank-local copies of
 Both copies use the same reference tensors.
 
 ```sh
-cargo build -p eredu-backend-mlx --no-default-features --example lfm3_vision_reference
+cargo build -p eredu --no-default-features --features mlx --example lfm3_vision_reference
 pair=/private/tmp/eredu-vl-gguf-projector
 runner=target/debug/examples/lfm3_vision_reference
 backbone="$pair/LFM3-VL-2B-Q4_K_M.gguf"
@@ -1005,8 +1005,8 @@ runner verifies source and weight hashes before loading the publisher code.
 ```sh
 python -c 'from huggingface_hub import snapshot_download; snapshot_download("LiquidAI/LFM3-Audio-2B", revision="2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1", local_dir="/private/tmp/lfm3-audio", allow_patterns=["*.py", "*.json", "*.jinja", "model.safetensors", "audio_tokenizer/*"])'
 HF_HOME=/private/tmp/lfm3-hf HF_MODULES_CACHE=/private/tmp/lfm3-hf/modules python validation/lfm3_audio_reference.py /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/cpu.json --device cpu
-MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/metal.json --device gpu
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/cpu.json --device cpu
+MLX_ENABLE_TF32=0 cargo run -p eredu --no-default-features --features mlx,audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-audio-reference /private/tmp/lfm3-audio-reference/metal.json --device gpu
 ```
 
 The conditional case measures resident execution with fixed-order greedy
@@ -1049,9 +1049,9 @@ precise Metal.
 ```sh
 HF_HOME=/private/tmp/lfm3-hf python validation/lfm3_audio_reference.py \
   /private/tmp/lfm3-audio /private/tmp/lfm3-audio-bf16 --bfloat16
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio /private/tmp/lfm3-audio-bf16 /private/tmp/lfm3-audio-bf16/cpu.json
-MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- \
+MLX_ENABLE_TF32=0 cargo run -p eredu --no-default-features --features mlx,audio,metal --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio /private/tmp/lfm3-audio-bf16 /private/tmp/lfm3-audio-bf16/metal.json --device gpu
 ```
 
@@ -1214,8 +1214,8 @@ independently with the same transcript.
 
 ```sh
 python validation/lfm3_audio_reference.py /private/tmp/lfm3-audio /private/tmp/lfm3-live --live-asr-wav /private/tmp/speech.wav
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/cpu.json --live-asr --device cpu
-MLX_ENABLE_TF32=0 cargo run -p eredu-backend-mlx --features audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/metal.json --live-asr --device gpu
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/cpu.json --live-asr --device cpu
+MLX_ENABLE_TF32=0 cargo run -p eredu --no-default-features --features mlx,audio,metal --example lfm3_audio_reference -- /private/tmp/lfm3-audio /private/tmp/lfm3-live /private/tmp/lfm3-live/metal.json --live-asr --device gpu
 ```
 
 Add `--live-asr-pcm` to the native command to compare the PCM path.
@@ -1319,7 +1319,7 @@ speech components for the disk profile.
 
 ```sh
 audio_dir=/private/tmp/eredu-audio-gguf
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
   "$audio_dir/ingress-cpu.json" --device cpu --ingress-replay --language-residency resident \
   --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
@@ -1353,7 +1353,7 @@ c++ -std=c++17 -O2 -I "$llama_dir/include" -I "$llama_dir/ggml/include" \
   -lmtmd -lllama -o "$llama_dir/audio-reference"
 "$llama_dir/audio-reference" "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
   "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" "$audio_dir/audio-scores.f32"
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
   "$audio_dir/audio-score-parity.json" --device cpu \
   --gguf-backbone "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
@@ -1394,13 +1394,13 @@ audio_dir=/private/tmp/eredu-audio-gguf
 backbone="$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf"
 projector="$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf"
 "$llama_dir/audio-reference" "$backbone" "$projector" "$audio_dir/depth-scores.f32" --depth
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
   "$audio_dir/depth-score-parity.json" --gguf-backbone "$backbone" \
   --gguf-projector "$projector" --gguf-depth-scores "$audio_dir/depth-scores.f32"
 PYTHONPATH="$llama_dir/gguf-py" python validation/lfm3_audio_reference.py \
   /private/tmp/lfm3-audio "$audio_dir/publisher-depth" --gguf-depth "$projector"
-cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
   /private/tmp/lfm3-audio validation/fixtures/lfm3/audio-gguf-sources.json \
   "$audio_dir/publisher-depth-parity.json" --gguf-backbone "$backbone" \
   --gguf-projector "$projector" --gguf-depth-scores "$audio_dir/publisher-depth/depth-scores.f32" \
@@ -1450,7 +1450,7 @@ c++ -std=c++17 -O2 -I "$llama_dir/include" -I "$llama_dir/ggml/include" \
   -lmtmd -lllama -o "$llama_dir/liquid-reference"
 "$llama_dir/liquid-reference" /private/tmp/eredu-lfm3-gguf/LFM3-1.7B-Q4_K_M.gguf \
   "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" "$llama_dir/codec.f32" --metal
-cargo run -p eredu-backend-mlx --no-default-features \
+cargo run -p eredu --no-default-features --features mlx,audio \
   --example lfm3_liquid_gguf_reference -- \
   validation/fixtures/lfm3/audio-gguf-sources.json \
   "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf.header" \
@@ -1498,15 +1498,15 @@ for variant in BF16 F16 Q4_0 Q8_0; do
   "$llama_dir/audio-reference" "$backbone" "$projector" "$audio_dir/$variant-depth.f32" --depth
   "$llama_dir/liquid-reference" /private/tmp/eredu-lfm3-gguf/LFM3-1.7B-Q4_K_M.gguf \
     "$projector" "$audio_dir/$variant-pcm.f32" --metal
-  cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
     "$assets" "$manifest" "$audio_dir/$variant-scores.json" --device cpu \
     --gguf-backbone "$backbone" --gguf-projector "$projector" \
     --gguf-scores "$audio_dir/$variant-scores.f32"
-  cargo run -p eredu-backend-mlx --features audio --example lfm3_audio_reference -- \
+  cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference -- \
     "$assets" "$manifest" "$audio_dir/$variant-depth.json" --device cpu \
     --gguf-backbone "$backbone" --gguf-projector "$projector" \
     --gguf-depth-scores "$audio_dir/$variant-depth.f32"
-  cargo run -p eredu-backend-mlx --features audio --example lfm3_liquid_gguf_reference -- \
+  cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_liquid_gguf_reference -- \
     "$manifest" "$backbone.header" "$projector" "$assets/config.json" \
     "$assets/audio_tokenizer/config.json" "$audio_dir/$variant-pcm.f32"
 done
@@ -1567,7 +1567,7 @@ these same bindings.
 
 ```sh
 audio_dir=/private/tmp/eredu-audio-gguf
-cargo build -p eredu-backend-mlx --features audio --example lfm3_audio_reference
+cargo build -p eredu --no-default-features --features mlx,audio --example lfm3_audio_reference
 python3 validation/lfm3_audio_tensor_replay.py \
   target/debug/examples/lfm3_audio_reference /private/tmp/lfm3-audio \
   validation/fixtures/lfm3/audio-gguf-sources.json \

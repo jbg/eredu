@@ -37,7 +37,7 @@ use super::{
 };
 use crate::{
     composite_execution::{
-        CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+        ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
         ExternalPredictionTargetOperation, PreparedCompositeInput,
     },
     media_plan::Gemma4InputPartPlan,
@@ -63,7 +63,7 @@ pub fn external_assistant_capture_request(
         .num_hidden_layers()
         .checked_sub(1)
         .ok_or_else(|| "Gemma 4 assistant target has no decoder layer".to_owned())?;
-    Ok(ExternalPredictionCaptureRequest::Gemma4SharedAttention {
+    Ok(ExternalPredictionCaptureRequest::SharedAttention {
         final_hidden_path: format!("model.language_model.layers.{last}.output"),
     })
 }
@@ -220,7 +220,7 @@ where
     for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
         match plan {
             Gemma4InputPartPlan::TextTokens { .. } => {
-                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::TokenIds(value) = part.payload() else {
                     return Err(Error::backend(
                         "Gemma 4 admitted text part lost its token payload",
                     ));
@@ -234,7 +234,7 @@ where
                 placeholder_token_id,
                 positions,
             } => {
-                let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Embeddings(value) = part.payload() else {
                     return Err(Error::backend(
                         "Gemma 4 admitted projected part lost its embedding payload",
                     ));
@@ -252,7 +252,7 @@ where
                 ingress,
                 ..
             } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Gemma 4 admitted vision part lost its tensor payload",
                     ));
@@ -280,7 +280,7 @@ where
                 ingress,
                 ..
             } => {
-                let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
+                let eredu_core::PreparedInputPayload::Tensor(value) = part.payload() else {
                     return Err(Error::backend(
                         "Gemma 4 admitted audio part lost its tensor payload",
                     ));
@@ -436,7 +436,8 @@ where
     })
 }
 
-impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::ParallelCompositeComponentKernel<B, S>
+    for GemmaKernel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -444,7 +445,7 @@ where
 {
 }
 
-impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::composite_execution::CompositeComponentKernel<B, S> for GemmaKernel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
@@ -471,7 +472,7 @@ where
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
 
     fn prepare_prefill_request(
-        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        prepared: eredu_core::PreparedModelInput<B::Tensor>,
         admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::PrefillRequest, Self::Error> {
@@ -480,19 +481,17 @@ where
     type AdmissionConfig = FamilyConfig;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
-        self.kernel().args.clone()
+        self.args.clone()
     }
 
-    fn external_assistant_target_profile(
-        config: &Self::AdmissionConfig,
-    ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
-        Some(crate::external_assistant::ExternalAssistantTargetProfile::Gemma4(config.clone()))
+    fn supports_external_assistant(_config: &Self::AdmissionConfig) -> bool {
+        true
     }
 
     fn admit_prepared_input(
         config: &Self::AdmissionConfig,
-        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
-        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        input: &eredu_core::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_core::input::PreparedInputInspector<B::Tensor>,
     ) -> Result<
         crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
         eredu_core::CapabilityError,
@@ -571,18 +570,8 @@ where
                     .map_err(|_| "Gemma continuation batch exceeds i32")?;
                 let maximum = extents.into_iter().max();
                 let width = match group {
-                    0 => self
-                        .kernel()
-                        .args
-                        .vision
-                        .as_ref()
-                        .map(|config| config.hidden_size),
-                    1 => self
-                        .kernel()
-                        .args
-                        .audio
-                        .as_ref()
-                        .map(|config| config.hidden_size),
+                    0 => self.args.vision.as_ref().map(|config| config.hidden_size),
+                    1 => self.args.audio.as_ref().map(|config| config.hidden_size),
                     _ => None,
                 };
                 Ok(maximum.zip(width).map(|(sequence, width)| {
@@ -615,7 +604,7 @@ where
                                     part.payload().value().dim(0),
                                     i32::try_from(*positions)
                                         .map_err(|_| "Gemma text extent exceeds i32")?,
-                                    self.kernel().args.text.hidden_size,
+                                    self.args.text.hidden_size,
                                 ],
                             });
                         }
@@ -647,7 +636,7 @@ where
                     Gemma4InputPartPlan::TextTokens { positions } => Some(*positions),
                     _ => None,
                 }),
-            self.kernel().args.text.hidden_size,
+            self.args.text.hidden_size,
             tensor_partitions,
         )
     }
@@ -657,12 +646,11 @@ where
         unit: usize,
         routed: bool,
     ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
-        self.kernel()
-            .args
+        self.args
             .text
             .layer_policy(unit)
             .ok_or_else(|| Error::backend("Gemma collective plan references an unknown layer"))?;
-        let per_layer = usize::from(self.kernel().args.text.hidden_size_per_layer_input > 0);
+        let per_layer = usize::from(self.args.text.hidden_size_per_layer_input > 0);
         // Attention and the always-present dense branch reduce before routing;
         // the routed write and optional per-layer write reduce afterward.
         Ok(eredu_runtime::RoutedTensorReductions::hidden(
@@ -692,11 +680,11 @@ where
             (1, 2) => forward.audio_output = Some(hidden.clone()),
             (0, 0) | (1, 1) => {}
             (2, 2) => {
-                let geometry = self.kernel().parallel_geometry().ok_or_else(|| {
+                let geometry = self.parallel_geometry().ok_or_else(|| {
                     Error::backend("Gemma decoder boundary requires parallel geometry")
                 })?;
                 let boundary = eredu_runtime::ArchitectureBoundary::decode(
-                    &TextBoundarySchema::from_args(&self.kernel().args.text, geometry),
+                    &TextBoundarySchema::from_args(&self.args.text, geometry),
                     values.collect(),
                 )
                 .map_err(Error::backend)?;
@@ -715,7 +703,7 @@ where
         request: &ExternalPredictionCaptureRequest,
     ) -> Result<Option<Vec<String>>, Self::Error> {
         match request {
-            ExternalPredictionCaptureRequest::Gemma4SharedAttention { final_hidden_path } => {
+            ExternalPredictionCaptureRequest::SharedAttention { final_hidden_path } => {
                 Ok(Some(vec![final_hidden_path.clone()]))
             }
             _ => Ok(None),
@@ -729,7 +717,7 @@ where
     ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
         if !matches!(
             request,
-            ExternalPredictionCaptureRequest::Gemma4SharedAttention { .. }
+            ExternalPredictionCaptureRequest::SharedAttention { .. }
         ) {
             return Ok(None);
         }
@@ -744,10 +732,9 @@ where
             .iter()
             .map(|(policy, (keys, values))| (*policy, keys.clone(), values.clone()))
             .collect();
-        Ok(Some(ExternalPredictionTargetCapture::Gemma4 {
-            hidden,
-            shared_kv,
-        }))
+        Ok(Some(
+            ExternalPredictionTargetCapture::HiddenWithSharedAttention { hidden, shared_kv },
+        ))
     }
 
     fn external_prediction_target_operation(
@@ -759,22 +746,17 @@ where
         match operation {
             ExternalPredictionTargetOperation::TokenEmbeddings(tokens) => match parallel {
                 Some(parallel) => B::vocabulary_parallel_lookup(
-                    self.kernel_mut().static_modules.text.embeddings_mut()?,
+                    self.static_modules.text.embeddings_mut()?,
                     tokens,
                     eredu_nn::EmbeddingLookupPolicy::Strict,
                     parallel,
                     context,
                 )?
-                .multiply_scalar((self.kernel().args.text.hidden_size as f32).sqrt(), context)
+                .multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)
                 .map(Some),
-                None => self
-                    .kernel_mut()
-                    .token_embeddings(tokens, context)
-                    .map(Some),
+                None => self.token_embeddings(tokens, context).map(Some),
             },
-            ExternalPredictionTargetOperation::ProjectLogits(_)
-            | ExternalPredictionTargetOperation::RawTokenEmbeddings(_)
-            | ExternalPredictionTargetOperation::RawVocabularyProjection(_) => Ok(None),
+            _ => Ok(None),
         }
     }
 }
@@ -910,7 +892,8 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
     }
 
     fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
-        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        use eredu_core::communication::BoundaryTensorDtype as Dtype;
+        use eredu_runtime::BoundaryTensorDimension as Dim;
         let mut specs: Vec<_> = self
             .per_layer_geometry
             .map(|(layers, width)| {

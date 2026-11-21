@@ -10,7 +10,7 @@ use eredu_core::{
     DEFAULT_MAX_CACHED_SHARDS,
 };
 
-use crate::WeightBinding;
+use eredu_core::residency::parameter_binding::WeightBinding;
 
 /// Current plus next unit retained by dense streamed execution.
 pub const DENSE_TRANSFER_WINDOW: usize = 2;
@@ -76,17 +76,19 @@ impl AuxiliaryWeightRequirements {
     /// Admits one independently materialized auxiliary owner using backend host-capacity facts.
     pub fn admit<E>(
         self,
-        definition: &crate::OffloadUnit,
+        definition: &eredu_core::residency::parameter_binding::OffloadUnit,
         residency: LayerWeightResidency,
         shared: bool,
         host_capacity: impl FnOnce(&[WeightBinding]) -> Result<u64, E>,
     ) -> Result<(Self, OffloadUnitSpec), E>
     where
-        E: From<crate::ResidencyDeclarationError>
+        E: From<eredu_core::residency::parameter_binding::ResidencyDeclarationError>
             + From<OffloadError>
             + From<crate::BoundedResidencySizingError>,
     {
-        let bytes = crate::physical_binding_bytes(definition.bindings())?;
+        let bytes = eredu_core::residency::parameter_binding::physical_binding_bytes(
+            definition.bindings(),
+        )?;
         let host = host_capacity(definition.bindings())?;
         let requirements = self.checked_add_module(bytes, host, shared).ok_or(
             crate::BoundedResidencySizingError::ArithmeticOverflow("auxiliary residency bytes"),
@@ -158,7 +160,10 @@ impl StaticUnitBindings {
 #[derive(Debug)]
 pub struct PreparedStaticUnit {
     /// Physical definition and pinned-device policy, when parameters exist.
-    pub resource: Option<(crate::OffloadUnit, OffloadUnitSpec)>,
+    pub resource: Option<(
+        eredu_core::residency::parameter_binding::OffloadUnit,
+        OffloadUnitSpec,
+    )>,
     /// Exact module-local destinations populated from the pinned lease.
     pub parameters: BTreeSet<String>,
     /// Physical checkpoint inputs consumed by this resource.
@@ -171,9 +176,11 @@ impl StaticUnitBindings {
     /// Admits exact pinned resources without constructing a native module or reading payloads.
     pub fn prepare<E>(self) -> Result<PreparedStaticUnit, E>
     where
-        E: From<crate::ResidencyDeclarationError> + From<OffloadError>,
+        E: From<eredu_core::residency::parameter_binding::ResidencyDeclarationError>
+            + From<OffloadError>,
     {
-        let bytes = crate::physical_binding_bytes(&self.bindings)?;
+        let bytes =
+            eredu_core::residency::parameter_binding::physical_binding_bytes(&self.bindings)?;
         let parameters = self
             .bindings
             .iter()
@@ -188,7 +195,10 @@ impl StaticUnitBindings {
             None
         } else {
             Some((
-                crate::OffloadUnit::new(self.id.clone(), self.bindings)?,
+                eredu_core::residency::parameter_binding::OffloadUnit::new(
+                    self.id.clone(),
+                    self.bindings,
+                )?,
                 OffloadUnitSpec::new(self.id, bytes, ResidencyPolicy::Pinned, MemoryTier::Device)?,
             ))
         };
@@ -973,6 +983,18 @@ pub enum ExecutionResidency {
     DenseDiskStream,
 }
 
+impl ExecutionResidency {
+    /// Physical storage mechanism required for the selected execution policy.
+    pub const fn weight_storage(self) -> crate::WeightResidencyMechanism {
+        use crate::WeightResidencyMechanism;
+        match self {
+            Self::FullyResident => WeightResidencyMechanism::Resident,
+            Self::LayerwiseHost => WeightResidencyMechanism::Windowed,
+            Self::DenseDiskStream => WeightResidencyMechanism::DiskStreamed,
+        }
+    }
+}
+
 /// Inspectable backend-neutral parameter-residency metadata for a layered model.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
@@ -985,7 +1007,7 @@ pub struct LayerwiseModelMetadata {
     maximum_device_layer_bytes: u64,
     maximum_host_layer_bytes: u64,
     device_layer_capacity: usize,
-    materialization: Option<crate::WeightMaterializationReport>,
+    materialization: Option<eredu_checkpoint::quantization::WeightMaterializationReport>,
 }
 
 impl LayerwiseModelMetadata {
@@ -1029,7 +1051,7 @@ impl LayerwiseModelMetadata {
     /// Replaces bounded load-time materialization telemetry.
     pub fn set_materialization(
         &mut self,
-        materialization: Option<crate::WeightMaterializationReport>,
+        materialization: Option<eredu_checkpoint::quantization::WeightMaterializationReport>,
     ) {
         self.materialization = materialization;
     }
@@ -1080,7 +1102,9 @@ impl LayerwiseModelMetadata {
     }
 
     /// Returns bounded load-time materialization telemetry.
-    pub const fn materialization(&self) -> Option<&crate::WeightMaterializationReport> {
+    pub const fn materialization(
+        &self,
+    ) -> Option<&eredu_checkpoint::quantization::WeightMaterializationReport> {
         self.materialization.as_ref()
     }
 }

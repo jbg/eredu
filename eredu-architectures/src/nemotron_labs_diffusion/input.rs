@@ -7,8 +7,9 @@ use crate::{
     },
 };
 use eredu_core::checkpoint::TensorDtype;
+use eredu_core::input::PreparedInputInspector;
 use eredu_core::{CapabilityError, InputExtent, InputMetadataKey, InputModality, InputPayloadKind};
-use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedModelInput};
+use eredu_core::{PreparedInputPart, PreparedModelInput};
 
 /// Ordered decoder parts, including image delimiters and row separators.
 #[derive(Debug, Clone, PartialEq, Eq)]

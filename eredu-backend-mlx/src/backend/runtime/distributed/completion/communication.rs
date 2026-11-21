@@ -12,34 +12,19 @@ pub struct MlxCommunicationCompletion {
     pub(super) event: Rc<Event>,
     pub(super) recovery: Recovery<Rc<NativeResources>>,
     agreement: Option<FailureAgreementResolution>,
-    flag: Option<FlagResolution>,
     words: Option<WordResolution>,
     boundary_headers: Vec<BoundaryHeaderResolution>,
     authority: Option<AuthorizedCommunicationCompletion>,
-    #[cfg(test)]
-    submitted_outputs: usize,
-    #[cfg(test)]
-    pub(super) force_pending: bool,
-    #[cfg(test)]
-    pub(super) teardown_observed: Option<Arc<AtomicBool>>,
-    #[cfg(test)]
-    pub(super) owner_exit_completion_observed: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug)]
 struct AuthorizedCommunicationCompletion {
-    authority: eredu_runtime::PartitionCommunicationAuthority,
-    operation: eredu_runtime::CommunicationOperation,
-    phase: eredu_runtime::DistributedExecutionPhase,
+    authority: eredu_core::communication::CommunicationAuthority,
+    operation: eredu_core::communication::CommunicationOperation,
 }
 
 impl Drop for MlxCommunicationCompletion {
-    fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(observed) = &self.teardown_observed {
-            observed.store(true, Ordering::Release);
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 #[derive(Debug)]
@@ -47,12 +32,6 @@ struct FailureAgreementResolution {
     output: Array,
     member_count: i32,
     descriptor: bool,
-    resolved: Rc<Cell<Option<bool>>>,
-}
-
-#[derive(Debug)]
-struct FlagResolution {
-    output: Array,
     resolved: Rc<Cell<Option<bool>>>,
 }
 
@@ -90,22 +69,6 @@ pub struct MlxFailureAgreement {
     resolved: Rc<Cell<Option<bool>>>,
 }
 
-/// Deferred host boolean resolved while the exact communication event is complete.
-#[derive(Debug)]
-pub(crate) struct MlxCommunicationFlag {
-    resolved: Rc<Cell<Option<bool>>>,
-}
-
-impl MlxCommunicationFlag {
-    pub(crate) fn resolve(self) -> Result<bool, safemlx::error::Exception> {
-        self.resolved.get().ok_or_else(|| {
-            safemlx::error::Exception::custom(
-                "communication flag was requested before exact completion",
-            )
-        })
-    }
-}
-
 impl MlxFailureAgreement {
     /// One status word and two exact i32 bit-pattern halves per u64 field.
     pub(crate) const DESCRIPTOR_WORDS: usize = 17;
@@ -139,8 +102,6 @@ impl CommunicationOrphanQuarantine {
         let mut index = 0;
         while index < self.work.len() {
             let finished = self.work[index].recovery.progress().settled;
-            #[cfg(test)]
-            let finished = finished && !self.work[index].force_pending;
             if finished {
                 // Native terminal evidence, not an error return, permits release.
                 drop(self.work.swap_remove(index));
@@ -157,45 +118,9 @@ impl Drop for CommunicationOrphanQuarantine {
         // Hand unresolved owners to recovery. Its final owner-thread boundary
         // waits for terminal proof before releasing the retained resources.
         for work in self.work.drain(..) {
-            #[cfg(test)]
-            if work.recovery.progress().settled {
-                if let Some(observed) = &work.owner_exit_completion_observed {
-                    observed.store(true, Ordering::Release);
-                }
-            }
             drop(work);
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn force_next_communication_pending() {
-    FORCE_NEXT_COMMUNICATION_PENDING.with(|force| force.set(true));
-}
-
-#[cfg(test)]
-pub(crate) fn distributed_completion_orphan_count() -> usize {
-    DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| orphans.borrow().work.len())
-}
-
-#[cfg(test)]
-pub(crate) fn release_forced_pending_orphans() {
-    DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| {
-        let mut orphans = orphans.borrow_mut();
-        for work in &mut orphans.work {
-            work.force_pending.set(false);
-            work._event.synchronize().unwrap();
-        }
-        orphans.reap();
-    });
-    COMMUNICATION_ORPHANS.with(|orphans| {
-        let mut orphans = orphans.borrow_mut();
-        for work in &mut orphans.work {
-            work.force_pending = false;
-            work.event.synchronize().unwrap();
-        }
-        orphans.reap();
-    });
 }
 
 fn quarantine(work: MlxCommunicationCompletion) {
@@ -270,8 +195,6 @@ impl MlxCommunicationCompletion {
         streams: Vec<Stream>,
     ) -> Result<Self, safemlx::error::Exception> {
         let outputs = outputs.into_iter().cloned().collect::<Vec<_>>();
-        #[cfg(test)]
-        let submitted_outputs = outputs.len();
         let mut recovery = Recovery::begin(NativeResources::new(
             arrays,
             count_buffers,
@@ -286,48 +209,32 @@ impl MlxCommunicationCompletion {
         let event = Rc::new(event?);
         *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
         check_native_status(&recovery)?;
-        #[cfg(test)]
-        let force_pending = FORCE_NEXT_COMMUNICATION_PENDING.with(|force| force.replace(false));
         Ok(Self {
             event,
             recovery,
             agreement: None,
-            flag: None,
             words: None,
             boundary_headers: Vec::new(),
             authority: None,
-            #[cfg(test)]
-            submitted_outputs,
-            #[cfg(test)]
-            force_pending,
-            #[cfg(test)]
-            teardown_observed: None,
-            #[cfg(test)]
-            owner_exit_completion_observed: None,
         })
     }
 
     /// Joins this exact completion to the selected session poison authority.
     pub(crate) fn with_authority(
         mut self,
-        authority: eredu_runtime::PartitionCommunicationAuthority,
-        operation: eredu_runtime::CommunicationOperation,
-        phase: eredu_runtime::DistributedExecutionPhase,
+        authority: eredu_core::communication::CommunicationAuthority,
+        operation: eredu_core::communication::CommunicationOperation,
     ) -> Self {
         self.authority = Some(AuthorizedCommunicationCompletion {
             authority,
             operation,
-            phase,
         });
         self
     }
 
-    fn mark_authority_failure(&self, error: impl std::fmt::Display) {
+    fn fence_authority(&self) {
         if let Some(context) = &self.authority {
-            let _ =
-                context
-                    .authority
-                    .completion_error(error, context.operation, context.phase, None);
+            context.authority.fence(context.operation, None);
         }
     }
 
@@ -354,15 +261,6 @@ impl MlxCommunicationCompletion {
             resolved: Rc::clone(&resolved),
         });
         (MlxCommunicationWords { resolved }, self)
-    }
-
-    pub(crate) fn with_f32_flag(mut self, output: Array) -> (MlxCommunicationFlag, Self) {
-        let resolved = Rc::new(Cell::new(None));
-        self.flag = Some(FlagResolution {
-            output,
-            resolved: Rc::clone(&resolved),
-        });
-        (MlxCommunicationFlag { resolved }, self)
     }
 
     /// Requires exact bytes sliced from received in-band boundary frames.
@@ -411,23 +309,6 @@ impl MlxCommunicationCompletion {
             };
             agreement.resolved.set(Some(agreed));
         }
-        if let Some(flag) = &self.flag {
-            let evaluated = flag.output.evaluated()?;
-            let values = evaluated.try_as_slice::<f32>().map_err(|error| {
-                safemlx::error::Exception::custom(format!(
-                    "communication flag result is not f32: {error}"
-                ))
-            })?;
-            let value = match values {
-                [value] => *value != 0.0,
-                _ => {
-                    return Err(safemlx::error::Exception::custom(
-                        "communication flag result is not one scalar",
-                    ));
-                }
-            };
-            flag.resolved.set(Some(value));
-        }
         if let Some(words) = &self.words {
             let evaluated = words.output.evaluated()?;
             let values = evaluated.try_as_slice::<i32>().map_err(|error| {
@@ -465,7 +346,6 @@ impl MlxCommunicationCompletion {
             .agreement
             .iter()
             .map(|value| value.output.clone())
-            .chain(self.flag.iter().map(|value| value.output.clone()))
             .chain(self.words.iter().map(|value| value.output.clone()))
             .chain(
                 self.boundary_headers
@@ -478,42 +358,6 @@ impl MlxCommunicationCompletion {
                 self.event.try_with_complete(|| self.resolve_host_results())
             })?;
         Ok(result.is_some() && settled)
-    }
-
-    /// Number of explicitly retained array handles.
-    #[cfg(test)]
-    pub(crate) fn retained_arrays(&self) -> usize {
-        self.recovery.retention().arrays.len()
-    }
-
-    /// Number of explicitly retained count buffers.
-    #[cfg(test)]
-    pub(crate) fn retained_count_buffers(&self) -> usize {
-        self.recovery.retention()._count_buffers.len()
-    }
-
-    /// Number of explicitly retained group handles.
-    #[cfg(test)]
-    pub(crate) fn retained_groups(&self) -> usize {
-        self.recovery.retention().groups.len()
-    }
-
-    /// Number of explicitly retained route handles.
-    #[cfg(test)]
-    pub(crate) fn retained_routes(&self) -> usize {
-        self.recovery.retention()._routes.len()
-    }
-
-    /// Number of explicitly retained stream handles.
-    #[cfg(test)]
-    pub(crate) fn retained_streams(&self) -> usize {
-        self.recovery.retention()._streams.len()
-    }
-
-    /// Number of native graph outputs certified by the exact event.
-    #[cfg(test)]
-    pub(crate) fn submitted_outputs(&self) -> usize {
-        self.submitted_outputs
     }
 }
 
@@ -530,18 +374,6 @@ impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
             ));
         };
         loop {
-            #[cfg(test)]
-            let complete = if self.force_pending {
-                safemlx::try_with_submission_retirement(|| {
-                    check_native_status(&self.recovery)
-                        .inspect_err(|error| self.mark_authority_failure(error))
-                        .map(|_| false)
-                })
-                .unwrap_or(Ok(false))?
-            } else {
-                eredu_core::Completion::is_complete(&self)?
-            };
-            #[cfg(not(test))]
             let complete = eredu_core::Completion::is_complete(&self)?;
             if complete {
                 // A completed query is authoritative and reports any retained
@@ -550,7 +382,7 @@ impl eredu_core::BoundedCompletion for MlxCommunicationCompletion {
             }
             if std::time::Instant::now() >= deadline {
                 let selected = policy.cancellation();
-                self.mark_authority_failure("bounded communication deadline exceeded");
+                self.fence_authority();
                 quarantine(self);
                 if selected != eredu_core::CompletionCancellationMode::QuarantineUntilComplete {
                     return Err(safemlx::error::Exception::custom(
@@ -570,24 +402,18 @@ impl eredu_core::Completion for MlxCommunicationCompletion {
     type Error = safemlx::error::Exception;
 
     fn resources_releasable(&self) -> bool {
-        #[cfg(test)]
-        if self.force_pending {
-            return false;
-        }
         native_resources_releasable(&self.recovery)
     }
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
         safemlx::try_with_submission_retirement(|| {
-            if !check_native_status(&self.recovery)
-                .inspect_err(|error| self.mark_authority_failure(error))?
-            {
+            if !check_native_status(&self.recovery).inspect_err(|_| self.fence_authority())? {
                 return Ok(false);
             }
             match self.observe_completion() {
                 Ok(result) => Ok(result),
                 Err(error) => {
-                    self.mark_authority_failure(&error);
+                    self.fence_authority();
                     Err(error)
                 }
             }

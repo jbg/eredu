@@ -422,7 +422,7 @@ impl PhysicalLinear {
     /// Both ordinary and distributed execution use the same selected projection.
     /// Keeping the bias out of this equation avoids mutating retained parameters
     /// while invoking fallible, user-controlled input observers.
-    fn project_without_bias(
+    pub(crate) fn project_without_bias(
         &self,
         input: &Array,
         stream: &Stream,
@@ -521,109 +521,6 @@ impl PhysicalLinear {
         };
         Ok(output)
     }
-
-    /// Reduces row-sharded partials before adding a replicated output bias once.
-    pub(crate) fn forward_row_parallel_with_compute(
-        &mut self,
-        input: &Array,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: Option<&mut dyn NativeProjectionInputObserver>,
-        compute_dtype: Option<Dtype>,
-    ) -> Result<Array, Exception> {
-        let guarded = group.has_local_phase_agreement();
-        let prepared = (|| {
-            let cast = compute_dtype
-                .map(|dtype| input.as_dtype(dtype, stream))
-                .transpose()?;
-            let partial =
-                self.project_without_bias(cast.as_ref().unwrap_or(input), stream, observer)?;
-            if compute_dtype.is_some() {
-                partial.as_dtype(input.dtype(), stream)
-            } else {
-                Ok(partial)
-            }
-        })();
-        let partial = if guarded {
-            let prepared = prepared.and_then(|partial| {
-                // Admit the exact immutable data contract before any participant
-                // enters the reduction. Native completion and transport failures
-                // remain owned by the collective itself.
-                use eredu_runtime::CommunicationOperation;
-                group.completion_policy().ok_or_else(|| {
-                    Exception::custom("guarded row projection requires bounded completion")
-                })?;
-                group.validate_tensor(CommunicationOperation::AllReduceSum, &partial, false)?;
-                group.validate_expected_output(
-                    CommunicationOperation::AllReduceSum,
-                    partial.dtype(),
-                    partial.ndim(),
-                    partial.size(),
-                )?;
-                Ok(partial)
-            });
-            agree_row_parallel_result(group, 0, prepared, self.bias.as_ref().as_ref(), stream)?
-        } else {
-            prepared?
-        };
-        // No recovery status exchange follows a failed data collective: its
-        // retained authority establishes completion or fences further work.
-        let output = crate::backend::runtime::distributed::all_sum(&partial, group, stream)?;
-        let output = match self.bias.as_ref() {
-            Some(bias) => output.add(bias, stream),
-            None => Ok(output),
-        };
-        if guarded {
-            agree_row_parallel_result(group, 1, output, None, stream)
-        } else {
-            output
-        }
-    }
-}
-
-/// Agrees only replicated output geometry. Input feature widths may differ
-/// across balanced row shards; bias broadcasting keeps its native semantics.
-fn agree_row_parallel_result(
-    group: &crate::backend::runtime::distributed::Group,
-    phase: u64,
-    local: Result<Array, Exception>,
-    bias: Option<&Array>,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    const PROTOCOL: u64 = 0x524f57504152414c;
-    let mut words = vec![u64::from(bias.is_some())];
-    for value in local.as_ref().ok().into_iter().chain(bias) {
-        words.extend([value.dtype() as u64, value.ndim() as u64]);
-        words.extend(value.shape().iter().map(|&extent| extent as u64));
-    }
-    // All participants enter the fixed-size header before geometry-dependent
-    // exchanges, including when graph construction or observation failed.
-    let accepted = group.agree_local_phase(
-        [PROTOCOL, phase, words.len() as u64, 0, 0, 0, 0, 0],
-        local.is_ok(),
-        stream,
-    );
-    let value = local?;
-    if !accepted.map_err(Exception::from_source)? {
-        return Err(Exception::custom(
-            "a row-projection participant failed or selected different output geometry",
-        ));
-    }
-    for (index, chunk) in words.chunks(6).enumerate() {
-        let mut descriptor = [u64::MAX; 8];
-        descriptor[0] = PROTOCOL;
-        descriptor[1] = index as u64;
-        descriptor[2..2 + chunk.len()].copy_from_slice(chunk);
-        if !group
-            .agree_local_phase(descriptor, true, stream)
-            .map_err(Exception::from_source)?
-        {
-            return Err(Exception::custom(
-                "row-projection participant output or bias geometry differs",
-            ));
-        }
-    }
-    Ok(value)
 }
 
 /// Creates an unloaded embedding using its checkpoint-declared physical format.

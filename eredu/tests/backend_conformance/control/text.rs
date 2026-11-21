@@ -14,7 +14,7 @@ fn request() -> ChatTemplateRequest {
 }
 
 fn text_setup() -> (
-    LoadedModel<MockBackend>,
+    LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     PreparedChatGenerationSettings,
     u32,
@@ -36,24 +36,23 @@ fn text_setup() -> (
 }
 
 fn prepare(
-    model: &LoadedModel<MockBackend>,
+    model: &LoadedModel<MockBackend, MockSession>,
     chat: &PreparedChat,
     settings: PreparedChatGenerationSettings,
     mode: u8,
-) -> PreparedObservedGeneration<MockBackend> {
-    if mode == 0 {
-        return model.prepare_controlled_chat(chat, settings).unwrap();
-    }
+) -> PreparedObservedGeneration<Vec<u32>> {
     #[cfg(not(feature = "tensor-capture"))]
-    unreachable!("capture and intervention cases require tensor-capture");
-    #[cfg(feature = "tensor-capture")]
-    let mut capture = if mode & 1 == 0 {
-        CapturePlan::none()
-    } else {
-        observed_mock::plan()
-    };
+    {
+        let _ = mode;
+        model.prepare_controlled_chat(chat, settings).unwrap()
+    }
     #[cfg(feature = "tensor-capture")]
     {
+        let mut capture = if mode & 1 == 0 {
+            CapturePlan::none()
+        } else {
+            observed_mock::plan()
+        };
         capture.limits = observed_mock::plan().limits;
         if mode & 2 == 0 {
             model
@@ -513,7 +512,11 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
     vocab.insert("<|im_end|>".into(), serde_json::json!(65));
     let tokenizer = Tokenizer::from_bytes(serde_json::to_vec(&value).unwrap()).unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -577,7 +580,11 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        ModelRuntime::install::<MockSession>(
+            MockBackend,
+            fixture_prepared_model(Default::default()),
+        )
+        .unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,

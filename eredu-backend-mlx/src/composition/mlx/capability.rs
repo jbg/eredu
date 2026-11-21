@@ -1,18 +1,8 @@
 //! MLX model capability derivation, resource observation, and admission adapter.
 
-use std::num::NonZeroU8;
-
-use eredu_architectures::media_plan::{MediaShapePlan, PreparedInputPartPlan};
 use eredu_core::{
-    estimate_runtime_state, AvailableMemory, CapabilityError, InputMetadataKey, InputModality,
-    InputTokenCount, ModelCapabilities, ModelCapabilityBackend, ModelRuntime, ObservationKind,
-    Observed, PhysicalMemorySemantics, RuntimeStateEstimate, StateMemoryLayout, StaticMemoryReport,
+    AvailableMemory, CapabilityError, ObservationKind, Observed, PhysicalMemorySemantics,
 };
-use safemlx::{Array, Stream};
-
-use super::{Executable, MlxBackend, MlxModelInput, MlxModelSession};
-use crate::backend::runtime::media::input::{self, InputPayload};
-use eredu_core::residency::MemoryTier;
 
 fn physical_memory_semantics(os: &str, arch: &str) -> PhysicalMemorySemantics {
     // Supported Apple silicon devices and ARM64 simulators share physical RAM
@@ -25,70 +15,6 @@ fn physical_memory_semantics(os: &str, arch: &str) -> PhysicalMemorySemantics {
     }
 }
 
-fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
-    left.checked_add(right)
-        .ok_or(CapabilityError::ArithmeticOverflow { operation })
-}
-
-fn checked_mul(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
-    left.checked_mul(right)
-        .ok_or(CapabilityError::ArithmeticOverflow { operation })
-}
-
-fn estimate_mlx_runtime_state_with_dtype(
-    layout: &StateMemoryLayout,
-    input: InputTokenCount,
-    max_output_tokens: u64,
-    batch_size: u64,
-    floating_state_dtype_bytes: NonZeroU8,
-) -> Result<RuntimeStateEstimate, CapabilityError> {
-    estimate_runtime_state(
-        layout,
-        input,
-        max_output_tokens,
-        batch_size,
-        floating_state_dtype_bytes,
-    )
-}
-
-#[cfg(test)]
-fn estimate_mlx_runtime_state(
-    layout: &StateMemoryLayout,
-    input: InputTokenCount,
-    max_output_tokens: u64,
-    batch_size: u64,
-) -> Result<RuntimeStateEstimate, CapabilityError> {
-    estimate_mlx_runtime_state_with_dtype(
-        layout,
-        input,
-        max_output_tokens,
-        batch_size,
-        NonZeroU8::new(4).expect("test dtype width is nonzero"),
-    )
-}
-
-impl Executable {
-    pub(super) fn prepared_input_token_ids(
-        &self,
-        input: input::ModelInput<'_>,
-        stream: &Stream,
-    ) -> Result<Vec<u32>, crate::backend::error::Error> {
-        self.erased().prepared_input_token_ids(input, stream)
-    }
-
-    pub(super) fn prepared_input_plans(
-        &self,
-        input: input::ModelInput<'_>,
-    ) -> Result<Vec<PreparedInputPartPlan>, CapabilityError> {
-        self.erased().prepared_input_plans(input)
-    }
-
-    pub(super) fn architecture_capability_estimate(
-        &self,
-    ) -> Result<eredu_architectures::capability::CapabilityEstimate, CapabilityError> {
-        Ok(self.erased().capability_estimate().clone())
-    }
-}
 fn unavailable_counter(error: safemlx::error::Exception) -> Observed<u64> {
     Observed::Unavailable {
         reason: error.to_string(),
@@ -114,367 +40,17 @@ fn runtime_counter(
     }
 }
 
-fn array_bytes(array: &Array, operation: &'static str) -> Result<u64, CapabilityError> {
-    u64::try_from(array.nbytes()).map_err(|_| CapabilityError::ArithmeticOverflow { operation })
-}
-
-fn four_byte_scalars(scalars: u64, operation: &'static str) -> Result<u64, CapabilityError> {
-    checked_mul(scalars, 4, operation)
-}
-
-fn prepared_media_accounting_with_plan(
-    payload: &Array,
-    part: &input::InputPart,
-    plan: &MediaShapePlan,
-) -> Result<(u64, u64), CapabilityError> {
-    let mut input_bytes = array_bytes(payload, "prepared media payload bytes")?;
-    for array in [
-        part.metadata_value(InputMetadataKey::PatchGrid),
-        part.metadata_value(InputMetadataKey::PatchPositions),
-        part.metadata_value(InputMetadataKey::AudioMask),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        input_bytes = checked_add(
-            input_bytes,
-            array_bytes(array, "prepared media metadata bytes")?,
-            "prepared media input bytes",
-        )?;
-    }
-    Ok((
-        plan.decoder_positions,
-        checked_add(
-            input_bytes,
-            four_byte_scalars(
-                plan.execution_workspace_scalars,
-                "prepared media execution workspace bytes",
-            )?,
-            "prepared media total workspace bytes",
-        )?,
-    ))
-}
-
-pub fn model_capabilities(session: &MlxModelSession) -> Result<ModelCapabilities, CapabilityError> {
-    session
-        .capability_estimate()
-        .map(|estimate| estimate.into_parts().0)
-}
-
-pub fn count_prepared_input(
-    session: &MlxModelSession,
-    prepared: input::ModelInput<'_>,
-    _stream: &Stream,
-) -> Result<InputTokenCount, CapabilityError> {
-    let mut text_tokens = 0u64;
-    let mut media_positions = 0u64;
-    let mut media_execution_workspace_bytes = 0u64;
-    let mut media_execution_workspace_kind = ObservationKind::Exact;
-    let plans = session.prepared_input_plans(prepared)?;
-    if plans.len() != prepared.parts.len() {
-        return Err(CapabilityError::Observation(
-            "prepared input accounting plan count differs from input parts".into(),
-        ));
-    }
-    for (part, plan) in prepared.parts.iter().zip(plans) {
-        match plan {
-            PreparedInputPartPlan::Text { positions } => {
-                text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
-            }
-            PreparedInputPartPlan::Projected {
-                modality,
-                positions,
-            } => {
-                if modality == InputModality::Text {
-                    text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
-                } else {
-                    media_positions =
-                        checked_add(media_positions, positions, "prepared media-position total")?;
-                }
-            }
-            PreparedInputPartPlan::Media { shape } => {
-                let InputPayload::Tensor(tensor) = part.payload() else {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: session.effective_model_type().into(),
-                        reason: "architecture media plan requires a tensor payload".into(),
-                    });
-                };
-                let (positions, workspace_bytes) =
-                    prepared_media_accounting_with_plan(tensor, part, &shape)?;
-                media_positions =
-                    checked_add(media_positions, positions, "prepared media-position total")?;
-                media_execution_workspace_bytes = checked_add(
-                    media_execution_workspace_bytes,
-                    workspace_bytes,
-                    "prepared media-workspace total",
-                )?;
-                media_execution_workspace_kind = ObservationKind::Conservative;
-            }
-        }
-    }
-    Ok(InputTokenCount::prepared(
-        text_tokens,
-        media_positions,
-        checked_add(
-            text_tokens,
-            media_positions,
-            "prepared model-position total",
-        )?,
-        media_execution_workspace_bytes,
-        media_execution_workspace_kind,
-    ))
-}
-
-pub fn model_runtime_state(
-    session: &MlxModelSession,
-    input: InputTokenCount,
-    max_output_tokens: u64,
-    batch_size: u64,
-    floating_state_dtype_bytes: NonZeroU8,
-) -> Result<RuntimeStateEstimate, CapabilityError> {
-    let estimate = session.capability_estimate()?;
-    estimate_mlx_runtime_state_with_dtype(
-        estimate.state_layout(),
-        input,
-        max_output_tokens,
-        batch_size,
-        floating_state_dtype_bytes,
-    )
-}
-
-pub fn static_model_memory(
-    session: &MlxModelSession,
-) -> Result<StaticMemoryReport, CapabilityError> {
-    let residency = session
-        .residency_report()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let banks = session
-        .parameter_bank_report()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let components = session
-        .component_residency_reports()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let mut components = components.into_iter();
-    let residency = residency.or_else(|| components.next());
-    static_memory_from_residency_and_components(residency, components, banks)
-}
-
-pub(crate) fn static_memory_from_residency(
-    residency: Option<eredu_runtime::ResidencyReport>,
-    banks: Option<
-        crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
-    >,
-) -> Result<StaticMemoryReport, CapabilityError> {
-    static_memory_from_residency_and_components(residency, std::iter::empty(), banks)
-}
-
-fn static_memory_from_residency_and_components(
-    residency: Option<eredu_runtime::ResidencyReport>,
-    components: impl Iterator<Item = eredu_runtime::ResidencyReport>,
-    banks: Option<
-        crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
-    >,
-) -> Result<StaticMemoryReport, CapabilityError> {
-    let retention = residency.as_ref().map_or_else(
-        eredu_core::residency::unreported_parameter_conversion_retention,
-        |report| report.offload().parameter_conversion_retention().clone(),
-    );
-    let mut conversions = residency
-        .as_ref()
-        .map(|report| report.device_parameter_conversion_bytes());
-    let (mut logical, mut host, mut device, mut disk, mut cached_shards) =
-        if let Some(report) = residency {
-            let planned = report.offload().planned_bytes();
-            let resident = report.offload().resident_bytes();
-            let logical = checked_add(
-                checked_add(
-                    planned.get(MemoryTier::Host),
-                    planned.get(MemoryTier::Device),
-                    "planned host plus device parameters",
-                )?,
-                planned.get(MemoryTier::Disk),
-                "complete planned parameter bytes",
-            )?;
-            (
-                Observed::Available {
-                    value: logical,
-                    kind: ObservationKind::Exact,
-                    source: "validated bounded-residency plan".into(),
-                },
-                Observed::Available {
-                    value: resident.get(MemoryTier::Host),
-                    kind: ObservationKind::Exact,
-                    source: "bounded-residency manager".into(),
-                },
-                Observed::Available {
-                    value: resident.get(MemoryTier::Device),
-                    kind: ObservationKind::Exact,
-                    source: "bounded-residency manager".into(),
-                },
-                Observed::Available {
-                    value: planned.get(MemoryTier::Disk),
-                    kind: ObservationKind::Exact,
-                    source: "bounded-residency plan".into(),
-                },
-                Observed::Available {
-                    value: report.weight_store().currently_cached_shards as u64,
-                    kind: ObservationKind::Observational,
-                    source: "checkpoint shard cache".into(),
-                },
-            )
-        } else {
-            (
-                Observed::Unavailable {
-                    reason: "loaded model exposes neither resident parameters nor a residency plan"
-                        .into(),
-                },
-                Observed::Unavailable {
-                    reason: "host residency unavailable".into(),
-                },
-                Observed::Unavailable {
-                    reason: "device residency unavailable".into(),
-                },
-                Observed::Unavailable {
-                    reason: "disk residency unavailable".into(),
-                },
-                Observed::Unavailable {
-                    reason: "checkpoint shard-cache information unavailable".into(),
-                },
-            )
-        };
-    for component in components {
-        let planned = component.offload().planned_bytes();
-        let resident = component.offload().resident_bytes();
-        for tier in [MemoryTier::Device, MemoryTier::Host, MemoryTier::Disk] {
-            add_parameter_observation(&mut logical, planned.get(tier))?;
-        }
-        add_parameter_observation(&mut host, resident.get(MemoryTier::Host))?;
-        add_parameter_observation(&mut device, resident.get(MemoryTier::Device))?;
-        add_parameter_observation(&mut disk, planned.get(MemoryTier::Disk))?;
-        if let Some(bytes) = conversions.as_mut() {
-            *bytes = checked_add(
-                *bytes,
-                component.device_parameter_conversion_bytes(),
-                "component conversion bytes",
-            )?;
-        }
-        cached_shards = Observed::unavailable("component checkpoint readers can share storage");
-    }
-    // Independently addressable parameters are excluded from ordinary block
-    // residency. Count each bank's owned entries once, even when banks share
-    // the same physical pool and its aggregate telemetry.
-    if let Some(banks) = banks {
-        for bank in banks.banks().values() {
-            add_parameter_observation(&mut logical, bank.owned_bytes())?;
-            add_parameter_observation(&mut host, bank.host_resident_bytes())?;
-            add_parameter_observation(&mut device, bank.device_resident_bytes())?;
-            // Addressable entries retain independently reopenable disk recipes.
-            add_parameter_observation(&mut disk, bank.owned_bytes())?;
-        }
-    }
-    if let Some(bytes) = conversions {
-        add_parameter_observation(&mut device, bytes)?;
-    }
-    Ok(StaticMemoryReport {
-        parameter_conversion_retention: retention,
-        logical_parameter_bytes: logical,
-        current_host_resident_bytes: host,
-        current_device_resident_bytes: device,
-        current_device_parameter_conversion_bytes: conversions.map_or_else(
-            || Observed::unavailable("parameter conversion ownership unavailable"),
-            |bytes| Observed::exact(bytes, "resident parameter conversion owners"),
-        ),
-        planned_disk_backed_bytes: disk,
-        backend_active_allocation_bytes: runtime_counter(
+pub(super) fn native_memory_facts() -> eredu_core::capability::NativeMemoryFacts {
+    eredu_core::capability::NativeMemoryFacts {
+        active_allocation_bytes: runtime_counter(
             safemlx::memory::active_memory,
             "process-global MLX active allocation counter",
         ),
-        backend_allocator_cache_bytes: runtime_counter(
+        allocator_cache_bytes: runtime_counter(
             safemlx::memory::cache_memory,
             "process-global MLX allocator cache counter",
         ),
         physical_semantics: physical_memory_semantics(std::env::consts::OS, std::env::consts::ARCH),
-        currently_cached_shards: cached_shards,
-    })
-}
-
-fn add_parameter_observation(
-    observation: &mut Observed<u64>,
-    extra: u64,
-) -> Result<(), CapabilityError> {
-    if let Observed::Available { value, source, .. } = observation {
-        *value = checked_add(*value, extra, "resident parameter storage bytes")?;
-        if extra != 0 {
-            *source = "ordinary residency plus independently owned native parameter storage".into();
-        }
-    }
-    Ok(())
-}
-
-impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
-    fn prepared_input_token_ids(
-        runtime: &ModelRuntime<Self>,
-        input: &Self::Prompt,
-    ) -> Result<Vec<u32>, eredu_core::BackendFailure> {
-        input
-            .with_borrowed(|input| {
-                runtime
-                    .session()
-                    .prepared_input_token_ids(input, runtime.backend().stream())
-            })
-            .map_err(eredu_core::BackendFailure::from_error)
-    }
-
-    fn trim_parameter_conversions(
-        runtime: &mut eredu_core::ModelRuntime<Self>,
-    ) -> Result<
-        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        runtime.session_mut().trim_parameter_conversions()
-    }
-
-    fn parameter_conversion_retention(
-        runtime: &ModelRuntime<Self>,
-    ) -> Result<
-        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
-        eredu_core::BackendFailure,
-    > {
-        runtime.session().parameter_conversion_retention()
-    }
-
-    fn model_capabilities(
-        runtime: &ModelRuntime<Self>,
-    ) -> Result<ModelCapabilities, CapabilityError> {
-        model_capabilities(runtime.session())
-    }
-
-    fn count_prepared_input(
-        runtime: &ModelRuntime<Self>,
-        prepared: &MlxModelInput,
-    ) -> Result<InputTokenCount, CapabilityError> {
-        prepared.with_borrowed(|input| {
-            count_prepared_input(runtime.session(), input, runtime.backend().stream())
-        })
-    }
-
-    fn estimate_runtime_state(
-        runtime: &ModelRuntime<Self>,
-        input: InputTokenCount,
-        max_output_tokens: u64,
-        batch_size: u64,
-    ) -> Result<RuntimeStateEstimate, CapabilityError> {
-        model_runtime_state(
-            runtime.session(),
-            input,
-            max_output_tokens,
-            batch_size,
-            runtime.session().floating_state_dtype_bytes(),
-        )
-    }
-
-    fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError> {
-        static_model_memory(runtime.session())
     }
 }
 
@@ -523,5 +99,28 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
     })
 }
 
-#[cfg(test)]
-mod tests;
+/// Native allocator observations for MLX placements.
+pub struct MlxAllocatorObservations;
+
+impl eredu_core::capability::NativeAllocatorObservations for MlxAllocatorObservations {
+    fn native_memory_facts() -> eredu_core::capability::NativeMemoryFacts {
+        native_memory_facts()
+    }
+
+    fn available_memory() -> Result<eredu_core::AvailableMemory, eredu_core::BackendFailure> {
+        available_memory().map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    fn allocator_cache_limit() -> eredu_core::Observed<u64> {
+        match crate::allocator_cache_policy() {
+            Ok(policy) => Observed::exact(
+                policy.limit_bytes,
+                format!(
+                    "MLX allocator-cache policy {:?}: {} bytes",
+                    policy.source, policy.limit_bytes
+                ),
+            ),
+            Err(error) => eredu_core::Observed::unavailable(error.to_string()),
+        }
+    }
+}

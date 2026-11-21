@@ -313,8 +313,10 @@ pub struct TextExecutionTopology {
     pub f32_rms_normalization_gains: std::collections::BTreeSet<String>,
     /// Current backend binding facts. Cold/older reports default to no coverage.
     #[serde(default)]
-    pub projection_storage:
-        std::collections::BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
+    pub projection_storage: std::collections::BTreeMap<
+        String,
+        eredu_core::residency::projection::ProjectionStorageFacts,
+    >,
     /// Additional unsupported module equations or invocation facts.
     pub missing: Vec<String>,
 }

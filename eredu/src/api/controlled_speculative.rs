@@ -3,6 +3,7 @@
 use super::request::OutputMode;
 use super::request::SourceRequest;
 use super::{LoadedModel, PreparedChatError};
+use crate::runtime::speculative::SpeculativeBatchBackend;
 #[cfg(feature = "tensor-capture")]
 pub use eredu_core::speculative::{
     AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationDiscovery,
@@ -12,9 +13,7 @@ pub use eredu_core::speculative::{
     SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
 };
 pub use eredu_core::speculative::{SpeculativeControlError, SpeculativeProposalView};
-use eredu_core::{
-    generation::SemanticEvent, SpeculativeGenerationBackend, SpeculativeGenerationOutput,
-};
+use eredu_core::{generation::SemanticEvent, SpeculativeGenerationOutput};
 pub use eredu_runtime::memory_forecast::{
     EmbeddedContinuationMemoryPlan, SpeculativeContinuationForecast,
     SpeculativeContinuationMemoryPlan,
@@ -40,7 +39,7 @@ pub(super) enum ControlledSpeculativeGenerationError {
 }
 
 #[cfg(feature = "tensor-capture")]
-impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
+impl<B: SpeculativeBatchBackend<S>, S: eredu_core::TextExecutionSession<B>> LoadedModel<B, S> {
     /// Internal forward capture and edit support for the actually loaded
     /// speculative executor. Ordinary sampler capture uses a separate report.
     pub fn speculative_activation_discovery(
@@ -106,14 +105,15 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
     }
 }
 
-impl<B> LoadedModel<B>
+impl<B, S> LoadedModel<B, S>
 where
-    B: SpeculativeGenerationBackend
-        + eredu_runtime::memory_forecast::SpeculativeForecastBackend<B::Drafter>,
+    B: SpeculativeBatchBackend<S>,
+    S: eredu_core::TextExecutionSession<B>
+        + eredu_runtime::memory_forecast::SpeculativeForecastSession<B, B::Drafter>,
 {
     pub(super) fn with_controlled_speculative<'a, F, D>(
         &mut self,
-        request: SourceRequest<'a, B, B::Drafter, F>,
+        request: SourceRequest<'a, S::Prompt, B::Drafter, F>,
         options: ControlledSpeculativeOptions,
         drive: D,
         mode: OutputMode,
@@ -172,10 +172,10 @@ where
         )?;
         // Retain selection geometry before the backend lends its mutable execution
         // resources. Unsupported forecasts must not prevent ordinary execution.
-        let forecast_profiles = B::speculative_target_memory_profile(&self.runtime)
+        let forecast_profiles = S::speculative_target_memory_profile(&self.runtime)
             .ok()
             .and_then(|target| {
-                B::speculative_memory_profile(&self.runtime, &request.drafting)
+                S::speculative_memory_profile(&self.runtime, &request.drafting)
                     .ok()
                     .flatten()
                     .map(|draft| (target, draft))

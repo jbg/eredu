@@ -461,7 +461,7 @@ impl eredu_runtime::execution_control::SnapshotValue for DepthFrame {
 
     fn copy_snapshot_value(
         &self,
-        retention: &eredu_runtime::execution_control::SnapshotReservation,
+        retention: &eredu_runtime::execution_control::SnapshotRetention,
     ) -> Result<Self, eredu_core::BackendFailure> {
         Ok(Self {
             order: self.order.copy_snapshot_value(retention)?,

@@ -3,7 +3,7 @@
 use super::{AudioTokens, DepthDeclaration, DepthFrame, PreparedAudio};
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_runtime::{
-    execution_control::{snapshot_value_estimate, SnapshotReservation, SnapshotValue},
+    execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue},
     RealtimeScheduleState,
 };
 
@@ -68,7 +68,7 @@ impl SnapshotValue for AudioSchedulePolicy {
         ])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             eos: self.eos.copy_snapshot_value(retention)?,
             depth_schedule: self.depth_schedule.copy_snapshot_value(retention)?,
@@ -224,7 +224,7 @@ impl SnapshotValue for AudioSchedule {
         ])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             policy: self.policy.copy_snapshot_value(retention)?,
             pending: self.pending.copy_snapshot_value(retention)?,

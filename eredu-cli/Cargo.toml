@@ -13,14 +13,14 @@ readme = "README.md"
 
 [features]
 default = ["mlx", "metal", "realtime", "system-audio", "vision"]
-distributed = ["mlx", "eredu-backend-mlx/distributed"]
-vision = ["eredu/image", "eredu-backend-mlx?/image", "dep:image"]
-realtime = ["eredu/audio", "eredu-backend-mlx?/audio", "dep:eredu-media"]
+distributed = ["mlx", "eredu/distributed"]
+vision = ["eredu/image", "dep:image"]
+realtime = ["eredu/audio", "dep:eredu-media"]
 system-audio = ["realtime", "eredu-media/system-audio", "dep:ctrlc", "dep:crossterm"]
-mlx = ["dep:eredu-backend-mlx"]
-metal = ["mlx", "eredu-backend-mlx/accelerate", "eredu-backend-mlx/metal"]
-cuda = ["mlx", "eredu-backend-mlx/cuda"]
-nccl = ["cuda", "distributed", "eredu-backend-mlx/nccl"]
+mlx = ["eredu/mlx", "dep:eredu-backend-mlx"]
+metal = ["mlx", "eredu/metal"]
+cuda = ["mlx", "eredu/cuda"]
+nccl = ["cuda", "distributed", "eredu/nccl"]
 
 [[bin]]
 name = "eredu"

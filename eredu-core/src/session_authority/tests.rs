@@ -205,9 +205,6 @@ struct ForeignSession {
 }
 
 impl BackendProvider for ForeignBackend {
-    type ModelConfig = ();
-    type Model = ();
-    type Session = ForeignSession;
     type Error = std::io::Error;
 
     fn descriptor(&self) -> crate::BackendDescriptor {
@@ -220,21 +217,6 @@ impl BackendProvider for ForeignBackend {
         Ok(Vec::new())
     }
 
-    fn prepare_model(&self, (): ()) -> Result<PreparedModel<()>, Self::Error> {
-        Ok(PreparedModel::new((), SessionCapabilities::default()))
-    }
-
-    fn create_session(&self, _: PreparedModel<()>) -> Result<ForeignSession, Self::Error> {
-        let mut authority = SessionAuthority::new();
-        let mut completion = pending(&mut authority);
-        completion.native.drained = Arc::clone(&self.native_drained);
-        *self.constructed_active.lock().unwrap() = Some(Arc::clone(&authority.active));
-        Ok(ForeignSession {
-            authority,
-            _construction: completion,
-        })
-    }
-
     fn session_capability_mismatch(
         &self,
         admitted: SessionCapabilities,
@@ -245,6 +227,25 @@ impl BackendProvider for ForeignBackend {
                 .validate(realized)
                 .unwrap_err(),
         )
+    }
+}
+
+impl crate::backend::ModelSessionInstaller<ForeignBackend> for ForeignSession {
+    type Model = ();
+    type Session = Self;
+
+    fn install_session(
+        backend: &ForeignBackend,
+        _: PreparedModel<()>,
+    ) -> Result<Self, std::io::Error> {
+        let mut authority = SessionAuthority::new();
+        let mut completion = pending(&mut authority);
+        completion.native.drained = Arc::clone(&backend.native_drained);
+        *backend.constructed_active.lock().unwrap() = Some(Arc::clone(&authority.active));
+        Ok(ForeignSession {
+            authority,
+            _construction: completion,
+        })
     }
 }
 
@@ -300,7 +301,10 @@ fn failed_generic_session_publication_drains_native_resources_and_releases_activ
         constructed_active: Arc::clone(&active),
         native_drained: Arc::clone(&drained),
     };
-    let result = ModelRuntime::prepare(backend, ());
+    let result = ModelRuntime::<ForeignBackend, ForeignSession>::install::<ForeignSession>(
+        backend,
+        PreparedModel::new((), SessionCapabilities::default()),
+    );
     assert!(result.is_err());
     assert!(drained.load(Ordering::Acquire));
     assert_eq!(

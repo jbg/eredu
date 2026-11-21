@@ -1,5 +1,7 @@
 //! Shared layered traversal for causal speech and bidirectional character stacks.
 
+use eredu_core::SubmissionBackend;
+
 use super::tts_transformer::{encoder_mask, NoTransformerCache, TransformerConfig};
 use super::tts_transformer_specs::{TransformerDeclaration, TransformerSpec};
 use crate::decoder::{self, AttentionInput, Config, PartitionedConfig, TransformerBlock};
@@ -14,7 +16,7 @@ use eredu_runtime::{
     ComponentKernel, ComponentUnit, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress,
     ExecutionUnitLayout, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime, LocalModelLayout,
     OwnedParameterGroupSpec, ParallelComponentKernel, ParameterGroupOwner, RuntimeLayerState,
-    RuntimeState, StateError, StateLayout, SubmissionBackend,
+    RuntimeState, StateError, StateLayout,
 };
 use std::{marker::PhantomData, ops::DerefMut};
 

@@ -1,10 +1,10 @@
 //! QSA micro-block summaries and bounded selection over original token positions.
+use eredu_core::cache::append_stream::{AppendOnlyStream, AppendStreamError};
 use eredu_nn::{
     Error, Index, LinearOperator, LinearSpec, NeuralBackend, NeuralOperatorCapabilities as C,
     NormalizationConstructionSpec, NormalizationOperator, RotaryOperator, RotaryPosition,
     RotarySpec, Tensor, TensorElementType,
 };
-use eredu_runtime::{AppendOnlyStream, AppendStreamError};
 use std::{cmp::Ordering, collections::BinaryHeap};
 mod cached;
 mod state;

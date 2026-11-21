@@ -1,6 +1,7 @@
 //! Fixed-size, confirmed scheduler facts over the session's admitted transport.
 
 use super::*;
+use eredu_core::run_preparation::TextPreparationTransport;
 use eredu_core::{SpeculativeRequestStatus, SpeculativeScheduleState};
 
 const SCHEDULE_MAGIC: u32 = 0x4552_5350;
@@ -29,7 +30,7 @@ impl TextPreparationCoordinator {
             Ok(state) => state,
             Err(_) => {
                 let error = TextPreparationAgreementError::Busy;
-                transport.fail_preparation(&error);
+                transport.fence_preparation();
                 return Err(error);
             }
         };
@@ -68,9 +69,9 @@ impl TextPreparationCoordinator {
             }
             Ok(local)
         })();
-        if let Err(error) = &result {
+        if result.is_err() {
             state.fenced = true;
-            transport.fail_preparation(error);
+            transport.fence_preparation();
         }
         result
     }

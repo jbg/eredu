@@ -48,15 +48,23 @@ pub struct GenerationBranchMetadata {
 /// Inactive continuation for serial exchange with one exclusively borrowed model.
 /// After an exchange this handle holds the previously active run. Dropping a
 /// handle releases that inactive state; the active child's lease follows its run.
-pub struct ControlledGenerationBranch<B: TextSnapshotBackend> {
-    continuation: TextContinuationBranch<B, ControlConstraints>,
+pub struct ControlledGenerationBranch<
+    B: TextSnapshotBackend<S>,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::execution_control::NativeTextStateSession<B>,
+> {
+    continuation: TextContinuationBranch<B, ControlConstraints, S>,
     cursor: CommittedGenerationCursor,
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     lifecycle: GenerationLifecycle,
     delivery: Delivery,
 }
 
-impl<B: TextSnapshotBackend> ControlledGenerationBranch<B> {
+impl<
+        B: TextSnapshotBackend<S>,
+        S: eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > ControlledGenerationBranch<B, S>
+{
     /// Identity of the run currently held by this inactive slot.
     pub fn run_id(&self) -> &str {
         &self.delivery.template.run_id
@@ -75,16 +83,21 @@ impl<B: TextSnapshotBackend> ControlledGenerationBranch<B> {
     }
 }
 
-impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
+impl<
+        B: TextSnapshotBackend<S> + TextSamplingControlBackend<S>,
+        S: eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > ControlledGenerationSession<'_, B, S>
+{
     /// Forks a complete saved boundary without installing it, replaying input or
     /// loading weights. The emitted BranchStarted belongs to the child and
     /// contains its inherited semantic prefix. Children execute through `exchange`.
     pub fn fork(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
+        snapshot: &ControlledGenerationSnapshot<B, S>,
         options: GenerationBranchOptions,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
+    ) -> Result<ControlledGenerationBranch<B, S>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.fork_inner(snapshot, options, emit)
         })) {
@@ -99,10 +112,10 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
 
     fn fork_inner(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
+        snapshot: &ControlledGenerationSnapshot<B, S>,
         options: GenerationBranchOptions,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
+    ) -> Result<ControlledGenerationBranch<B, S>, ControlledGenerationError> {
         self.lifecycle.checkpoint()?;
         if self.delivery.cancellation.is_cancelled() {
             return Err(CaptureError::Invalid(
@@ -153,7 +166,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
             .retained_bytes
             .checked_mul(3)
             .and_then(|bytes| {
-                bytes.checked_add(std::mem::size_of::<ControlledGenerationBranch<B>>() as u64)
+                bytes.checked_add(std::mem::size_of::<ControlledGenerationBranch<B, S>>() as u64)
             })
             .and_then(|bytes| bytes.checked_add((run_id.len() + session_id.len()) as u64))
             .ok_or(ExecutionControlError::Overflow)?;
@@ -189,7 +202,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                 |runtime, generation| {
                     let sampling_before = B::sampling_control_facts(generation);
                     if let Some(request) = options.sampling {
-                        apply_prepared_sampling_override::<B>(runtime, generation, request)
+                        apply_prepared_sampling_override::<B, S>(runtime, generation, request)
                             .map_err(|error| match error {
                                 SamplingOverrideError::Backend(error) => {
                                     TextSnapshotError::Backend(error)
@@ -242,7 +255,9 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             .and_then(|run| run.intervention_plan())
                             .map(|plan| plan.artifact_identity().to_owned())
                             .or_else(|| snapshot.metadata.artifact_identity.clone()),
-                        parameter_overlay_id: B::active_parameter_overlay(runtime)
+                        parameter_overlay_id: runtime
+                            .session()
+                            .active_parameter_overlay()
                             .map(str::to_owned),
                         session_id: session_id.clone(),
                         #[cfg(not(feature = "tensor-capture"))]
@@ -313,13 +328,18 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
     }
 }
 
-impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
+impl<
+        B: TextSnapshotBackend<S>,
+        S: eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > ControlledGenerationSession<'_, B, S>
+{
     /// Exchanges the active run with a saved branch slot. Native state, semantic
     /// buffers, lifecycle, identity, cancellation and cumulative budgets move
     /// together. No prediction, copy, random draw or semantic replay occurs.
     pub fn exchange(
         &mut self,
-        branch: &mut ControlledGenerationBranch<B>,
+        branch: &mut ControlledGenerationBranch<B, S>,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -328,7 +348,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             Ok(result) => {
                 if result.is_err()
                     && !matches!(
-                        B::estimate_native_text_state(self.driver.runtime(), None),
+                        S::estimate_native_text_state(self.driver.runtime(), None),
                         Ok(Some(_))
                     )
                 {
@@ -347,7 +367,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
 
     fn exchange_inner(
         &mut self,
-        branch: &mut ControlledGenerationBranch<B>,
+        branch: &mut ControlledGenerationBranch<B, S>,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         branch

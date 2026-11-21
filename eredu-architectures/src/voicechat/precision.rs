@@ -157,7 +157,7 @@ impl SpeechPrecision {
     pub(crate) fn bindings(
         self,
         source: &eredu_checkpoint::store::SharedCheckpointSource,
-        units: &mut [Vec<eredu_runtime::WeightBinding>],
+        units: &mut [Vec<eredu_core::residency::parameter_binding::WeightBinding>],
         declaration: &SpeechPrecisionDeclaration,
     ) -> Result<(), eredu_runtime::RecipeBindingError> {
         use eredu_checkpoint::recipe::DerivedWeightRecipe;

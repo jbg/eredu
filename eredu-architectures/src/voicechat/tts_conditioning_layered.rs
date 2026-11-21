@@ -1,4 +1,5 @@
 //! Separately leased character conditioning, speaker ingress and gated fusion.
+
 use super::tts_conditioning_specs::{ConditioningDeclaration, Declaration};
 use super::{
     config::TtsConfig,
@@ -11,6 +12,7 @@ use super::{
     tts_rvq_layered::RvqExecution,
 };
 use eredu_core::BackendFailure;
+use eredu_core::SubmissionBackend;
 use eredu_nn::{
     DeclareLogicalParameters, DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor,
 };
@@ -22,7 +24,6 @@ use eredu_runtime::{
     ExecutionUnitLayout, LayeredForwardState, LayeredInvocation, LayerwisePolicy, LayerwiseRuntime,
     LocalModelLayout, MemberSharding, OwnedParameterGroupSpec, ParallelComponentKernel,
     ParameterGroupOwner, ParameterRole, ResidentRuntime, StatelessComponentState,
-    SubmissionBackend,
 };
 use std::marker::PhantomData;
 

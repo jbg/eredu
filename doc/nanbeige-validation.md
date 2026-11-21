@@ -200,7 +200,7 @@ hf download Nanbeige/Nanbeige4.2-3B \
   --local-dir "$NANBEIGE_VALIDATION/checkpoint"
 shasum -a 256 "$NANBEIGE_VALIDATION"/checkpoint/model-*.safetensors
 
-CARGO_INCREMENTAL=0 cargo run -p eredu-backend-mlx --no-default-features \
+CARGO_INCREMENTAL=0 cargo run -p eredu --no-default-features --features mlx \
   --example checkpoint_probe -- \
   --model "$NANBEIGE_VALIDATION/checkpoint" --device cpu \
   --prompt 'The capital of France is' --decode-steps 4 --warmup-runs 0 \

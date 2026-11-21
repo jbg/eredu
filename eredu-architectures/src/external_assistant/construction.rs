@@ -341,7 +341,7 @@ impl CompatibleExternalAssistantPreparation {
             .ok_or_else(|| invalid_assistant("target omitted its retained architecture"))?
             .architecture_descriptor();
         let paths = match &self.capture {
-            crate::composite_execution::ExternalPredictionCaptureRequest::Muse {
+            crate::composite_execution::ExternalPredictionCaptureRequest::OrderedLayerOutputs {
                 target_paths,
                 ..
             } => target_paths,

@@ -14,10 +14,11 @@ use crate::replicated_text::{CompositeTextRequirements, SelectedCompositeTextRea
 use crate::routed_text::RoutedTextSelectionRequest;
 use crate::selected_execution::SelectedCompositePartitionedExecution;
 use eredu_core::artifact::ArtifactInspection;
+use eredu_core::communication::BoundaryTensorDtype as Dtype;
+use eredu_core::communication::CommunicationCapabilities;
 use eredu_runtime::{
     ArchitectureBoundary, BackendMechanismCapabilities, BoundaryTensorDimension as Dim,
-    BoundaryTensorDtype as Dtype, BoundaryTensorSpec, BoundaryWireSchema,
-    CommunicationCapabilities, MediaPrimitiveCapabilities, ProcessorSelectionRequest,
+    BoundaryTensorSpec, BoundaryWireSchema, MediaPrimitiveCapabilities, ProcessorSelectionRequest,
     RowLookupDescriptor, StateRealizationRequirements,
 };
 
@@ -198,17 +199,16 @@ fn vision_partition_extent(
 /// The encoder runs once for the complete request, before decoder chunking.
 /// Its reductions must fit the same selected tensor collective as lexical rows.
 fn vision_reduction(
-    rows: Option<eredu_runtime::CommunicationOperationRequirement>,
+    rows: Option<eredu_core::communication::CommunicationOperationRequirement>,
     request: PartitionedSelectionRequest,
     patches: i32,
     projected: i32,
     vision: &crate::qwen::vision::VisionConfig,
-) -> Result<Option<eredu_runtime::CommunicationOperationRequirement>, PreparationError> {
+) -> Result<Option<eredu_core::communication::CommunicationOperationRequirement>, PreparationError>
+{
     use eredu_core::checkpoint::TensorDtype;
-    use eredu_runtime::{
-        CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
-        PipelineActivationDtype,
-    };
+    use eredu_core::communication::{CommunicationOperation, PipelineActivationDtype};
+    use eredu_core::communication::{CommunicationOperationRequirement, CommunicationTensorLimits};
     if request.topology().tensor() == 1 {
         return Ok(rows);
     }

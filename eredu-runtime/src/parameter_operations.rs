@@ -6,10 +6,16 @@ use crate::{
 use eredu_core::{capture::*, parameters::ParameterError};
 use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 
+mod prepared_slots;
+pub(crate) use prepared_slots::{
+    collect_prepared_layered_parameters, collect_prepared_module_parameters,
+};
 mod assembly;
 mod bank_reads;
 mod banks;
-pub use bank_reads::{BankParameterReadPlan, BankParameterReadSelectionError};
+pub use bank_reads::{
+    BankParameterReadPlan, BankParameterReadSelectionError, BankParameterReadSource,
+};
 mod bank_index;
 pub use bank_index::{
     BankParameterIndexError, BankParameterMemberAddress, PreparedBankParameterIndex,
@@ -34,8 +40,7 @@ pub use catalog::{
 };
 pub use coordination::{
     ParameterModelIdentity, ParameterOperationBinding, ParameterOperationCoordinator,
-    ParameterOperationKind, ParameterOperationTransport, ParameterReadPreparation,
-    PARAMETER_CONTROL_WORDS,
+    ParameterOperationKind, ParameterReadPreparation, PARAMETER_CONTROL_WORDS,
 };
 
 /// The architecture and residency policy actually retained by an execution.
@@ -52,6 +57,9 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
     /// A custom executor with no parameter mechanism returns `None`; callers must
     /// report unavailable access instead of exposing incomplete values.
     fn parameter_parts(&mut self) -> Option<(&mut Self::Architecture, &mut Self::Policy)>;
+
+    /// Borrows the installed policy for residency telemetry and retention.
+    fn parameter_policy(&self) -> Option<&Self::Policy>;
 
     /// Visits actual resident slots without acquiring or rebuilding a unit.
     /// False means the selected policy cannot provide resident traversal.

@@ -1,5 +1,8 @@
 //! Validation of mixed categorical and dense channel payloads before allocation.
 
+use eredu_core::realtime_mechanisms::RealtimeHostFrameMaterializer;
+#[cfg(test)]
+use eredu_core::realtime_mechanisms::RealtimeHostTokenMaterializer;
 use std::collections::BTreeSet;
 
 use eredu_core::{RealtimeChannelId, RealtimeChannelLayout, RealtimeChannelPayload};
@@ -79,7 +82,7 @@ impl<'a> ValidatedRealtimeFrameInput<'a> {
     /// Copies only previously admitted values, preserving channel identities and
     /// each payload's declared shape. A malformed override cannot partially copy
     /// ordinary inputs because both groups are validated by [`Self::new`].
-    pub fn materialize<M: crate::RealtimeHostFrameMaterializer>(
+    pub fn materialize<M: RealtimeHostFrameMaterializer>(
         &self,
         mechanism: &mut M,
     ) -> Result<crate::MaterializedRealtimeInput<M::Tensor>, M::Error> {
@@ -210,7 +213,7 @@ impl<'a> ValidatedRealtimeChannels<'a> {
     }
 
     /// Materializes the already validated set in caller order.
-    pub fn materialize<M: crate::RealtimeHostFrameMaterializer>(
+    pub fn materialize<M: RealtimeHostFrameMaterializer>(
         &self,
         mechanism: &mut M,
     ) -> Result<Vec<(RealtimeChannelId, M::Tensor)>, M::Error> {
@@ -288,8 +291,8 @@ mod tests {
     use std::convert::Infallible;
 
     use crate::{
-        RealtimeHostFrameMaterializer, RealtimeHostTokenMaterializer, RealtimePayloadContract,
-        RealtimePayloadGeneration, RealtimePayloadHistory, RealtimePayloadOwnerIdentity,
+        RealtimePayloadContract, RealtimePayloadGeneration, RealtimePayloadHistory,
+        RealtimePayloadOwnerIdentity,
     };
     use eredu_core::{
         RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelFeedback,

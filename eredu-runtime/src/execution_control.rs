@@ -11,9 +11,12 @@ mod isolated;
 mod sampling;
 mod snapshot;
 pub use choice::{TokenChoiceController, TokenChoiceError};
+pub use eredu_core::execution_control::{
+    snapshot_value_estimate, SnapshotRetention, SnapshotValue,
+};
 pub use isolated::{
-    snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateError,
-    IsolatedStateFork, IsolatedStateSnapshot, SnapshotValue,
+    ForkStateEstimate, IsolatedStateCopy, IsolatedStateError, IsolatedStateFork,
+    IsolatedStateSnapshot,
 };
 pub use sampling::{
     apply_prepared_sampling_override, apply_sampling_override, validate_sampling_override,
@@ -392,6 +395,11 @@ pub struct SnapshotReservation {
 }
 
 impl SnapshotReservation {
+    /// Provides native work with an opaque share of this retention charge.
+    pub fn authority(&self) -> SnapshotRetention {
+        SnapshotRetention::from_owner(self.lease.clone())
+    }
+
     /// Logical storage charged while any handle to this exact object is retained.
     pub fn retained_bytes(&self) -> u64 {
         self.lease.retained_bytes.get()
@@ -441,6 +449,11 @@ impl SnapshotRetainedGrowth {
         }
     }
 
+    /// Shares the lifetime of the budget charge with native recovery.
+    pub(crate) fn authority(&self) -> SnapshotRetention {
+        self.retention.authority()
+    }
+
     /// Admits a candidate before retaining it as committed child state.
     pub fn admit(&self, bytes: u64) -> Result<(), ExecutionControlError> {
         if bytes > self.admitted.get() {
@@ -474,7 +487,6 @@ mod trace;
 pub use trace::{TraceBudget, TraceLimits};
 
 /// Complete logical host storage of the supported immutable intervention DTO.
-#[cfg(feature = "tensor-capture")]
 pub fn admitted_intervention_storage_bytes(
     plan: &eredu_core::intervention::AdmittedInterventionPlan,
 ) -> Option<u64> {

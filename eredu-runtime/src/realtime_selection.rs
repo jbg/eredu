@@ -12,67 +12,7 @@ use crate::{
     WeightLoweringDescriptor, WeightLoweringKind,
 };
 
-/// Exact nonempty identity used by neutral realtime contracts.
-#[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RealtimeIdentity(String);
-
-impl RealtimeIdentity {
-    /// Creates an identity while preserving its exact nonempty text.
-    pub fn new(value: impl Into<String>) -> Result<Self, RealtimeContractError> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            return Err(RealtimeContractError::EmptyIdentity);
-        }
-        Ok(Self(value))
-    }
-
-    /// Returns the exact identity text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for RealtimeIdentity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-/// One generic mechanism that a neutral realtime executor may require.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum RealtimeMechanism {
-    /// Generic tensor construction, indexing, stacking, and slicing.
-    TensorOperations,
-    /// Backend-neutral tensor operations and architecture neural operations.
-    NeuralOperations,
-    /// Exact selected checkpoint recipes and source-to-execution lowering.
-    ParameterMaterialization,
-    /// Resident or bounded immutable-parameter storage.
-    ParameterStorage,
-    /// Mutable model-state storage matching architecture geometry.
-    StateStorage,
-    /// Typed coordinate payload storage and retention.
-    CoordinateStorage,
-    /// Generic logits processing and token sampling.
-    Sampling,
-    /// Transactional random-state storage and advancement.
-    Randomness,
-    /// Portable-host to opaque-tensor conversion.
-    HostConversion,
-    /// Exact completion and resource-retention tracking.
-    ExactCompletion,
-    /// Submitted tensor, store, validation, queue, and collective retention.
-    ResourceRetention,
-    /// Generic device or rank-local transfer.
-    Transfer,
-    /// Named activation observation and intervention.
-    Observation,
-    /// Opaque collective communication.
-    Collectives,
-    /// Optional execution timing.
-    Timing,
-}
+pub use eredu_core::realtime_mechanisms::{RealtimeIdentity, RealtimeMechanism};
 
 /// Semantic role of one physical component in an atomic matrix lowering.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -661,7 +601,7 @@ pub struct RealtimeMechanismCapabilities {
     observation_identities: BTreeSet<RealtimeIdentity>,
     state: StateMechanismCapabilities,
     maximum_tensor_parallel_size: NonZeroUsize,
-    completion: crate::CommunicationCompletionCapabilities,
+    completion: eredu_core::communication::CommunicationCompletionCapabilities,
     session: SessionCapabilities,
 }
 
@@ -675,7 +615,7 @@ impl RealtimeMechanismCapabilities {
         weight_lowerings: Vec<WeightLoweringCapability>,
         state: StateMechanismCapabilities,
         maximum_tensor_parallel_size: NonZeroUsize,
-        completion: crate::CommunicationCompletionCapabilities,
+        completion: eredu_core::communication::CommunicationCompletionCapabilities,
         session: SessionCapabilities,
     ) -> Self {
         Self {
@@ -741,7 +681,9 @@ impl RealtimeMechanismCapabilities {
     }
 
     /// Returns supported exact-completion timeout dispositions.
-    pub const fn completion(&self) -> &crate::CommunicationCompletionCapabilities {
+    pub const fn completion(
+        &self,
+    ) -> &eredu_core::communication::CommunicationCompletionCapabilities {
         &self.completion
     }
 
@@ -835,7 +777,7 @@ pub struct RealtimeSelectionRequest {
     residency: LayerWeightResidency,
     state: CacheResidencyPolicy,
     architecture_proof: Option<RealtimeArchitectureProof>,
-    completion: crate::CommunicationCompletionPolicy,
+    completion: eredu_core::communication::CommunicationCompletionPolicy,
     observations: RealtimeObservationRequirements,
 }
 
@@ -860,7 +802,7 @@ impl RealtimeSelectionRequest {
         residency: LayerWeightResidency,
         state: CacheResidencyPolicy,
         architecture_proof: Option<RealtimeArchitectureProof>,
-        completion: crate::CommunicationCompletionPolicy,
+        completion: eredu_core::communication::CommunicationCompletionPolicy,
         observations: RealtimeObservationRequirements,
     ) -> Self {
         Self {
@@ -961,7 +903,7 @@ pub struct SelectedRealtimeRealization {
     state: SelectedRealtimeStateRealization,
     topology: ParallelTopology,
     rank: usize,
-    completion: crate::CommunicationCompletionPolicy,
+    completion: eredu_core::communication::CommunicationCompletionPolicy,
     observations: RealtimeObservationRequirements,
 }
 
@@ -1041,7 +983,7 @@ impl SelectedRealtimeRealization {
     }
 
     /// Returns the one selected bounded-wait and timeout disposition policy.
-    pub const fn completion(&self) -> crate::CommunicationCompletionPolicy {
+    pub const fn completion(&self) -> eredu_core::communication::CommunicationCompletionPolicy {
         self.completion
     }
 
@@ -1485,9 +1427,6 @@ pub fn select_and_prepare_realtime_realization<P, M, S, Q, G, E>(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeContractError {
-    /// Stable identities must contain non-whitespace text.
-    #[error("realtime identity must not be empty")]
-    EmptyIdentity,
     /// A realtime architecture must require generic mechanisms.
     #[error("realtime mechanism requirements must not be empty")]
     EmptyMechanismRequirements,
@@ -1580,8 +1519,9 @@ pub enum RealtimeContractError {
 mod tests {
     use std::{cell::Cell, convert::Infallible, num::NonZeroUsize, rc::Rc, time::Duration};
 
-    use crate::{RealtimeIngressContract, RealtimeScheduleDescriptor, TokenDomain};
+    use crate::{RealtimeIngressContract, RealtimeScheduleDescriptor};
     use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
+    use eredu_core::sampling::TokenDomain;
     use eredu_core::{
         cache::LayerCachePolicy, AttentionPolicy, CompletionCancellationMode, LayerSchedule,
         RealtimeFrameConvention, RealtimeSpeechConfig,
@@ -1693,16 +1633,16 @@ mod tests {
         ]
     }
 
-    fn completion_policy() -> crate::CommunicationCompletionPolicy {
-        crate::CommunicationCompletionPolicy::new(
+    fn completion_policy() -> eredu_core::communication::CommunicationCompletionPolicy {
+        eredu_core::communication::CommunicationCompletionPolicy::new(
             Duration::from_secs(1),
             CompletionCancellationMode::QuarantineUntilComplete,
         )
         .unwrap()
     }
 
-    fn completion_capabilities() -> crate::CommunicationCompletionCapabilities {
-        crate::CommunicationCompletionCapabilities::new([
+    fn completion_capabilities() -> eredu_core::communication::CommunicationCompletionCapabilities {
+        eredu_core::communication::CommunicationCompletionCapabilities::new([
             CompletionCancellationMode::QuarantineUntilComplete,
         ])
         .unwrap()
@@ -1905,8 +1845,8 @@ mod tests {
                 required_operators(),
                 required_mechanisms(),
                 [
-                    ExecutionResidency::FullyResident,
-                    ExecutionResidency::LayerwiseHost,
+                    crate::WeightResidencyMechanism::Resident,
+                    crate::WeightResidencyMechanism::Windowed,
                 ],
                 NonZeroUsize::new(2).unwrap(),
                 completion_capabilities(),
@@ -1919,7 +1859,7 @@ mod tests {
         fn supports_lowering(
             &self,
             _descriptor: &WeightLoweringDescriptor,
-            _kind: WeightLoweringKind,
+            _transforms_payload: bool,
         ) -> bool {
             self.lowering_queries.set(self.lowering_queries.get() + 1);
             self.supported
@@ -2061,7 +2001,7 @@ mod tests {
     fn identities_and_requirement_sets_are_exact_and_nonempty() {
         assert_eq!(
             RealtimeIdentity::new(" \t"),
-            Err(RealtimeContractError::EmptyIdentity)
+            Err(eredu_core::realtime_mechanisms::EmptyRealtimeIdentity)
         );
         let exact = RealtimeIdentity::new("  exact identity  ").unwrap();
         assert_eq!(exact.as_str(), "  exact identity  ");
@@ -2416,7 +2356,7 @@ mod tests {
             Vec::new(),
             StateMechanismCapabilities::new([]),
             NonZeroUsize::new(1).unwrap(),
-            crate::CommunicationCompletionCapabilities::new([
+            eredu_core::communication::CommunicationCompletionCapabilities::new([
                 CompletionCancellationMode::NativeCancel,
             ])
             .unwrap(),

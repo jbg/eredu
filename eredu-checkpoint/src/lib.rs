@@ -10,6 +10,8 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Filesystem-backed exact artifact fingerprinting.
 pub mod artifact;
+/// Exact SafeTensors conversion plans and physical tensor identities.
+pub mod checkpoint_conversion;
 /// Composite model-artifact and component schemas.
 pub mod composite;
 /// Backend-neutral logical GGUF storage and portable encoded leases.
@@ -19,6 +21,8 @@ pub mod fp8;
 /// Shard-layout-independent identity of exact GGUF metadata and encoded payloads.
 pub mod gguf_fingerprint;
 pub mod gguf_store;
+/// Physical and logical geometry for weight lowering.
+pub mod lowering;
 /// Neutral NVFP4 storage geometry and bounded selected-row decoding.
 pub mod nvfp4;
 /// Bounded persisted encoded prepared-checkpoint storage.

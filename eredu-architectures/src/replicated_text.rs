@@ -3,12 +3,8 @@
 pub mod artifact;
 mod lfm3_vl;
 use artifact::{safetensors_inspection_recipe_source, safetensors_parameters};
+use eredu_runtime::executable_binding::ReplicatedTextProfileDispatcher;
 pub use lfm3_vl::{lfm3_vl_requirements, Lfm3VlRequirements};
-mod profiles;
-pub use profiles::{
-    IdentityReplicatedTextVisitor, ReplicatedTextStateProfiles, ReplicatedTextVisitorConversion,
-    SharedReplicatedTextVisitor,
-};
 
 use crate::decoder::Config as _;
 
@@ -19,7 +15,6 @@ use std::{
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
 use eredu_core::{
-    cache::PromptCacheModelIdentity,
     checkpoint::{TensorCatalog, TensorDtype},
     ArtifactInspection, InputModalities, InputModality,
 };
@@ -756,103 +751,10 @@ pub enum ReplicatedTextIneligibility {
     Unrelated,
 }
 
-/// Checked architecture value passed across the architecture/backend boundary.
-pub struct PreparedReplicatedTextArchitecture<A> {
-    architecture: A,
-    source_architecture: Option<A>,
-    requirements: ReplicatedTextRequirements,
-    contract: eredu_runtime::PreparedReplicatedTextContract,
-    capability_estimate: crate::capability::CapabilityEstimate,
-    effective_model_type: String,
-}
-
-impl<A> PreparedReplicatedTextArchitecture<A> {
-    /// Returns the exact architecture and artifact requirements.
-    pub const fn requirements(&self) -> &ReplicatedTextRequirements {
-        &self.requirements
-    }
-
-    /// Returns the authoritative selected realization.
-    pub const fn selected(&self) -> &SelectedReplicatedTextRealization {
-        self.contract.selected()
-    }
-
-    /// Returns the architecture-derived identity for persistent prompt state.
-    pub const fn prompt_cache_identity(&self) -> &PromptCacheModelIdentity {
-        self.contract.prompt_cache_identity()
-    }
-
-    /// Returns the architecture capability estimate presented by the session.
-    pub const fn capability_estimate(&self) -> &crate::capability::CapabilityEstimate {
-        &self.capability_estimate
-    }
-
-    /// Returns the normalized model-type label presented by the session.
-    pub fn effective_model_type(&self) -> &str {
-        &self.effective_model_type
-    }
-
-    /// Consumes the handoff into opaque architecture module ownership.
-    pub fn into_modules(self) -> PreparedReplicatedTextModules<A> {
-        PreparedReplicatedTextModules {
-            architecture: Some(self.architecture),
-            source_architecture: self.source_architecture,
-            contract: Some(self.contract),
-        }
-    }
-}
-
-/// Opaque ownership of selected-format and optional source-format modules.
-pub struct PreparedReplicatedTextModules<A> {
-    architecture: Option<A>,
-    source_architecture: Option<A>,
-    contract: Option<eredu_runtime::PreparedReplicatedTextContract>,
-}
-
-impl<A> PreparedReplicatedTextModules<A> {
-    /// Takes the selected-format architecture exactly once.
-    pub fn take_architecture(&mut self) -> A {
-        self.architecture
-            .take()
-            .expect("prepared architecture was already taken")
-    }
-
-    /// Takes the source-format architecture used by a selected transform.
-    pub fn take_source_architecture(&mut self) -> Option<A> {
-        self.source_architecture.take()
-    }
-
-    /// Takes the validated neutral construction contract exactly once.
-    pub fn take_contract(&mut self) -> eredu_runtime::PreparedReplicatedTextContract {
-        self.contract
-            .take()
-            .expect("prepared construction contract was already taken")
-    }
-}
-
-/// Backend-generic visitor for one admitted replicated text architecture.
-pub trait ReplicatedTextArchitectureVisitor<B, S>: Sized
-where
-    B: NeuralBackend,
-    S: RuntimeState<B>,
-{
-    /// Visitor output.
-    type Output;
-    /// Backend binding failure.
-    type Error;
-    /// Records that validated dispatch is about to invoke architecture constructors.
-    fn construction_started(&mut self);
-    /// Binds one opaque selected-format-aware architecture to backend mechanisms.
-    fn visit<A>(
-        self,
-        prepared: PreparedReplicatedTextArchitecture<A>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
-}
+pub use eredu_runtime::executable_binding::{
+    PreparedReplicatedTextArchitecture, PreparedReplicatedTextModules,
+    ReplicatedTextArchitectureVisitor,
+};
 
 /// Failure before or during the checked architecture/backend handoff.
 #[derive(Debug, thiserror::Error)]
@@ -869,37 +771,20 @@ pub enum ReplicatedTextDispatchError<E> {
     Backend(E),
 }
 
-/// Family-blind backend visitor for an exact replicated prediction target.
-pub trait ReplicatedPredictionTargetVisitor<B, S, M>: Sized
-where
-    B: eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + eredu_nn::HyperNeuralBackend,
-    S: RuntimeState<B>,
-    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-{
-    /// Completed backend adapter.
-    type Output;
-    /// Backend binding failure.
-    type Error;
-
-    /// Receives an exact target only after its materialized extension was paired.
-    fn visit<A>(
-        self,
-        prepared: PreparedReplicatedTextArchitecture<A>,
-        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
-            M,
-        >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
-            + crate::prediction_extension::MaterializedPredictionTarget<B>
-            + 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
+fn routed_composite_dispatch_error<E: std::fmt::Display>(
+    error: eredu_runtime::executable_binding::PreparedExecutionError<E>,
+) -> ReplicatedTextDispatchError<E> {
+    use eredu_runtime::executable_binding::PreparedExecutionError;
+    match error {
+        PreparedExecutionError::Backend(error) => ReplicatedTextDispatchError::Backend(error),
+        PreparedExecutionError::Architecture(error) => {
+            ReplicatedTextDispatchError::Architecture(error)
+        }
+        error => ReplicatedTextDispatchError::Architecture(error.to_string()),
+    }
 }
+
+pub use eredu_runtime::executable_binding::ReplicatedPredictionTargetVisitor;
 
 /// Pairs one materialized extension with its exact replicated target before backend erasure.
 pub fn visit_replicated_prediction_target_architecture<B, S, M, A, V>(
@@ -909,7 +794,8 @@ pub fn visit_replicated_prediction_target_architecture<B, S, M, A, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
@@ -922,11 +808,22 @@ where
     A::Error: std::fmt::Display,
     V: ReplicatedPredictionTargetVisitor<B, S, M>,
 {
-    let extension = A::pair_prediction_extension(extension)
+    let mut extension = A::pair_prediction_extension(extension)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit(prepared, extension, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    let (mechanisms, weights) = visitor
+        .prediction_mechanisms::<A>(&mut extension, store)
+        .map_err(ReplicatedTextDispatchError::Backend)?;
+    let (session, facts) = eredu_runtime::executable_binding::construct_selected_text_session(
+        prepared,
+        mechanisms,
+        weights,
+        visitor.context(),
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::executable_binding::bind_local_replicated_prediction::<B, S, M, A, V>(
+        visitor, session, extension, facts,
+    )
+    .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -976,7 +873,7 @@ pub fn visit_replicated_text_extension_architecture<B, S, A, V>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
     A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
@@ -1003,9 +900,10 @@ where
         context,
     )
     .map_err(ReplicatedTextDispatchError::Architecture)?;
-    visitor
-        .visit(prepared, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+        visitor, prepared, store,
+    )
+    .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1042,14 +940,14 @@ where
             addressable_parameters,
             context,
         )?;
-    Ok(PreparedReplicatedTextArchitecture {
+    Ok(PreparedReplicatedTextArchitecture::new(
         architecture,
         source_architecture,
         requirements,
         contract,
         capability_estimate,
         effective_model_type,
-    })
+    ))
 }
 
 /// Constructs and visits the architecture using one authoritative realization.
@@ -1061,7 +959,7 @@ pub fn visit_replicated_text_architecture<B, S, V>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
@@ -1272,7 +1170,7 @@ fn visit_prepared_decoder<B, S, C, P, V>(
     store: eredu_checkpoint::store::SharedCheckpointSource,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     C: crate::decoder::Config + Clone,
     P: crate::decoder::BlockFactory<B, C>,
     S: LayerRuntimeState<B>,
@@ -1299,9 +1197,10 @@ where
         context,
     )
     .map_err(ReplicatedTextDispatchError::Architecture)?;
-    visitor
-        .visit(prepared, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+        visitor, prepared, store,
+    )
+    .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 /// Materializes the selected resource pair from retained declarations through one typed boundary.
@@ -1982,7 +1881,7 @@ fn visit_fixed_profile<B, S, V, P>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
     P: FixedProfile<B, S, Lfm3Replicated>
@@ -2048,9 +1947,10 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
+            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+                visitor, prepared, store,
+            )
+            .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Lfm3(declaration) => {
             let args = declaration.args();
@@ -2093,9 +1993,10 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
+            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+                visitor, prepared, store,
+            )
+            .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::NemotronH(declaration) => {
             let args = declaration.args();
@@ -2139,9 +2040,10 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
+            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+                visitor, prepared, store,
+            )
+            .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::QwenHybrid(args) => {
             visitor.construction_started();
@@ -2180,9 +2082,10 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
+            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+                visitor, prepared, store,
+            )
+            .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::KimiLinear(declaration) => {
             let args = declaration.args();
@@ -2230,9 +2133,10 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
+            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+                visitor, prepared, store,
+            )
+            .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Gemma2(_, _)
         | EligibleConfig::Llama(_, _)
@@ -2263,7 +2167,7 @@ pub fn visit_replicated_fixed_state_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
@@ -2280,7 +2184,7 @@ pub fn visit_replicated_attention_state_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
@@ -2297,7 +2201,7 @@ pub fn visit_replicated_component_state_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_runtime::RuntimeStateComponents<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
@@ -2314,7 +2218,7 @@ pub fn visit_replicated_stateless_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
@@ -2383,6 +2287,7 @@ fn visit_compressed_profile<B, S, V, P>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
@@ -2445,9 +2350,10 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            visitor
-                .visit(prepared, store)
-                .map_err(ReplicatedTextDispatchError::Backend)
+            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+                visitor, prepared, store,
+            )
+            .map_err(ReplicatedTextDispatchError::Backend)
         }};
     }
     match eligible {
@@ -2485,6 +2391,7 @@ pub fn visit_replicated_compressed_state_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState:
@@ -2505,6 +2412,7 @@ pub fn visit_replicated_compressed_only_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     B: eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::CompressedAttentionCache<B::Tensor>,
@@ -2513,107 +2421,6 @@ where
     visit_compressed_profile::<B, S, V, crate::replicated_model::CompressedState>(
         plan, selected, store, context, visitor,
     )
-}
-
-/// Supplies typed construction visitors while architecture dispatch selects the exact state profile.
-///
-/// Backends supporting only ordinary key/value text can continue implementing
-/// [`ReplicatedTextArchitectureVisitor`] and calling
-/// [`visit_replicated_text_architecture`]. A backend supporting every admitted
-/// replicated profile implements this additive dispatcher instead of matching
-/// semantic state kinds itself.
-pub trait ReplicatedTextProfileDispatcher<B>: Sized
-where
-    B: eredu_nn::BlockwiseAttentionBackend,
-{
-    /// Completed construction output.
-    type Output;
-    /// Mechanism binding failure.
-    type Error;
-    /// State representation used when no token state is retained.
-    type StatelessState: LayerRuntimeState<B>;
-    /// State representation used by ordinary key/value attention.
-    type AttentionState: LayerRuntimeState<B>;
-    /// State representation used by recurrent or convolutional components.
-    type ComponentState: LayerRuntimeState<B>;
-    /// State representation used by key/value attention with fixed components.
-    type AttentionComponentState: LayerRuntimeState<B>;
-    /// State exposing the combined attention, fixed and named-stream contract.
-    type AttentionStreamState: LayerRuntimeState<
-        B,
-        LayerState: AttentionCache<B::Tensor>
-                        + eredu_runtime::RuntimeStateComponents<B>
-                        + eredu_runtime::RuntimeAppendStreams<B>,
-    >;
-    /// Visitor preserving the concrete combined-state access bounds.
-    type AttentionStreamVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::AttentionStreamState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Consumes this adapter into its attention-with-streams visitor.
-    fn into_attention_stream_visitor(self) -> Self::AttentionStreamVisitor;
-    /// State representation used by compressed attention.
-    type CompressedState: LayerRuntimeState<B>;
-    /// State representation used by compressed attention with fixed components.
-    type CompressedComponentState: LayerRuntimeState<B>;
-
-    /// Visitor for a stateless architecture.
-    type StatelessVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::StatelessState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Visitor for an ordinary key/value architecture.
-    type AttentionVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::AttentionState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Visitor for a fixed-component architecture.
-    type ComponentVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::ComponentState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Visitor for key/value attention with fixed components.
-    type AttentionComponentVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::AttentionComponentState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Visitor for compressed attention.
-    type CompressedVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::CompressedState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-    /// Visitor for compressed attention with fixed components.
-    type CompressedComponentVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::CompressedComponentState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-
-    /// Consumes the adapter into its stateless visitor.
-    fn into_stateless_visitor(self) -> Self::StatelessVisitor;
-    /// Consumes the adapter into its ordinary attention visitor.
-    fn into_attention_visitor(self) -> Self::AttentionVisitor;
-    /// Consumes the adapter into its fixed-component visitor.
-    fn into_component_visitor(self) -> Self::ComponentVisitor;
-    /// Consumes the adapter into its attention-with-components visitor.
-    fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor;
-    /// Consumes the adapter into its compressed-attention visitor.
-    fn into_compressed_visitor(self) -> Self::CompressedVisitor;
-    /// Consumes the adapter into its compressed-attention-with-components visitor.
-    fn into_compressed_component_visitor(self) -> Self::CompressedComponentVisitor;
 }
 
 /// Dispatches an ordinary key/value selection without requiring unrelated backend mechanisms.
@@ -2625,7 +2432,7 @@ pub(crate) fn dispatch_replicated_key_value_text_architecture<B, S, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: NeuralBackend,
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
@@ -2661,6 +2468,7 @@ fn visit_replicated_block_refinement_architecture<B, S, V>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
@@ -2732,9 +2540,10 @@ where
             context,
         )
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-        return visitor
-            .visit(prepared, store)
-            .map_err(ReplicatedTextDispatchError::Backend);
+        return eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+            visitor, prepared, store,
+        )
+        .map_err(ReplicatedTextDispatchError::Backend);
     }
     let config = match (plan.safetensors_architecture(), plan.gguf_plan()) {
         (Some(plan), None) => match plan.model() {
@@ -2796,9 +2605,10 @@ where
         context,
     )
     .map_err(ReplicatedTextDispatchError::Architecture)?;
-    visitor
-        .visit(prepared, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
+        visitor, prepared, store,
+    )
+    .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 /// Dispatches one selected replicated-text architecture through its exact typed state profile.
@@ -2810,6 +2620,7 @@ pub fn dispatch_replicated_text_architecture<B, D>(
     dispatcher: D,
 ) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
 where
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     B: eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend,
@@ -2915,33 +2726,7 @@ where
     }
 }
 
-/// Supplies prediction-aware visitors while architecture dispatch selects a replicated state profile.
-pub trait ReplicatedPredictionProfileDispatcher<B, M>: Sized
-where
-    B: eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + eredu_nn::HyperNeuralBackend,
-    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-{
-    /// Completed construction output.
-    type Output;
-    /// Mechanism binding failure.
-    type Error;
-    /// State representation selected for the target.
-    type State: LayerRuntimeState<B>;
-    /// Exact prediction-aware visitor for that representation.
-    type Visitor: ReplicatedPredictionTargetVisitor<
-        B,
-        Self::State,
-        M,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
-
-    /// Consumes the adapter into its exact typed visitor.
-    fn into_visitor(self) -> Self::Visitor;
-}
+pub use eredu_runtime::executable_binding::ReplicatedPredictionProfileDispatcher;
 
 /// Constructs a replicated prediction target and pairs its extension before backend erasure.
 pub fn dispatch_replicated_prediction_target_architecture<B, M, D>(
@@ -2953,7 +2738,8 @@ pub fn dispatch_replicated_prediction_target_architecture<B, M, D>(
     dispatcher: D,
 ) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
@@ -3289,7 +3075,7 @@ impl EligibleConfig<'_> {
                         eredu_runtime::BoundaryTensorSpec::new(
                             format!("deepstack.{index}"),
                             [Dim::Batch, Dim::Sequence, Dim::Fixed(args.text.hidden_size)],
-                            eredu_runtime::BoundaryTensorDtype::Activation,
+                            eredu_core::communication::BoundaryTensorDtype::Activation,
                         )
                     }),
                 )
@@ -6941,17 +6727,13 @@ pub fn select_composite_text_realization_with_processor(
     .retain_executable_component(requirements.inspection())
 }
 
-/// Checked composite architecture passed to a backend-generic session constructor.
-pub struct PreparedCompositeTextArchitecture<A, C> {
-    architecture: A,
-    source_architecture: Option<A>,
-    requirements: CompositeTextRequirements,
-    contract: eredu_runtime::PreparedReplicatedTextContract,
-    processor: eredu_runtime::SelectedProcessorExecution,
-    admission: C,
-    capability_estimate: crate::capability::CapabilityEstimate,
-    effective_model_type: String,
-}
+/// Checked composite architecture with the exact retained requirements.
+pub type PreparedCompositeTextArchitecture<A, C> =
+    eredu_runtime::executable_binding::PreparedCompositeTextArchitecture<
+        A,
+        C,
+        CompositeTextRequirements,
+    >;
 
 /// Source-independent requirements retained by a prepared routed composite.
 /// Artifact inspection remains with cold admission and typed dispatch, rather
@@ -6972,278 +6754,52 @@ impl RoutedCompositeRequirements {
     }
 }
 
-/// Checked composite architecture whose target decoder uses grouped providers.
-pub struct PreparedRoutedCompositeTextArchitecture<A, C> {
-    routed: crate::PreparedRoutedTextArchitecture<A>,
-    requirements: RoutedCompositeRequirements,
-    processor: eredu_runtime::SelectedProcessorExecution,
-    admission: C,
-    capability_estimate: crate::capability::CapabilityEstimate,
-    effective_model_type: String,
-}
-
-impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
-    /// Pairs already checked modules with their exact retained composite policy.
-    /// The selected authority is supplied explicitly so every bank, row provider,
-    /// state and materialization choice must agree before a visitor receives it.
-    pub(crate) fn from_routed_declared(
-        routed: crate::PreparedRoutedTextArchitecture<A>,
-        requirements: crate::RoutedTextRequirements,
-        selected: &crate::SelectedRoutedTextRealization,
-        processor: eredu_runtime::SelectedProcessorExecution,
-        processor_requirements: eredu_runtime::ProcessorExecutionRequirements,
-        admission: C,
-    ) -> Result<Self, String> {
-        crate::routed_text::validate_selected_routed_handoff(&requirements, selected)
-            .map_err(|error| error.to_string())?;
-        if processor.requirements() != &processor_requirements {
-            return Err("selected composite processor differs from exact requirements".into());
-        }
-        if routed.text().selected() != selected.text()
-            || routed.bank_residency() != selected.bank_residency()
-            || routed.banks() != selected.banks()
-            || routed.row_lookups().map(|rows| rows.plan()) != selected.row_lookups()
-        {
-            return Err("prepared composite modules differ from selected execution".into());
-        }
-        let capability_estimate = routed.text().capability_estimate().clone();
-        let effective_model_type = routed.text().effective_model_type().to_owned();
-        Ok(Self {
-            routed,
-            requirements: RoutedCompositeRequirements {
-                execution: requirements,
-                processor: processor_requirements,
-            },
-            processor,
-            admission,
-            capability_estimate,
-            effective_model_type,
-        })
-    }
-
-    /// Exact architecture, artifact, processor, and grouped-bank requirements.
-    pub const fn requirements(&self) -> &RoutedCompositeRequirements {
-        &self.requirements
-    }
-
-    /// Authoritative processor mechanism selection.
-    pub const fn processor(&self) -> &eredu_runtime::SelectedProcessorExecution {
-        &self.processor
-    }
-
-    /// Selected routed text, state, weight, and bank realization.
-    pub const fn routed(&self) -> &crate::PreparedRoutedTextArchitecture<A> {
-        &self.routed
-    }
-
-    /// Architecture capability estimate presented by the shared session.
-    pub const fn capability_estimate(&self) -> &crate::capability::CapabilityEstimate {
-        &self.capability_estimate
-    }
-
-    /// Normalized model-type label presented by the shared session.
-    pub fn effective_model_type(&self) -> &str {
-        &self.effective_model_type
-    }
-
-    /// Consumes the handoff into routed session-construction inputs.
-    pub fn into_parts(
-        self,
-    ) -> (
-        crate::PreparedRoutedTextArchitecture<A>,
-        eredu_runtime::SelectedProcessorExecution,
-        C,
-    ) {
-        (self.routed, self.processor, self.admission)
-    }
-}
-
-impl<A, C> PreparedCompositeTextArchitecture<A, C> {
-    /// Exact architecture, artifact, and processor requirements.
-    pub const fn requirements(&self) -> &CompositeTextRequirements {
-        &self.requirements
-    }
-
-    /// Authoritative processor mechanism selection.
-    pub const fn processor(&self) -> &eredu_runtime::SelectedProcessorExecution {
-        &self.processor
-    }
-
-    /// Architecture-derived identity coupled to the shared text session.
-    pub const fn prompt_cache_identity(&self) -> &PromptCacheModelIdentity {
-        self.contract.prompt_cache_identity()
-    }
-
-    /// Exact selected text execution realization.
-    pub const fn selected(&self) -> &SelectedReplicatedTextRealization {
-        self.contract.selected()
-    }
-
-    /// Architecture capability estimate presented by the shared session.
-    pub const fn capability_estimate(&self) -> &crate::capability::CapabilityEstimate {
-        &self.capability_estimate
-    }
-
-    /// Normalized model-type label presented by the shared session.
-    pub fn effective_model_type(&self) -> &str {
-        &self.effective_model_type
-    }
-
-    /// Consumes the handoff into generic session-construction inputs.
-    pub fn into_parts(
-        self,
-    ) -> (
+/// Checked composite modules and ingress policy with exact routed bank plans.
+pub type PreparedRoutedCompositeTextArchitecture<A, C> =
+    eredu_runtime::executable_binding::routed_session::PreparedRoutedCompositeTextArchitecture<
         A,
-        Option<A>,
-        eredu_runtime::PreparedReplicatedTextContract,
-        eredu_runtime::SelectedProcessorExecution,
         C,
-    ) {
-        (
-            self.architecture,
-            self.source_architecture,
-            self.contract,
-            self.processor,
-            self.admission,
-        )
+        crate::routed_text::SelectedRoutedBank,
+        RoutedCompositeRequirements,
+    >;
+
+/// Pairs already checked modules with their exact retained composite policy.
+/// The selected authority is supplied explicitly so every bank, row provider,
+/// state and materialization choice must agree before a visitor receives it.
+pub(crate) fn prepare_routed_composite_handoff<A, C>(
+    routed: crate::PreparedRoutedTextArchitecture<A>,
+    requirements: crate::RoutedTextRequirements,
+    selected: &crate::SelectedRoutedTextRealization,
+    processor: eredu_runtime::SelectedProcessorExecution,
+    processor_requirements: eredu_runtime::ProcessorExecutionRequirements,
+    admission: C,
+) -> Result<PreparedRoutedCompositeTextArchitecture<A, C>, String> {
+    crate::routed_text::validate_selected_routed_handoff(&requirements, selected)
+        .map_err(|error| error.to_string())?;
+    if processor.requirements() != &processor_requirements {
+        return Err("selected composite processor differs from exact requirements".into());
     }
-}
-
-/// Backend-generic visitor over one exact replicated composite architecture.
-pub trait CompositeTextArchitectureVisitor<B, S>: Sized
-where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
-    S: LayerRuntimeState<B>,
-{
-    /// Completed backend adapter.
-    type Output;
-    /// Backend binding failure.
-    type Error;
-
-    /// Records that validated dispatch is about to construct architecture modules.
-    fn construction_started(&mut self);
-
-    /// Binds a routed composite target and its independently prepared predictor.
-    /// Native adaptation retains processor policy and uses the shared speculative driver.
-    fn visit_prediction<A, W>(
-        self,
-        _prepared: PreparedRoutedCompositeTextArchitecture<
-            A,
-            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
-        >,
-        _prediction: W,
-        _target_source: eredu_checkpoint::store::SharedCheckpointSource,
-        _provider_source: eredu_checkpoint::store::SharedCheckpointSource,
-        _binding: crate::prepared_execution::PredictionBinding,
-    ) -> Result<Self::Output, crate::prepared_execution::PreparedExecutionError<Self::Error>>
-    where
-        B: eredu_nn::BlockwiseAttentionBackend + eredu_nn::HyperNeuralBackend,
-        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A::InputPartPlan: 'static,
-        A::StaticModules: Clone,
-        W: crate::prediction_extension::PreparedRoutedPrediction<B, A>,
+    if routed.text().selected() != selected.text()
+        || routed.bank_residency() != selected.bank_residency()
+        || routed.banks() != selected.banks()
+        || routed.row_lookups().map(|rows| rows.plan()) != selected.row_lookups()
     {
-        Err(crate::prepared_execution::PreparedExecutionError::UnavailablePrediction)
+        return Err("prepared composite modules differ from selected execution".into());
     }
-
-    /// Binds one statically known composite architecture to generic mechanisms.
-    fn visit<A>(
-        self,
-        prepared: PreparedCompositeTextArchitecture<
-            A,
-            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
-        >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A::InputPartPlan: 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
-
-    /// Binds one routed composite architecture to the existing planned provider.
-    fn visit_routed<A>(
-        self,
-        prepared: PreparedRoutedCompositeTextArchitecture<
-            A,
-            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
-        >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A::InputPartPlan: 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
+    Ok(PreparedRoutedCompositeTextArchitecture::new(
+        routed,
+        RoutedCompositeRequirements {
+            execution: requirements,
+            processor: processor_requirements,
+        },
+        processor,
+        admission,
+    ))
 }
 
-/// Family-blind backend visitor for an exact composite prediction target.
-pub trait CompositePredictionTargetVisitor<B, S, M>: Sized
-where
-    B: eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::TensorParallelGroupedNeuralBackend
-        + eredu_nn::HyperNeuralBackend
-        + Clone,
-    S: LayerRuntimeState<B>,
-    M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-{
-    /// Completed backend adapter.
-    type Output;
-    /// Backend binding failure.
-    type Error;
-
-    /// Records that validated dispatch is about to construct architecture modules.
-    fn construction_started(&mut self) {}
-
-    /// Receives a direct composite target after exact extension pairing.
-    fn visit<A>(
-        self,
-        prepared: PreparedCompositeTextArchitecture<
-            A,
-            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
-        >,
-        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
-            M,
-        >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A: crate::prediction_extension::MaterializedPredictionTarget<B>,
-        A::InputPartPlan: 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
-
-    /// Receives a routed composite target after exact extension pairing.
-    fn visit_routed<A>(
-        self,
-        prepared: PreparedRoutedCompositeTextArchitecture<
-            A,
-            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
-        >,
-        extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
-            M,
-        >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
-            + eredu_runtime::RoutedLayeredArchitecture<B, S>
-            + 'static,
-        A: crate::prediction_extension::MaterializedPredictionTarget<B>,
-        A::InputPartPlan: 'static,
-        A::StaticModules: Clone,
-        A::Error: std::fmt::Display;
-}
+pub use eredu_runtime::executable_binding::routed_session::{
+    CompositePredictionTargetVisitor, CompositeTextArchitectureVisitor,
+};
 
 /// Pairs one materialized extension with an exact direct composite target.
 pub fn visit_composite_prediction_target_architecture<B, S, M, A, V>(
@@ -7256,7 +6812,9 @@ pub fn visit_composite_prediction_target_architecture<B, S, M, A, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend
@@ -7270,16 +6828,42 @@ where
     A::InputPartPlan: 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
-    V: CompositePredictionTargetVisitor<B, S, M>,
+    V: CompositePredictionTargetVisitor<
+        B,
+        S,
+        M,
+        crate::SelectedRoutedBank,
+        crate::replicated_text::CompositeTextRequirements,
+        crate::replicated_text::RoutedCompositeRequirements,
+    >,
 {
     type Target<A> = A;
-    let extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
+    let mut extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
         B,
     >>::pair_prediction_extension(extension)
     .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit(prepared, extension, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    let mechanisms = visitor.session_mechanisms(store);
+    let weights = visitor
+        .prediction_weight_options::<A>(&mut extension)
+        .map_err(ReplicatedTextDispatchError::Backend)?;
+    let (session, facts) = eredu_runtime::executable_binding::construct_selected_composite_session(
+        prepared,
+        mechanisms,
+        weights,
+        visitor.session_context(),
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    eredu_runtime::executable_binding::routed_session::bind_local_composite_prediction::<
+        B,
+        S,
+        M,
+        crate::SelectedRoutedBank,
+        CompositeTextRequirements,
+        RoutedCompositeRequirements,
+        A,
+        V,
+    >(visitor, session, extension, facts)
+    .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 /// Pairs one materialized extension with an exact routed composite target.
@@ -7293,7 +6877,9 @@ pub fn visit_routed_composite_prediction_target_architecture<B, S, M, A, V>(
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend
@@ -7307,16 +6893,44 @@ where
     A::InputPartPlan: 'static,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
-    V: CompositePredictionTargetVisitor<B, S, M>,
+    V: CompositePredictionTargetVisitor<
+        B,
+        S,
+        M,
+        crate::SelectedRoutedBank,
+        crate::replicated_text::CompositeTextRequirements,
+        crate::replicated_text::RoutedCompositeRequirements,
+    >,
 {
     type Target<A> = A;
-    let extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
+    let mut extension = <Target<A> as crate::prediction_extension::MaterializedPredictionTarget<
         B,
     >>::pair_prediction_extension(extension)
     .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    visitor
-        .visit_routed(prepared, extension, store)
-        .map_err(ReplicatedTextDispatchError::Backend)
+    let mechanisms = visitor.session_mechanisms(store.clone());
+    let weights = visitor
+        .prediction_weight_options::<A>(&mut extension)
+        .map_err(ReplicatedTextDispatchError::Backend)?;
+    let (session, facts) =
+        eredu_runtime::executable_binding::routed_session::construct_selected_routed_composite_session(
+            &visitor, prepared, mechanisms, weights, store, &[],
+        )
+        .map_err(routed_composite_dispatch_error)?;
+    use eredu_runtime::executable_binding::routed_session::{
+        bind_routed_composite, install_routed_prediction,
+    };
+    let executable = bind_routed_composite(&visitor, session, facts);
+    let executable = install_routed_prediction::<B, A, crate::SelectedRoutedBank, _, V, _, M, _>(
+        executable,
+        extension,
+        visitor.into_prediction_binding(),
+    )
+    .map_err(|error| ReplicatedTextDispatchError::Backend(error.into()))?;
+    Ok(eredu_runtime::executable_binding::install_text_route::<
+        V::BoundCompositeRoutedPrediction<A>,
+        _,
+        _,
+    >(executable))
 }
 
 pub(crate) enum CompositeConfig<'a> {
@@ -8135,7 +7749,7 @@ where
         },
         context,
     )?;
-    Ok(PreparedCompositeTextArchitecture {
+    Ok(PreparedCompositeTextArchitecture::new(
         architecture,
         source_architecture,
         requirements,
@@ -8144,7 +7758,7 @@ where
         admission,
         capability_estimate,
         effective_model_type,
-    })
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8193,7 +7807,7 @@ where
         prompt_cache_architecture_identity,
         context,
     )?;
-    PreparedRoutedCompositeTextArchitecture::from_routed_declared(
+    prepare_routed_composite_handoff(
         routed,
         routed_requirements,
         &selected,
@@ -8212,12 +7826,22 @@ pub fn visit_composite_text_architecture<B, S, V>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + Clone,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
-    V: CompositeTextArchitectureVisitor<B, S>,
+    V: CompositeTextArchitectureVisitor<
+        B,
+        S,
+        crate::SelectedRoutedBank,
+        crate::replicated_text::CompositeTextRequirements,
+        crate::replicated_text::RoutedCompositeRequirements,
+    >,
 {
     eredu_runtime::validate_checkpoint_handoff(
         requirements.execution(),
@@ -8280,12 +7904,22 @@ struct CompositeTextConstruction<'a, B: eredu_nn::NeuralBackend, S, V> {
 
 impl<B, S, V> CompositeTextConstruction<'_, B, S, V>
 where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + Clone,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
-    V: CompositeTextArchitectureVisitor<B, S>,
+    V: CompositeTextArchitectureVisitor<
+        B,
+        S,
+        crate::SelectedRoutedBank,
+        crate::replicated_text::CompositeTextRequirements,
+        crate::replicated_text::RoutedCompositeRequirements,
+    >,
 {
     #[inline(never)]
     fn visit<A>(
@@ -8318,9 +7952,24 @@ where
                     self.context,
                 )
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
-                self.visitor
-                    .visit(prepared, self.store)
-                    .map_err(ReplicatedTextDispatchError::Backend)
+                let mechanisms = self.visitor.session_mechanisms(self.store);
+                let (session, facts) =
+                    eredu_runtime::executable_binding::construct_selected_composite_session(
+                        prepared,
+                        mechanisms,
+                        Default::default(),
+                        self.visitor.session_context(),
+                    )
+                    .map_err(ReplicatedTextDispatchError::Architecture)?;
+                Ok(eredu_runtime::executable_binding::install_text_route::<
+                    V::BoundComposite<A>,
+                    _,
+                    _,
+                >(facts.bind(
+                    session,
+                    self.visitor.local_resources(),
+                    true,
+                )))
             }
             SelectedCompositeTextRealization::Routed {
                 execution,
@@ -8338,9 +7987,23 @@ where
                     self.context,
                 )
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
-                self.visitor
-                    .visit_routed(prepared, self.store)
-                    .map_err(ReplicatedTextDispatchError::Backend)
+                let mechanisms = self.visitor.session_mechanisms(self.store.clone());
+                let (session, facts) =
+                    eredu_runtime::executable_binding::routed_session::construct_selected_routed_composite_session(
+                        &self.visitor, prepared, mechanisms, Default::default(), self.store, &[],
+                    )
+                    .map_err(routed_composite_dispatch_error)?;
+                let executable =
+                    eredu_runtime::executable_binding::routed_session::bind_routed_composite(
+                        &self.visitor,
+                        session,
+                        facts,
+                    );
+                Ok(eredu_runtime::executable_binding::install_text_route::<
+                    V::BoundCompositeRouted<A>,
+                    _,
+                    _,
+                >(executable))
             }
         }
     }
@@ -8720,7 +8383,9 @@ pub fn visit_composite_prediction_target_text_architecture<B, S, M, V>(
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend
+    B: eredu_core::SubmissionBackend<
+            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+        > + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend
@@ -8730,7 +8395,14 @@ where
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
-    V: CompositePredictionTargetVisitor<B, S, M>,
+    V: CompositePredictionTargetVisitor<
+        B,
+        S,
+        M,
+        crate::SelectedRoutedBank,
+        crate::replicated_text::CompositeTextRequirements,
+        crate::replicated_text::RoutedCompositeRequirements,
+    >,
 {
     eredu_runtime::validate_checkpoint_handoff(
         requirements.execution(),

@@ -36,7 +36,7 @@ impl PartitionCaptureTransport for HookTransport {
     fn capture_rank(&self) -> usize {
         self.transport.capture_rank()
     }
-    fn capture_wait(&self) -> Result<BoundedCompletionWait, CaptureError> {
+    fn capture_wait(&self) -> Option<BoundedCompletionWait> {
         self.transport.capture_wait()
     }
     fn ensure_capture_active(&self) -> Result<(), BackendFailure> {
@@ -45,8 +45,8 @@ impl PartitionCaptureTransport for HookTransport {
     fn estimate_capture_gather(&self, words: usize) -> Result<CaptureUsage, CaptureError> {
         self.transport.estimate_capture_gather(words)
     }
-    fn fail_capture_exchange(&self, error: &PartitionCaptureExchangeError) {
-        self.transport.fail_capture_exchange(error)
+    fn fence_capture_exchange(&self) {
+        self.transport.fence_capture_exchange()
     }
 }
 impl PartitionCaptureHookTransport for HookTransport {

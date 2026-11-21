@@ -7,10 +7,34 @@ use eredu_core::{
     SpeculativeGenerationVisitor, SpeculativePublisher, SpeculativeSampling,
 };
 
+mod batch;
+pub use batch::{
+    prepare_speculative_batch_lanes, run_speculative_batch, validate_lane_proposal_capacity,
+    SpeculativeBatchLane,
+};
+mod capture;
+mod sampling;
+pub use sampling::{InstalledSpeculativeSampling, SamplingContext};
 mod control;
+mod external_capture;
+mod external_state;
+pub use capture::{
+    speculative_capture_scope, EmbeddedPredictionObservers, SpeculativeActivationExecution,
+    EMBEDDED_PREDICTION_OUTPUT_PATH, EMBEDDED_PROPOSAL_LOGITS_PATH, EMBEDDED_TARGET_CAPTURE_PATH,
+    EMBEDDED_VERIFICATION_LOGITS_PATH,
+};
 pub use control::*;
+pub use external_capture::{
+    ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
+    ExternalPredictionTargetOperation, ExternalPredictionTargetOperationKind,
+};
+pub use external_state::{
+    ExternalAssistantCache, ExternalAssistantCacheCheckpoint, ExternalAssistantObservers,
+};
 mod causal_verification;
 pub use causal_verification::CausalVerification;
+mod execution_context;
+pub use execution_context::SpeculativeExecutionContext;
 pub mod autoregressive;
 pub mod shared_backbone;
 
@@ -266,3 +290,60 @@ fn completed_output<S, E: std::error::Error + 'static>(
         completed.take_scheduler(),
     ))
 }
+
+mod assistant_policy;
+pub use assistant_policy::AssistantParameterPolicy;
+mod assistant_mechanisms;
+pub use assistant_mechanisms::{
+    bind_external_assistant, external_assistant_conversion_retention,
+    external_assistant_input_identity, trim_external_assistant_conversions,
+    BoundAssistantRefVisitor, BoundAssistantVisitor, ExternalAssistantConstruction,
+    ExternalAssistantExecutionMechanisms, ExternalAssistantExecutorVisitor, ExternalAssistantModel,
+    ExternalAssistantPrompt, ExternalAssistantTarget, ExternalAssistantTensorPlacement,
+    ExternalAssistantTransfer, InstalledAssistantFor, InstalledExternalAssistant,
+    PreparedAssistantBinding, SelectedAssistantExecutionVisitor, SelectedAssistantExecutor,
+};
+mod embedded_execution;
+pub use embedded_execution::{
+    validate_prediction_output, EmbeddedPredictionCache, EmbeddedPredictionCacheAccessError,
+    EmbeddedPredictionCacheError, EmbeddedPredictionCacheFactory, EmbeddedPredictionCheckpoint,
+    EmbeddedPredictionDraftCache, EmbeddedPredictionDraftState, EmbeddedPredictionExecutor,
+    EmbeddedPredictionStrategy, EmbeddedPredictionTargetState,
+};
+pub(crate) mod embedded_mechanisms;
+mod target_state;
+pub use embedded_mechanisms::{
+    EmbeddedPredictionOutput, ReplicatedPredictionInput, ReplicatedPredictionNative,
+    SpeculativeTensorMechanisms,
+};
+pub use target_state::{PortablePredictionTargetState, PredictionTargetLifecycle};
+mod prediction_binding;
+pub(crate) use prediction_binding::with_prediction_module;
+pub use prediction_binding::{
+    materialize_prediction_module, materialize_prediction_units, prepare_prediction_residency,
+    PredictionExtensionMaterializer, PredictionInvocation, PredictionModule,
+    PredictionModuleResidency, PredictionModuleRole, PredictionModuleVisitor,
+    PredictionOperationInvoker, PredictionPoolingState, PredictionResidency,
+    PredictionResidencyDriver, PreparedPredictionUnit, SequentialPredictionCache,
+};
+mod prediction_executor;
+pub use prediction_executor::{
+    validate_selected_capture_shapes, MaterializedPredictionExecutor, ModelPredictionStateProfile,
+    PoolingPredictionStateProfile, PredictionKernel, PredictionStateLifecycle, PredictionTarget,
+    SequentialPredictionStateProfile,
+};
+mod replicated_prediction;
+pub use replicated_prediction::ReplicatedMaterializedPredictionStrategy;
+mod routed_preparation;
+pub use routed_preparation::{PredictionConstructionError, PreparedRoutedPrediction};
+mod installed_draft;
+pub use installed_draft::InstalledDraftSession;
+mod prepared_external;
+pub use prepared_external::{
+    AssistantDispatch, BoundAssistant, BoundAssistantDispatch, ExternalDraftExecution,
+    IndependentDraftModel, InstalledExternalDraft, PreparedAssistantExecution,
+    PreparedAutoregressiveDraft, PreparedExternalDraft, TypedAssistant,
+};
+
+mod target_operation;
+pub use target_operation::{ExternalTargetPlacements, PreparedExternalTargetOperation};

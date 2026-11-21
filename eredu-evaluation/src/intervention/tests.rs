@@ -87,6 +87,7 @@ impl CaptureBackend for Host {
         _: &Value,
         _: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _: Option<u64>,
     ) -> Result<CapturePayload> {
         Err(Error::other(
             "capture transform not used by primitive conformance",

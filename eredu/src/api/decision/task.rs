@@ -1,15 +1,8 @@
 use std::path::Path;
 
 use anyhow::{ensure, Result};
-use eredu_architectures::{
-    decision_task::{DecisionInput, DecisionMedia, PreparedDecisionModel},
-    processor_plan::ArtifactArchitecturePlan,
-    ExternalDraftPreparation,
-};
-use eredu_core::{
-    ExecutionPlan, Media, ModelConfigurationResolver, ModelLoadingBackend, TextGenerationBackend,
-    WeightTransformationPlan,
-};
+use eredu_architectures::decision_task::{DecisionInput, DecisionMedia, PreparedDecisionModel};
+use eredu_core::{ExecutionPlan, Media, ModelLoadingBackend, WeightTransformationPlan};
 use eredu_runtime::{execution_plan_layer_residency, ResidencyDiagnostics};
 
 use super::*;
@@ -25,10 +18,20 @@ pub fn evaluate_decisions<F>(
     on_loaded: Option<&mut dyn FnMut()>,
 ) -> Result<DecisionResponse>
 where
-    F: DecisionBackendFactory<DrafterPreparation = ExternalDraftPreparation>,
-    F::Backend: TextGenerationBackend + ModelLoadingBackend,
-    <F::Backend as ModelLoadingBackend>::ConfigurationResolver:
-        ModelConfigurationResolver<ArtifactPlan = ArtifactArchitecturePlan>,
+    F: DecisionBackendFactory<
+        DraftFacts: eredu_core::ExecutionPlanDraftAdmission<
+            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+            F::Backend,
+            Inspection = eredu_architectures::ExternalDraftPreparation,
+        >,
+    >,
+    F::Backend: ModelLoadingBackend
+        + crate::api::TextSessionComposition<
+            Model = crate::runtime::model_loading::PreparedTextProduct<
+                F::Backend,
+                F::SourcePreparation,
+            >,
+        >,
 {
     request.validate()?;
     let media = DecisionMedia {
@@ -127,7 +130,8 @@ where
         assets.is_none(),
         "decision sidecars require a native decision artifact"
     );
-    let mut loaded = crate::api::LoadedModel::load_execution_plan(factory, path, plan)?;
+    let mut loaded =
+        crate::api::LoadedModel::load_execution_plan(factory, path, plan, Default::default())?;
     if let Some(callback) = on_loaded {
         loaded.model_mut().synchronize()?;
         callback();

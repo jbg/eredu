@@ -1,9 +1,7 @@
 //! Independent host publication copies for bounded session snapshots.
 
 use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
-use eredu_runtime::execution_control::{
-    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
-};
+use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotRetention, SnapshotValue};
 
 use super::{OwnedHostOutput, OwnedSpeechChunk, TranscriptionOutput};
 
@@ -12,7 +10,7 @@ impl SnapshotValue for OwnedSpeechChunk {
         snapshot_value_estimate::<Self>([self.samples.estimate_snapshot_value()])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             samples: self.samples.copy_snapshot_value(retention)?,
             sample_rate: self.sample_rate,
@@ -28,7 +26,7 @@ impl SnapshotValue for TranscriptionOutput {
         snapshot_value_estimate::<Self>([self.emitted.estimate_snapshot_value()])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             frame_index: self.frame_index,
             sample_rate: self.sample_rate,
@@ -53,7 +51,7 @@ impl<D: SnapshotValue> SnapshotValue for OwnedHostOutput<D> {
         ])
     }
 
-    fn copy_snapshot_value(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+    fn copy_snapshot_value(&self, retention: &SnapshotRetention) -> Result<Self, BackendFailure> {
         Ok(Self {
             invocation_index: self.invocation_index,
             step: self.step,

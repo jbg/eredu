@@ -2,8 +2,7 @@
 
 //! Small C ABI used by the Eredu iOS example.
 
-use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
-use eredu_core::TokenOutput as _;
+use eredu_backend_mlx::MlxBackendFactory;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::PathBuf,
@@ -82,12 +81,16 @@ fn publish_error(out: *mut *mut c_char, message: String) {
     unsafe { *out = message.into_raw() };
 }
 
-fn generate(
-    model: &mut LoadedModel<MlxBackend<'_>>,
+fn generate<B, S>(
+    model: &mut LoadedModel<B, S>,
     prompt: &str,
     callback: TextCallback,
     context: usize,
-) -> Result<GenerationStats, String> {
+) -> Result<GenerationStats, String>
+where
+    B: eredu_core::TextGenerationBackend,
+    S: eredu_core::TextExecutionSession<B> + eredu_core::AutomaticPromptCacheSession<B>,
+{
     let started = Instant::now();
     let rendered = model
         .prepare_chat(ChatTemplateRequest {
@@ -160,14 +163,16 @@ fn worker_main(
     let initialized = (|| {
         eredu_backend_mlx::set_accelerator_library_path(metallib_path)
             .map_err(|error| error.to_string())?;
-        eredu_backend_mlx::initialize_allocator_cache_policy(false)
-            .map_err(|error| error.to_string())?;
         let plan = ExecutionPlan::fully_resident(
             eredu_core::DevicePlan::new("mlx", "metal:0").map_err(|error| error.to_string())?,
         );
-        let planned =
-            LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &model_path, &plan)
-                .map_err(|error| error.to_string())?;
+        let planned = LoadedModel::load_execution_plan(
+            &MlxBackendFactory::default(),
+            &model_path,
+            &plan,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
         let (mut model, _) = planned.into_parts();
         model.synchronize().map_err(|error| error.to_string())?;
         ready

@@ -1,6 +1,7 @@
 //! Architecture inspection and facade forecast parity with cold mock facts.
 use eredu::api::*;
 use eredu_architectures::PreparationMechanismProvider;
+use eredu_core::communication::CommunicationCapabilities;
 use eredu_core::{
     MediaFeatureAvailability, ModelConfigurationResolver, PreparationMechanismCapabilities,
     SessionCapabilities,
@@ -10,7 +11,7 @@ use std::collections::BTreeMap;
 
 struct Mechanisms;
 impl ReplicatedTextMechanismSupport for Mechanisms {
-    fn facts(&self, _: &CacheResidencyPolicy) -> BackendMechanismFacts {
+    fn facts(&self, _: StateComponentPlacement) -> BackendMechanismFacts {
         BackendMechanismFacts::new(
             eredu_nn::NeuralOperatorCapabilities::ALL,
             [
@@ -43,7 +44,7 @@ impl ReplicatedTextMechanismSupport for Mechanisms {
     }
     fn supports_state_component(
         &self,
-        _: &eredu_core::cache::StateComponentPolicy,
+        _: &[eredu_core::cache::StateTensorDimension],
         _: StateStorageDtype,
         _: StateComponentPlacement,
     ) -> bool {

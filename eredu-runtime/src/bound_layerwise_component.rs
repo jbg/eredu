@@ -1,5 +1,7 @@
 //! Binding for independently leased layered components with caller-owned state.
 
+use eredu_core::SubmissionBackend;
+
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::BackendFailure;
 use eredu_nn::{NeuralBackend, Parameterized, Tensor};
@@ -8,9 +10,9 @@ use crate::{
     DenseDiskStreamReport, ExecutionUnitAddressMap, LayerWeightResidency, LayeredArchitecture,
     LayeredInvocation, LayeredTensorCohort, LayerwiseModelMetadata, LayerwisePolicy,
     LayerwiseRuntime, LayerwiseRuntimeError, ParallelLayeredArchitecture, ParameterUnitMechanisms,
-    ResidencyReport, StatelessComponentState, SubmissionBackend, UnitPolicyResidency,
-    WeightBinding,
+    ResidencyReport, StatelessComponentState, UnitPolicyResidency,
 };
+use eredu_core::residency::parameter_binding::WeightBinding;
 
 /// An independently leased component and its optional tensor cohort.
 pub struct BoundLayerwiseComponent<A, B, P, C, S>
@@ -48,19 +50,14 @@ where
         H: ParameterUnitMechanisms<B, UnitPolicy<A::Unit> = P>,
         A::Unit: Parameterized<B::Tensor> + 'static,
     {
-        let (policy, metadata) =
-            mechanisms.bind_units(source, invocations.clone(), units, residency, &|| {
-                (0..invocations.storage_layout().len())
-                    .map(|ordinal| {
-                        let location = invocations
-                            .storage_location(ordinal)
-                            .expect("retained storage ordinal");
-                        architecture
-                            .build_storage_unit(location, context)
-                            .map_err(BackendFailure::from_error)
-                    })
-                    .collect()
-            })?;
+        let (policy, metadata) = crate::bind_parameter_units(
+            mechanisms,
+            source,
+            invocations.clone(),
+            units,
+            residency,
+            || crate::build_resident_units::<B, S, A>(&architecture, &invocations, context),
+        )?;
         Ok((
             Self {
                 runtime: LayerwiseRuntime::new(architecture, policy),

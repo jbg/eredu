@@ -61,12 +61,13 @@ impl<S: IsolatedStateFork + ForkStateEstimate, D: SnapshotValue> VoiceChatPublic
         let playback = conversation
             .pending_playback()
             .map(|receipt| (receipt, receipt.with_request(request)));
+        let authority = retention.authority();
         let copied_queue = queue
-            .copy_snapshot_value(&retention)
+            .copy_snapshot_value(&authority)
             .map_err(component)?
             .fork_owner(request, capacity, &retention)?;
         let copied_input = input
-            .copy_snapshot_value(&retention)
+            .copy_snapshot_value(&authority)
             .map_err(component)?
             .fork_owner(&retention);
         let conversation = conversation

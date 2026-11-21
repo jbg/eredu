@@ -236,7 +236,7 @@ fn main() -> anyhow::Result<()> {
     let device = args.get(2).map(String::as_str).unwrap_or("cpu:0");
     let execution = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", device)?);
     let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution)?
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &execution, None)?
             .into_parts();
     eprintln!("loaded sparse execution");
     let facts = model.parameter_discovery()?;

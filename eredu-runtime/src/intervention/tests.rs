@@ -158,6 +158,7 @@ impl CaptureBackend for Backend {
         v: &Value,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         self.copies += 1;
         let maximum = match selection.transform {

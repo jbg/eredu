@@ -600,7 +600,8 @@ pub enum RealtimePayloadHistoryError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RealtimeIngressContract, TokenDomain};
+    use crate::RealtimeIngressContract;
+    use eredu_core::sampling::TokenDomain;
     use eredu_core::{RealtimeFrameConvention, RealtimeSpeechConfig};
 
     use super::*;

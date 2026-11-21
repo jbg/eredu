@@ -110,11 +110,13 @@ fn raise_floor(bytes: &mut MemoryBytes, logical: u64) -> Result<(), CapabilityEr
 }
 
 /// Backend continuation observations never submit, settle or copy model state.
-pub trait ContinuationForecastBackend: GenerationForecastBackend {
+pub trait ContinuationForecastSession<B: eredu_core::TextGenerationBackend>:
+    GenerationForecastSession<B>
+{
     /// Returns no projection for unsupported executables. An in-flight or poisoned
     /// owner must return an error rather than sampling inconsistent state.
     fn continuation_memory_profile(
-        _runtime: &ModelRuntime<Self>,
+        _runtime: &ModelRuntime<B, Self>,
         _additional_input_tokens: u64,
     ) -> Result<Option<ContinuationMemoryProfile>, GenerationForecastError> {
         Ok(None)

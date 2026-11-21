@@ -191,6 +191,7 @@ impl CaptureBackend for ProbeBackend {
         _: &Self::Tensor,
         _: &CaptureSelection,
         _: &ResolvedCaptureSlice,
+        _score_row: Option<u64>,
     ) -> Result<CapturePayload, Infallible> {
         self.copies.set(self.copies.get() + 1);
         Ok(CapturePayload::Tensor(
@@ -645,6 +646,7 @@ fn source_precision_survives_export_and_deferred_generation_without_using_protot
             _: &Self::Tensor,
             _: &CaptureSelection,
             _: &ResolvedCaptureSlice,
+            _score_row: Option<u64>,
         ) -> Result<CapturePayload, Self::Error> {
             if self.fail {
                 return Err(std::io::Error::other("reserved transform failure"));

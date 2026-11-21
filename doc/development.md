@@ -9,29 +9,22 @@ cargo fmt --all
 CI runs `cargo fmt --all -- --check` as an independent job on pull requests and
 main pushes that trigger the CI workflow. Formatting drift fails that check.
 
-On Apple silicon, run the shared native preflight before starting a broad
-platform build:
+Run the shared native Ring preflight on Unix before starting a broad platform
+build:
 
 ```sh
 bash validation/preflight.sh
 ```
 
-This checks native MLX availability, runs ordinary backend tests with normal
-parallelism, and then runs every self-contained Ring case serially. All three
-commands use `--features metal,accelerate --lib`, so changing test selection
-does not rebuild the backend with a different feature set. The two production-model
-Ring parity cases still require their external model fixtures and remain
-explicit opt-in checks; see [releasing](releasing.md).
+This runs the self-contained CPU Ring cases in isolated processes. Released-model
+cases require their external fixtures and run explicitly. See [releasing](releasing.md).
 
-For an individual edit, start with the affected test and then run preflight:
+For an individual edit, select the relevant integration target:
 
 ```sh
-cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib <test-name>
+cargo test --locked -p eredu --no-default-features --features mlx --test chunked_prefill
 cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe -- --test-threads=1
 ```
-
-The second command targets only the two SafeMLX concurrency tests. Avoid a
-workspace-wide command when only one crate's tests are needed.
 
 ## Reference conformance selection
 

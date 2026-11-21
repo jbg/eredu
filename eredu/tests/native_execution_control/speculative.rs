@@ -113,7 +113,8 @@ pub(super) fn speculative_control_artifacts(
         plan
     };
     let mut loaded =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &plan).unwrap();
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &plan, None)
+            .unwrap();
     let generation_options = loaded.drafting_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
     let chat = model

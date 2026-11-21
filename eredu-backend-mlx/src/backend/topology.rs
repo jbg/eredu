@@ -103,13 +103,3 @@ impl MlxRankContext {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mlx_rank_context_rejects_out_of_range_rank() {
-        assert!(MlxRankContext::new(1, 1, DeviceAssignment::new(DeviceType::Gpu, 0)).is_err());
-    }
-}

@@ -1,20 +1,17 @@
 //! Opaque independent state slots for serial ordinary-generation branches.
 
 use super::*;
-use eredu_core::execution_control::SnapshotEstimate;
+use crate::text_session_driver::{ErasedTextState, ErasedTextStateAccess};
+use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use std::sync::Arc;
 
 /// Native mechanisms for complete, independently writable ordinary state copies.
 /// Unlike rollback checkpoints, these copies must remain stable as any descendant
 /// advances. Estimation is side-effect-free; completion stays with the existing
 /// backend submission owner, not this portable driver.
-pub trait ReplicatedTextSnapshotMechanisms<A, B>: ReplicatedTextSessionMechanisms<A, B>
+pub trait ReplicatedTextSnapshotPrimitives<B>: ReplicatedTextPrimitives<B>
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
-    A: LayeredArchitecture<B, Self::State>,
-    Self::State: RuntimeState<B>,
-    Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
-    Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
 {
     /// Known logical cost for copying the exact state. None explicitly means
     /// unknown/unsupported; callers must reserve a known estimate before copying.
@@ -46,6 +43,23 @@ where
         state: &Self::State,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<Self::State, Self::Error>;
+}
+
+/// Portable snapshot support for a typed text session.
+pub trait ReplicatedTextSnapshotMechanisms<A, B>:
+    ReplicatedTextSessionMechanisms<A, B> + ReplicatedTextSnapshotPrimitives<B>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    A: LayeredArchitecture<B, Self::State>,
+{
+}
+
+impl<A, B, N> ReplicatedTextSnapshotMechanisms<A, B> for N
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    A: LayeredArchitecture<B, N::State>,
+    N: ReplicatedTextSessionMechanisms<A, B> + ReplicatedTextSnapshotPrimitives<B>,
+{
 }
 
 /// Native state plus complete portable execution metadata. This is an opaque
@@ -101,10 +115,13 @@ where
     > {
         self.ensure_commit_resolved()?;
         let state = match self.selected_state.state() {
-            Some(selected) => self
-                .mechanisms
-                .realize_state(selected, context)
-                .map_err(ReplicatedTextSessionError::Mechanism)?,
+            Some(selected) => realize_live_state(
+                &mut self.mechanisms,
+                selected,
+                self.prompt_cache_identity.as_ref(),
+                context,
+            )
+            .map_err(ReplicatedTextSessionError::Mechanism)?,
             None => self.mechanisms.realize_stateless_state().ok_or_else(|| {
                 ReplicatedTextSessionError::Contract(
                     "mechanism cannot realize a stateless parameter reset".into(),
@@ -323,5 +340,116 @@ where
         // Commit epochs and outcomes belong to the live submission owner. A
         // branch switch must never reuse a completed transaction identity.
         Ok(())
+    }
+}
+
+impl<A, B, M, D> ErasedTextStateAccess<<B::Tensor as Tensor>::Context>
+    for ReplicatedTextSession<A, B, M, D>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    M: ReplicatedTextSnapshotMechanisms<A, B>,
+    A: LayeredArchitecture<B, M::State>,
+    D: ReplicatedTextExecutionStrategy<A, B, M::State, M::ResidentPolicy, M::BoundedPolicy>,
+    M::State: 'static,
+    M::PolicyError: std::error::Error + Send + Sync + 'static,
+    M::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn support(&self, embedded_prediction: bool) -> eredu_core::execution_control::ControlSupport {
+        use eredu_core::execution_control::ControlSupport;
+        let reason = if D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT {
+            "partitioned state copies require bounded all-rank preparation agreement"
+        } else if embedded_prediction {
+            "native text snapshots do not support selected speculative execution"
+        } else if self.estimate_control_state().is_none() {
+            "native state isolation or a complete storage estimate is unavailable"
+        } else {
+            return ControlSupport::Supported;
+        };
+        ControlSupport::Unsupported {
+            reason: reason.into(),
+        }
+    }
+
+    fn estimate_copy(
+        &self,
+        saved: Option<&ErasedTextState>,
+    ) -> Result<Option<SnapshotEstimate>, BackendFailure> {
+        match saved {
+            Some(saved) => self
+                .estimate_control_state_copy(saved.typed()?)
+                .map_err(BackendFailure::from_error),
+            None => Ok(self.estimate_control_state()),
+        }
+    }
+
+    fn estimate_growth(
+        &self,
+        saved: &ErasedTextState,
+        additional: u64,
+    ) -> Result<Option<u64>, BackendFailure> {
+        self.estimate_control_state_growth(saved.typed()?, additional)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn estimate_installed_growth(&self, additional: u64) -> Option<u64> {
+        self.estimate_installed_control_state_growth(additional)
+    }
+
+    fn save(
+        &mut self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ErasedTextState, BackendFailure> {
+        self.capture_control_state(context)
+            .map(ErasedTextState::new)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn copy(
+        &mut self,
+        saved: &ErasedTextState,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ErasedTextState, BackendFailure> {
+        self.copy_control_state(saved.typed()?, context)
+            .map(ErasedTextState::new)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn validate(&self, saved: &ErasedTextState) -> Result<(), BackendFailure> {
+        self.validate_control_state(saved.typed()?)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn exchange(
+        &mut self,
+        saved: &mut ErasedTextState,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), BackendFailure> {
+        self.exchange_control_state(saved.typed_mut()?, context)
+            .map_err(BackendFailure::from_error)
+    }
+    fn estimate_parameter_reset(&self) -> Option<SnapshotEstimate> {
+        self.estimate_parameter_reset_state()
+            .and_then(ErasedTextState::include_slot_cost)
+    }
+
+    fn prepare_parameter_reset(
+        &mut self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ErasedTextState, BackendFailure> {
+        self.prepare_parameter_reset_state(context)
+            .map(ErasedTextState::new)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn exchange_parameter_reset(
+        &mut self,
+        saved: &mut ErasedTextState,
+    ) -> Result<(), BackendFailure> {
+        self.exchange_parameter_reset_state(saved.typed_mut()?)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn invalidate_parameter_snapshots(&mut self) {
+        ReplicatedTextSession::invalidate_parameter_snapshots(self);
     }
 }

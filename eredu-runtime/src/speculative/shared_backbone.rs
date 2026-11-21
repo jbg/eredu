@@ -1,8 +1,16 @@
 //! Masked drafting and causal verification over one retained executable.
 
+use eredu_core::refinement::RefinementBackend;
+pub(super) mod execution;
+pub use execution::SharedRefinementState;
+
 use super::{
     autoregressive::{AutoregressiveMechanisms, AutoregressivePass},
     causal_verification, CausalVerification,
+};
+use crate::{
+    executable_binding::retained_session::PreparedInputPartPlan,
+    generation::refinement::architecture::BlockRefinementGeometry,
 };
 use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
@@ -100,6 +108,36 @@ impl SharedBackboneExecutionPolicy {
     pub fn proposal_capacity(self) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(self.geometry.canvas_length.get() as usize - 1).unwrap()
     }
+    /// Admits a lane against the shared target's selected draft policy.
+    pub fn prepare_lane(
+        self,
+        config: &eredu_core::generation::GenerationRequestConfig,
+        generation: &eredu_core::TextGenerationConfig,
+    ) -> Result<SharedBackboneDraftOptions, eredu_core::generation::GenerationError> {
+        use eredu_core::{
+            decoding::{DecodingMode, DecodingModeError, SpeculationOptions},
+            generation::GenerationError,
+        };
+
+        super::batch::validate_lane_proposal_capacity(config, self.proposal_capacity().get())?;
+        if generation
+            .decoding_mode()
+            .is_some_and(|mode| mode != config.decoding_mode)
+        {
+            return Err(GenerationError::DecodingMode(
+                DecodingModeError::Unsupported("lane sampling and execution modes disagree"),
+            ));
+        }
+        let options = match config.decoding_mode {
+            DecodingMode::SelfSpeculation(options) => options,
+            DecodingMode::Autoregressive | DecodingMode::Diffusion { .. } => {
+                SpeculationOptions::default().with_proposal_capacity(self.proposal_capacity())
+            }
+        };
+        self.prepare(options, config.temperature)
+            .map_err(GenerationError::DecodingMode)
+    }
+
     /// Resolves one request against the already retained numerical declaration.
     pub fn prepare(
         self,
@@ -206,163 +244,132 @@ impl SharedBackboneDraftOptions {
 /// Additional operations for a masked assistant sharing the causal target's
 /// parameters. Ordinary operations retain their causal, adapter-disabled equations.
 pub trait SharedBackboneMechanisms: AutoregressiveMechanisms {
+    /// Borrows the selected context for a shorter executable acquisition.
+    fn reborrow_context<'a: 'b, 'b>(context: Self::Context<'a>) -> Self::Context<'b>;
+
+    /// Installs a verified cache at the settled commitment boundary.
+    fn publish_committed(
+        model: &mut Self::Model,
+        state: &mut Self::State,
+    ) -> Result<(), Self::Error>;
+
     /// Native activation value, independent of scores and parameter ownership.
     type ActivationTensor;
 
-    /// Binds explicitly admitted authority before any sequence work starts.
-    #[cfg(feature = "tensor-capture")]
-    fn activation_observer(
-        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
-        _request: eredu_core::SpeculativeRequestId,
-        _context: Self::Context<'_>,
-    ) -> Result<
-        Option<
-            Box<
-                dyn crate::inspection::SpeculativeActivationObserver<
-                    Self::ActivationTensor,
-                    Self::Error,
-                >,
-            >,
-        >,
-        eredu_core::speculative::SpeculativeControlError,
-    > {
-        if plan.is_empty() {
-            Ok(None)
-        } else {
-            Err(
-                eredu_core::speculative::SpeculativeControlError::Unsupported(
-                    "shared executor has no admitted activation collector",
-                ),
-            )
-        }
-    }
+    /// Native transforms and retained transport for the portable speculative observer.
+    type Capture: for<'a> crate::capture::SpeculativeCaptureMechanisms<
+            Context<'a> = Self::Context<'a>,
+            Provider: crate::capture::CaptureBackendProvider<Tensor = Self::ActivationTensor>,
+            Error = Self::Error,
+        > + 'static;
 
-    /// Actual causal prompt invocation with optional internal authority.
-    fn prefill_observed(
+    /// Describes decoder positions and media axes accepted by this exact prompt.
+    fn activation_prefill_plans(
+        model: &Self::Model,
+        input: &Self::Input,
+    ) -> Result<Vec<PreparedInputPartPlan>, Self::Error>;
+
+    /// Invokes the bound prompt with an already admitted activation observer.
+    fn prefill_with_activation(
         model: &mut Self::Model,
         input: &Self::Input,
         state: &mut Self::State,
-        context: Self::Context<'_>,
-        observer: Option<
-            &mut dyn crate::inspection::SpeculativeActivationObserver<
-                Self::ActivationTensor,
-                Self::Error,
-            >,
-        >,
-    ) -> Result<(Self::Output, usize), Self::Error> {
-        if observer.is_some() {
-            return Err(Self::invalid("shared prompt hooks are unavailable"));
-        }
-        Self::prefill(
-            model,
-            input,
-            state,
-            AutoregressivePass::TargetPrefill,
-            context,
-        )
-    }
+        observer: &mut dyn crate::ActivationObserver<Self::ActivationTensor, Self::Error>,
+    ) -> Result<(Self::Output, usize), Self::Error>;
 
-    /// Actual causal verification or accepted-prefix replay invocation.
-    fn decode_observed(
+    /// Invokes causal decode with an already admitted activation observer.
+    fn decode_with_activation(
         model: &mut Self::Model,
         tokens: &[u32],
         state: &mut Self::State,
-        pass: AutoregressivePass,
-        context: Self::Context<'_>,
-        observer: Option<
-            &mut dyn crate::inspection::SpeculativeActivationObserver<
-                Self::ActivationTensor,
-                Self::Error,
-            >,
-        >,
-    ) -> Result<Self::Output, Self::Error> {
-        if observer.is_some() {
-            return Err(Self::invalid("shared causal hooks are unavailable"));
-        }
-        Self::decode(model, tokens, state, pass, context)
-    }
+        observer: &mut dyn crate::ActivationObserver<Self::ActivationTensor, Self::Error>,
+    ) -> Result<Self::Output, Self::Error>;
 
-    /// Immutable per-request draft policy, independent of shared model modules.
-    type DraftOptions: Clone;
     /// Request-owned proposal randomness, independent of target sampling.
     type ProposalRandomness: Clone;
-    /// Complete immutable numerical continuation, independently forkable from parameters.
-    type RefinementState: Clone;
+    /// Retained declaration for ordinary target refinement.
+    fn ordinary_refinement_policy(
+        model: &Self::Model,
+    ) -> Option<crate::generation::refinement::architecture::RefinementExecutionPolicy>;
+
+    /// Retained declaration for masked shared-backbone drafting.
+    fn shared_backbone_policy(model: &Self::Model) -> Option<SharedBackboneExecutionPolicy>;
+
+    /// Creates the native root for model randomness.
+    fn model_randomness_root(seed: u64) -> Result<Self::ProposalRandomness, Self::Error>;
+
+    /// Selects one logical substream from an immutable root.
+    fn split_model_randomness(
+        root: &Self::ProposalRandomness,
+        substream: usize,
+        context: Self::Context<'_>,
+    ) -> Result<Self::ProposalRandomness, Self::Error>;
+
+    /// Settles the selected native keys before transferring their ownership.
+    fn settle_model_randomness(randomness: &[&Self::ProposalRandomness])
+        -> Result<(), Self::Error>;
+
+    /// Native numerical execution queue.
+    type Queue: ?Sized + 'static;
+    /// Native numerical operations over one single-sequence block.
+    type Refinement: RefinementBackend<
+        RandomState = Self::ProposalRandomness,
+        Error = Self::Error,
+        Context = Self::Queue,
+    >;
+    /// Native queue used by target refinement.
+    fn target_refinement_context<'a>(context: Self::Context<'a>) -> &'a Self::Queue;
+    /// Native queue available to the masked draft on the target device.
+    fn draft_refinement_context<'a>(context: Self::Context<'a>) -> Option<&'a Self::Queue>;
+    /// Maps validation errors to the execution adapter's error type.
+    fn execution_error(error: impl std::error::Error + Send + Sync + 'static) -> Self::Error;
+    /// Exact block geometry implemented by the retained executable.
+    fn block_geometry(model: &Self::Model) -> Option<BlockRefinementGeometry>;
+    /// Native score format of target logits.
+    fn score_format(
+        logits: &Self::Logits,
+    ) -> <Self::Refinement as RefinementBackend>::ConditioningFormat;
+    /// Native conditioning format for masked drafting.
+    fn draft_score_format() -> <Self::Refinement as RefinementBackend>::ConditioningFormat;
+    /// Borrows or shares a causal score row for the numerical backend.
+    fn refinement_scores(logits: &Self::Logits) -> <Self::Refinement as RefinementBackend>::Logits;
+    /// Invokes the selected workspace with already prepared native values.
+    fn evaluate_refinement(
+        model: &mut Self::Model,
+        prefix: &mut Self::State,
+        canvas: &<Self::Refinement as RefinementBackend>::Token,
+        feedback: Option<&<Self::Refinement as RefinementBackend>::Logits>,
+        geometry: BlockRefinementGeometry,
+        invocation: eredu_core::decoding::AttentionInvocation,
+        context: &Self::Queue,
+        observer: Option<&mut dyn crate::ActivationObserver<Self::ActivationTensor, Self::Error>>,
+    ) -> Result<<Self::Refinement as RefinementBackend>::Logits, Self::Error>
+    where
+        Self: Sized;
+    /// Reads exactly the selected token interval from the completed canvas.
+    fn read_refinement_tokens(
+        tokens: &<Self::Refinement as RefinementBackend>::Token,
+        range: std::ops::Range<usize>,
+        context: &Self::Queue,
+    ) -> Result<Vec<u32>, Self::Error>;
+    /// Extracts one retained score row for target sampling.
+    fn refinement_score_row(
+        scores: &<Self::Refinement as RefinementBackend>::Logits,
+        position: usize,
+        context: &Self::Queue,
+    ) -> Result<Self::Logits, Self::Error>;
+    /// Settles native numerical values before publishing paused target state.
+    fn settle_refinement(state: &SharedRefinementState<Self>) -> Result<(), Self::Error>
+    where
+        Self: Sized;
     /// Bounds retained numerical values and host policy in a paused iteration.
     fn refinement_state_estimate(
-        state: &Self::RefinementState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate>;
-
-    /// Retained numerical draft declarations; refinement commitment is a separate mode.
-    fn draft_capabilities(_model: &Self::Model) -> eredu_core::decoding::DecodingCapabilities {
-        eredu_core::decoding::DecodingCapabilities {
-            autoregressive: true,
-            speculation: true,
-            mode_changes: true,
-            ..Default::default()
-        }
-    }
-
-    /// Ordinary adapter-disabled refinement over the same immutable prefix.
-    /// The complete canvas and selected position scores survive shortened output
-    /// budgets. `committed` pins constraint-corrected authoritative positions.
-    fn refine(
-        _model: &mut Self::Model,
-        _prefix: &Self::Checkpoint,
-        _next_logits: &Self::Logits,
-        _committed: &[u32],
-        _policy: Option<eredu_core::refinement::RefinementPolicy>,
-        _temperature: f32,
-        _randomness: &mut Self::ProposalRandomness,
-        _refinement: &mut Option<Self::RefinementState>,
-        _context: Self::Context<'_>,
-        observer: Option<
-            &mut dyn crate::inspection::SpeculativeActivationObserver<
-                Self::ActivationTensor,
-                Self::Error,
-            >,
-        >,
-    ) -> Result<Option<eredu_core::speculative::RefinementProgress<Self::Logits>>, Self::Error>
-    {
-        if observer.is_some() {
-            return Err(Self::invalid("shared refinement hooks are unavailable"));
-        }
-        Ok(None)
-    }
-
-    /// Resolves prospective options against the same retained architecture declaration.
-    fn prepare_draft_options(
-        model: &Self::Model,
-        options: eredu_core::decoding::SpeculationOptions,
-        temperature: f32,
-    ) -> Result<Self::DraftOptions, eredu_core::decoding::DecodingModeError>;
-
+        state: &SharedRefinementState<Self>,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate>
+    where
+        Self: Sized;
     /// Complete retained bytes of a cloned proposal stream, including native backing.
     fn proposal_randomness_bytes(randomness: &Self::ProposalRandomness) -> Option<u64>;
-    /// Complete logical policy retention, including any cloned backing.
-    fn draft_options_bytes(options: &Self::DraftOptions) -> Option<u64>;
-
-    /// Refines a complete admitted canvas over the immutable causal prefix.
-    /// `last_token` is the committed token not yet appended to that prefix;
-    /// it seeds the canvas and is excluded from the returned proposals. Return
-    /// exactly `capacity` selected tokens, retaining their unmasking decisions.
-    /// Draft-only adapters are enabled solely within this invocation. Neither
-    /// canonical cache nor shared parameter ownership may change.
-    fn draft(
-        model: &mut Self::Model,
-        prefix: &Self::Checkpoint,
-        last_token: u32,
-        capacity: usize,
-        options: &Self::DraftOptions,
-        randomness: &mut Self::ProposalRandomness,
-        context: Self::Context<'_>,
-        observer: Option<
-            &mut dyn crate::inspection::SpeculativeActivationObserver<
-                Self::ActivationTensor,
-                Self::Error,
-            >,
-        >,
-    ) -> Result<Vec<u32>, Self::Error>;
 }
 
 /// One lane's prepared context, immutable draft policy and independent stream.
@@ -460,11 +467,15 @@ impl<'a, M: SharedBackboneMechanisms> SharedBackboneExecutor<'a, M> {
     pub fn resume_seed(
         &self,
         saved: M::Checkpoint,
-        options: M::DraftOptions,
+        options: SharedBackboneDraftOptions,
         randomness: M::ProposalRandomness,
         refinement_randomness: M::ProposalRandomness,
-    ) -> SharedBackboneSeed<M::Checkpoint, M::DraftOptions, M::ProposalRandomness, M::RefinementState>
-    {
+    ) -> SharedBackboneSeed<
+        M::Checkpoint,
+        SharedBackboneDraftOptions,
+        M::ProposalRandomness,
+        SharedRefinementState<M>,
+    > {
         SharedBackboneSeed {
             prefix: saved,
             options,
@@ -475,8 +486,19 @@ impl<'a, M: SharedBackboneMechanisms> SharedBackboneExecutor<'a, M> {
             refinement: None,
         }
     }
-    /// Forks the retained canonical state into an independently mutable lane.
-    pub fn new_cache(&mut self, context: M::Context<'_>) -> Result<M::State, M::Error> {
+}
+
+impl<M: SharedBackboneMechanisms> eredu_core::speculative::SpeculativeCacheFactory
+    for SharedBackboneExecutor<'_, M>
+{
+    fn create_cache<'context>(
+        &mut self,
+        _: &(),
+        context: Self::Context<'context>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'context,
+    {
         M::empty(self.model, AutoregressivePass::TargetPrefill, context)
     }
 }
@@ -497,7 +519,8 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
                 "shared activation authority must be installed once before execution",
             ));
         }
-        self.observer = M::activation_observer(&plan, request, context)?;
+        self.observer =
+            crate::capture::bind_speculative_observer::<M::Capture>(&plan, request, context)?;
         self.observation_configured = true;
         Ok(())
     }
@@ -584,12 +607,13 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         temperature: f32,
     ) -> Result<(), eredu_core::GenerationError> {
         if let eredu_core::decoding::DecodingMode::SelfSpeculation(options) = mode {
-            state.options = M::prepare_draft_options(self.model, options, temperature)?;
+            state.options =
+                execution::prepare_draft_options::<M>(self.model, options, temperature)?;
         }
         Ok(())
     }
     fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
-        let mut capabilities = M::draft_capabilities(self.model);
+        let mut capabilities = execution::draft_capabilities::<M>(self.model);
         capabilities.max_draft_tokens = Some(self.capacity);
         capabilities.with_completion_support(
             M::Completion::supports_cancellation(
@@ -616,7 +640,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         {
             self.execution_started = true;
         }
-        M::refine(
+        execution::refine::<M>(
             self.model,
             &state.prefix,
             next_logits,
@@ -637,15 +661,15 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     fn verification_policy(&self) -> eredu_core::speculative::SpeculativeVerificationPolicy {
         eredu_core::speculative::SpeculativeVerificationPolicy::TargetMatching
     }
-    type Input = SharedBackboneInput<M::Input, M::DraftOptions, M::ProposalRandomness>;
+    type Input = SharedBackboneInput<M::Input, SharedBackboneDraftOptions, M::ProposalRandomness>;
     type Cache = M::State;
     type TargetState = SharedBackboneSeed<
         M::Checkpoint,
-        M::DraftOptions,
+        SharedBackboneDraftOptions,
         M::ProposalRandomness,
-        M::RefinementState,
+        SharedRefinementState<M>,
     >;
-    type DraftState = SharedBackboneProposal<M::DraftOptions, M::ProposalRandomness>;
+    type DraftState = SharedBackboneProposal<SharedBackboneDraftOptions, M::ProposalRandomness>;
     type CacheCheckpoint = M::Checkpoint;
     type Verification = CausalVerification<M::Output>;
     type Logits = M::Logits;
@@ -674,7 +698,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         {
             self.execution_started = true;
         }
-        let (output, count) = M::prefill_observed(
+        let (output, count) = execution::prefill_observed::<M>(
             self.model,
             &input.input,
             cache,
@@ -727,7 +751,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         let tokens = if capacity == 0 {
             Vec::new()
         } else {
-            M::draft(
+            execution::draft::<M>(
                 self.model,
                 &seed.prefix,
                 last_token,
@@ -817,7 +841,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         {
             self.execution_started = true;
         }
-        let output = M::decode_observed(
+        let output = execution::decode_observed::<M>(
             self.model,
             tokens,
             cache,
@@ -871,7 +895,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         {
             // Build the accepted prefix in isolation before replacing installed state.
             let mut accepted = M::restore(saved, context)?;
-            M::decode_observed(
+            execution::decode_observed::<M>(
                 self.model,
                 &output.inputs[..verified],
                 &mut accepted,
@@ -952,7 +976,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
                             .checked_add(M::proposal_randomness_bytes(
                                 &seed.refinement_randomness,
                             )?)?
-                            .checked_add(M::draft_options_bytes(&seed.options)?)?
+                            .checked_add(std::mem::size_of_val(&seed.options) as u64)?
                             .checked_add(seed.refinement.as_ref().map_or(Some(0), |state| {
                                 M::refinement_state_estimate(state)
                                     .map(|estimate| estimate.retained_bytes)
@@ -977,7 +1001,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         let cache = M::estimate_state(cache)?;
         let randomness = M::proposal_randomness_bytes(&seed.randomness)?
             .checked_add(M::proposal_randomness_bytes(&seed.refinement_randomness)?)?;
-        let options = M::draft_options_bytes(&seed.options)?;
+        let options = std::mem::size_of_val(&seed.options) as u64;
         let refinement = seed.refinement.as_ref().map_or(
             Some(eredu_core::execution_control::SnapshotEstimate {
                 retained_bytes: 0,

@@ -12,7 +12,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-fn positions(
+pub(crate) fn positions(
     input: &IndexedAttentionInput<'_, MlxTensor>,
     batch: i32,
     query: i32,
@@ -37,7 +37,7 @@ fn positions(
         _ => {
             return Err(Exception::custom(
                 "indexed positions must be 32-bit integers",
-            ))
+            ));
         }
     };
     let valid = input
@@ -106,30 +106,37 @@ pub fn indexed_sparse_attention(
     {
         return resident_decode(input, stream);
     }
-    indexed_attention_with_reader(input, stream, |batch, positions, stream| {
-        let origin = i64::from(input.key_position_offset);
-        let length = i64::from(input.keys.as_array().dim(2));
-        let indexes = positions
-            .iter()
-            .map(|position| {
-                let index = i64::from(*position) - origin;
-                if index < 0 || index >= length {
-                    return Err(Exception::custom(
-                        "indexed position is outside retained source",
-                    ));
-                }
-                Ok(index as i32)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let indexes = Array::from_slice(&indexes, &[indexes.len() as i32]);
-        let gather = |source: &MlxTensor| {
-            let batch = source
-                .as_array()
-                .try_index_device((batch..batch + 1, .., .., ..), stream)?;
-            take_axis(batch, &indexes, 2, stream)
-        };
-        Ok((gather(input.keys)?, gather(input.values)?))
-    })
+    resident_selected_attention(input, stream)
+}
+
+fn gather_resident_rows(
+    input: &IndexedAttentionInput<'_, MlxTensor>,
+    batch: i32,
+    positions: &[i32],
+    stream: &Stream,
+) -> Result<[Array; 2], Exception> {
+    let origin = i64::from(input.key_position_offset);
+    let length = i64::from(input.keys.as_array().dim(2));
+    let indexes = positions
+        .iter()
+        .map(|position| {
+            let index = i64::from(*position) - origin;
+            if index < 0 || index >= length {
+                return Err(Exception::custom(
+                    "indexed position is outside retained source",
+                ));
+            }
+            Ok(index as i32)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let indexes = Array::from_slice(&indexes, &[indexes.len() as i32]);
+    let gather = |source: &MlxTensor| {
+        let batch = source
+            .as_array()
+            .try_index_device((batch..batch + 1, .., .., ..), stream)?;
+        take_axis(batch, &indexes, 2, stream)
+    };
+    Ok([gather(input.keys)?, gather(input.values)?])
 }
 
 // One resident query per batch needs no host position list or reader lease.
@@ -270,113 +277,119 @@ fn attend_selected(
     Ok(output)
 }
 
-/// Executes through a cache-owned reader. The reader receives sorted unique
-/// absolute positions for one batch/query, returns exactly those rows, and must
-/// complete copies before releasing any source leases. Results are reordered to
-/// the requested slots here, including duplicates and invalid padding.
-pub(crate) fn indexed_attention_with_reader(
+// The resident host path keeps only one query's gathered values live.
+fn resident_selected_attention(
     input: &IndexedAttentionInput<'_, MlxTensor>,
     stream: &Stream,
-    mut read: impl FnMut(i32, &[i32], &Stream) -> Result<(Array, Array), Exception>,
 ) -> Result<Array, Exception> {
     input
         .validate()
         .map_err(|e| Exception::custom(e.to_string()))?;
     let q = input.queries.as_array();
-    let keys = input.keys.as_array();
-    let values = input.values.as_array();
-    let selected = input.selected_positions.as_array().dim(2);
     let mut batches = Vec::new();
     for batch in 0..q.dim(0) {
         let mut outputs = Vec::new();
         for query in 0..q.dim(2) {
             let positions = positions(input, batch, query, stream)?;
-            let mut unique = positions.iter().flatten().copied().collect::<Vec<_>>();
-            unique.sort_unstable();
-            unique.dedup();
-            let (selected_keys, selected_values) = if unique.is_empty() {
-                (
-                    zeros_dtype(
-                        &[1, keys.dim(1), selected, keys.dim(3)],
-                        keys.dtype(),
-                        stream,
-                    )?,
-                    zeros_dtype(
-                        &[1, values.dim(1), selected, values.dim(3)],
-                        values.dtype(),
-                        stream,
-                    )?,
-                )
+            let (unique, slots) = eredu_nn::compact_indexed_positions(&positions);
+            let gathered = if unique.is_empty() {
+                None
             } else {
-                let (gathered_keys, gathered_values) = read(batch, &unique, stream)?;
-                if gathered_keys.shape() != [1, keys.dim(1), unique.len() as i32, keys.dim(3)]
-                    || gathered_values.shape()
-                        != [1, values.dim(1), unique.len() as i32, values.dim(3)]
-                {
-                    return Err(Exception::custom(
-                        "selected history reader returned incorrect row geometry",
-                    ));
-                }
-                let slots = positions
-                    .iter()
-                    .map(|position| {
-                        position.map_or(0, |p| {
-                            unique
-                                .binary_search(&p)
-                                .expect("selected position retained")
-                                as i32
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let indexes = Array::from_slice(&slots, &[selected]);
-                let valid = Array::from_slice(
-                    &positions.iter().map(Option::is_some).collect::<Vec<_>>(),
-                    &[1, 1, selected, 1],
-                );
-                // Invalid slots must not read a real row or retain NaNs from the
-                // harmless gather index used to fill their physical positions.
-                (
-                    r#where(
-                        &valid,
-                        take_axis(gathered_keys, &indexes, 2, stream)?,
-                        Array::from_f32(0.0),
-                        stream,
-                    )?
-                    .as_dtype(keys.dtype(), stream)?,
-                    r#where(
-                        &valid,
-                        take_axis(gathered_values, &indexes, 2, stream)?,
-                        Array::from_f32(0.0),
-                        stream,
-                    )?
-                    .as_dtype(values.dtype(), stream)?,
-                )
+                Some(gather_resident_rows(input, batch, &unique, stream)?)
             };
-            let valid = Array::from_slice(
-                &positions.iter().map(Option::is_some).collect::<Vec<_>>(),
-                &[1, 1, 1, selected],
-            );
-            let selected_mask = r#where(
-                valid,
-                mask_row(input.mask, input, batch, query, selected, stream)?,
-                Array::from_f32(f32::NEG_INFINITY),
-                stream,
-            )?;
-            let output = attend_selected(
-                input,
-                batch,
-                query,
-                selected_keys,
-                selected_values,
-                selected_mask,
-                stream,
-            )?;
-            // Complete the bounded gather/attention graph before retaining the
-            // next query. Only completed output rows accumulate across a prefill.
-            safemlx::transforms::eval([&output])?;
+            let output = attend_indexed_row(input, batch, query, &slots, gathered, stream)?;
             outputs.push(output);
         }
         batches.push(concatenate_axis(&outputs, 2, stream)?);
     }
     concatenate_axis(&batches, 0, stream)
+}
+
+pub(crate) fn attend_indexed_row(
+    input: &IndexedAttentionInput<'_, MlxTensor>,
+    batch: i32,
+    query: i32,
+    slots: &[Option<i32>],
+    gathered: Option<[Array; 2]>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let keys = input.keys.as_array();
+    let values = input.values.as_array();
+    let selected = input.selected_positions.as_array().dim(2);
+    let gathered_count = 1 + slots.iter().flatten().max().copied().unwrap_or(-1);
+    let (selected_keys, selected_values) = if let Some([gathered_keys, gathered_values]) = gathered
+    {
+        if gathered_keys.shape() != [1, keys.dim(1), gathered_count, keys.dim(3)]
+            || gathered_values.shape() != [1, values.dim(1), gathered_count, values.dim(3)]
+        {
+            return Err(Exception::custom(
+                "selected history reader returned incorrect row geometry",
+            ));
+        }
+        let indexes = Array::from_slice(
+            &slots
+                .iter()
+                .map(|slot| slot.unwrap_or(0))
+                .collect::<Vec<_>>(),
+            &[selected],
+        );
+        let valid = Array::from_slice(
+            &slots.iter().map(Option::is_some).collect::<Vec<_>>(),
+            &[1, 1, selected, 1],
+        );
+        // Invalid slots must not read a real row or retain NaNs from the
+        // harmless gather index used to fill their physical positions.
+        (
+            r#where(
+                &valid,
+                take_axis(gathered_keys, &indexes, 2, stream)?,
+                Array::from_f32(0.0),
+                stream,
+            )?
+            .as_dtype(keys.dtype(), stream)?,
+            r#where(
+                &valid,
+                take_axis(gathered_values, &indexes, 2, stream)?,
+                Array::from_f32(0.0),
+                stream,
+            )?
+            .as_dtype(values.dtype(), stream)?,
+        )
+    } else {
+        (
+            zeros_dtype(
+                &[1, keys.dim(1), selected, keys.dim(3)],
+                keys.dtype(),
+                stream,
+            )?,
+            zeros_dtype(
+                &[1, values.dim(1), selected, values.dim(3)],
+                values.dtype(),
+                stream,
+            )?,
+        )
+    };
+    let valid = Array::from_slice(
+        &slots.iter().map(Option::is_some).collect::<Vec<_>>(),
+        &[1, 1, 1, selected],
+    );
+    let selected_mask = r#where(
+        valid,
+        mask_row(input.mask, input, batch, query, selected, stream)?,
+        Array::from_f32(f32::NEG_INFINITY),
+        stream,
+    )?;
+    let output = attend_selected(
+        input,
+        batch,
+        query,
+        selected_keys,
+        selected_values,
+        selected_mask,
+        stream,
+    )?;
+    // Complete the bounded gather/attention graph before retaining the
+    // next query. Only completed output rows accumulate across a prefill.
+    safemlx::transforms::eval([&output])?;
+    Ok(output)
 }

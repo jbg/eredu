@@ -1,9 +1,10 @@
 //! Typed supplied-embedding transport for causal and character transformer stages.
 use super::*;
+use eredu_core::communication::BoundaryTensorDtype as Dtype;
 use eredu_runtime::{
     ArchitectureBoundary, ArchitectureBoundaryError, ArchitectureBoundaryValue,
-    ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype,
-    BoundaryTensorSpec, LayeredPartitionInput, LayeredPartitionOutput,
+    ArchitecturePartition, BoundaryTensorDimension as Dim, BoundaryTensorSpec,
+    LayeredPartitionInput, LayeredPartitionOutput,
 };
 use std::ops::Range;
 

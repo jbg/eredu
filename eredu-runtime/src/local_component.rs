@@ -1,5 +1,13 @@
 //! Binding contract for one local layerwise component.
 
+use eredu_core::backend::LocalComponentStorage;
+use eredu_core::checkpoint_mechanisms::unit_binding::{
+    ComponentPreparationScope, LocalComponentBinding,
+};
+
+mod driver;
+pub use driver::{LocalComponentDriver, LocalParameterRetention};
+
 use std::{borrow::Borrow, sync::Arc};
 
 use eredu_core::{
@@ -7,14 +15,14 @@ use eredu_core::{
         ParameterConversionRetentionEligibility, ParameterConversionRetentionPolicy,
         ParameterConversionRetentionTrimReport, ParameterConversionTrimError,
     },
-    BackendFailure,
+    BackendFailure, SubmissionBackend,
 };
-use eredu_nn::NeuralBackend;
+use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
     ActivationObserver, ComponentAdapter, ComponentDefinition, DenseDiskStreamReport,
-    LayerWeightResidency, LayeredArchitecture, PreparedComponent, ResidencyReport, RuntimeState,
-    SelectedStateRealization,
+    LayerWeightResidency, LayeredArchitecture, ParameterUnitMechanisms, PreparedComponent,
+    ResidencyReport, RuntimeState, SelectedStateRealization,
 };
 
 /// Exact resources and policies for an architecture-constructed local component.
@@ -60,6 +68,38 @@ where
 }
 
 impl<A> PreparedLocalComponent<A> {
+    /// Constructs resident units above native materialization and binds the selected driver.
+    pub fn bind<B, S, M>(
+        self,
+        mechanisms: &M,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<M::Local<A>, BackendFailure>
+    where
+        B: NeuralBackend,
+        S: RuntimeState<B>,
+        M: LocalComponentMechanisms<B, S>,
+        A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::Unit: 'static,
+    {
+        let scope = mechanisms.begin_local_preparation()?;
+        let result = (|| {
+            let (mut architecture, prepared, mut policy) = self.into_parts();
+            let state = policy.state.take();
+            let layout = prepared.declaration().state_layout().clone();
+            let residency = policy.residency;
+            let invocations = prepared.invocations().clone();
+            let storage = mechanisms.prepare_local_storage(&mut architecture, prepared, policy)?;
+            let units = residency
+                .is_fully_resident()
+                .then(|| {
+                    crate::build_resident_units::<B, S, A>(&architecture, &invocations, context)
+                })
+                .transpose()?;
+            mechanisms.finish_local_binding(architecture, storage, units, layout, state)
+        })();
+        scope.finish(result)
+    }
+
     /// Transfers the validated architecture, resources, and selection to a binder.
     pub fn into_parts(
         self,
@@ -129,6 +169,12 @@ where
 
 /// Binds local component resources without knowing their model family.
 pub trait LocalComponentMechanisms<B: NeuralBackend, S: RuntimeState<B>> {
+    /// Scope covering native work issued during architecture construction.
+    type PreparationScope: ComponentPreparationScope;
+
+    /// Opens recovery before the caller prepares the local architecture.
+    fn begin_local_preparation(&self) -> Result<Self::PreparationScope, BackendFailure>;
+
     /// Bound component for any compatible layerwise architecture.
     type Local<A>: BoundLocalComponent<A, B, S>
         + crate::LayeredInvocation<
@@ -141,12 +187,105 @@ pub trait LocalComponentMechanisms<B: NeuralBackend, S: RuntimeState<B>> {
         A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
         A::Unit: 'static;
 
-    /// Realizes the supplied local component and retains its selected state policy.
-    fn bind_local<A>(
+    /// Native storage of the admitted local component.
+    type Storage;
+
+    /// Binds pinned parameters and prepares the selected unit storage.
+    fn prepare_local_storage<A>(
         &self,
-        prepare: impl FnOnce() -> Result<PreparedLocalComponent<A>, BackendFailure>,
+        architecture: &mut A,
+        prepared: PreparedComponent<Arc<ComponentDefinition>>,
+        policy: LocalComponentPolicy,
+    ) -> Result<Self::Storage, BackendFailure>
+    where
+        A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::Unit: 'static;
+
+    /// Populates supplied resident units, or adopts prepared bounded storage.
+    fn finish_local_binding<A>(
+        &self,
+        architecture: A,
+        storage: Self::Storage,
+        resident: Option<Vec<A::Unit>>,
+        layout: crate::StateLayout,
+        state: Option<SelectedStateRealization>,
     ) -> Result<Self::Local<A>, BackendFailure>
     where
         A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
         A::Unit: 'static;
+}
+
+impl<B, S, M> LocalComponentMechanisms<B, S> for M
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>
+        + LocalComponentStorage
+        + 'static,
+    B::OwnedExecutor: 'static,
+    S: crate::state::PortableTextState<B, B::CacheStorage> + 'static,
+    M: LocalComponentBinding<B> + ParameterUnitMechanisms<B>,
+{
+    type PreparationScope = M::Scope;
+    type Storage = crate::ParameterUnitStorage<B, M>;
+
+    type Local<A>
+        = LocalComponentDriver<A, B, S, M::UnitPolicy<A::Unit>>
+    where
+        A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::Unit: 'static;
+
+    fn begin_local_preparation(&self) -> Result<Self::PreparationScope, BackendFailure> {
+        self.begin_unit_binding()
+    }
+
+    fn prepare_local_storage<A>(
+        &self,
+        architecture: &mut A,
+        prepared: PreparedComponent<Arc<ComponentDefinition>>,
+        policy: LocalComponentPolicy,
+    ) -> Result<Self::Storage, BackendFailure>
+    where
+        A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::Unit: 'static,
+    {
+        let (_, invocations, source, units, pinned) = prepared.into_parts();
+        let (storage, _) = crate::parameter_units::materialize_component_storage::<B, S, A, M>(
+            self,
+            architecture,
+            source,
+            &invocations,
+            policy.residency,
+            pinned.into_values().flatten().collect(),
+            units,
+            Some((policy.conversion_retention, policy.conversion_eligibility)),
+        )?;
+        Ok(storage)
+    }
+
+    fn finish_local_binding<A>(
+        &self,
+        architecture: A,
+        storage: Self::Storage,
+        resident: Option<Vec<A::Unit>>,
+        layout: crate::StateLayout,
+        state: Option<SelectedStateRealization>,
+    ) -> Result<Self::Local<A>, BackendFailure>
+    where
+        A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::Unit: 'static,
+    {
+        use crate::bounded_execution::units::{BindBoundedPolicy as _, BindResidentPolicy as _};
+        let policy = match resident {
+            Some(units) => {
+                M::UnitPolicy::<A::Unit>::bind_resident(storage, units, self.unit_executor())?
+            }
+            None => M::UnitPolicy::<A::Unit>::bind_bounded(storage),
+        };
+        Ok(LocalComponentDriver::new(
+            architecture,
+            policy,
+            layout,
+            state,
+            self.local_executor(),
+        ))
+    }
 }

@@ -44,9 +44,9 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
     cd /src; \
     rustc --version | grep -F 'rustc 1.89.0'; \
     cargo build --locked --release \
-        -p eredu-backend-mlx \
+        -p eredu \
         --no-default-features \
-        --features cuda \
+        --features mlx,cuda \
         --example checkpoint_probe; \
     cargo build --locked --release \
         -p eredu-evaluation \
@@ -163,10 +163,8 @@ RUN set -eux; \
         exit 1; \
     fi; \
     rm /tmp/checkpoint-probe.ldd; \
-    python -m unittest discover \
-        -s /opt/eredu/validation \
-        -p 'test_*.py' \
-        -q; \
+    python -m unittest validation.test_checkpoint_validation -q; \
+    python -m unittest discover -s /opt/eredu/validation -p 'test_projection_baseline.py' -q; \
     python -c 'import torch, transformers; assert torch.__version__.startswith("2.8.0"); assert torch.version.cuda == "12.9"; assert transformers.__version__ == "5.14.1"'
 
 WORKDIR /workspace

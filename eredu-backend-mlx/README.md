@@ -1,28 +1,15 @@
 # eredu-backend-mlx
 
-`eredu-backend-mlx` is the concrete MLX implementation of Eredu's
-backend-neutral contracts. It owns MLX tensor and neural operations,
-checkpoint materialization, execution runtime, typed architecture-to-mechanism
-binding, processed-media tensor conversion, and distributed execution. Neural codec semantics
-and artifact plans remain in `eredu-codec`; MLX supplies the same generic
-parameter materialization mechanisms used by other neutral modules. This crate
-does not depend on the `eredu` facade crate.
+`eredu-backend-mlx` implements Eredu's neutral contracts for MLX tensors,
+operators, checkpoint materialization, cache storage, queues, completion,
+processed-media conversion, and distributed transport.
 
-Cold preparation enters this crate as a normalized portable request, a total
-architecture-selected execution, and an exact prepared-source bundle. MLX
-reports side-effect-free capability facts and retains native rank/device,
-stream, cache, collective, lease-conversion, tensor, and erasure work; it does
-not reopen artifact formats or reconstruct portable selection and inspection
-policy.
-
-`eredu-runtime` converts execution plans and synthesizes exact capabilities from
-MLX's single-candidate mechanism predicates. `eredu-architectures` consumes the
-paired selection and sources through one total typed construction driver. MLX
-supplies materialization, native state profiles, communication resources, and
-final executable assembly. Ordinary and realtime prepared values retain their
-selected native target; materialization accepts no replacement load policy.
-Sessions use `eredu-core` submission authority while native completions retain
-all MLX resources until exact completion or safe teardown.
+Portable composition selects the architecture, loads the admitted checkpoint,
+and owns the resulting executable and session. MLX reports cold capability
+facts and realizes the selected native resources from exact binding requests.
+Submission uses `eredu-core` authority, and native completions retain MLX
+resources through completion or safe teardown. The backend has no dependency
+on the facade, portable runtime, or family crates.
 
 The crate's `MlxTensor` is a transparent, zero-copy wrapper around the native
 MLX array handle. The wrapper lets this crate implement `eredu_nn::Tensor`
@@ -38,17 +25,12 @@ for implementation architecture, native platform setup, and low-level
 `safemlx` guides.
 
 ```rust,no_run
-use eredu_backend_mlx::{
-    native::{backend, ExecutionContext},
-    MlxLoadRequest,
-};
-use eredu_core::load_model;
-use safemlx::{Device, DeviceType};
+use eredu_backend_mlx::native::{backend, ExecutionContext};
+use eredu_core::BackendProvider;
 
-let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-let backend = backend(execution.stream(), weights.stream());
-let model = load_model(&backend, "/path/to/model", MlxLoadRequest::default())?;
+let execution = ExecutionContext::cpu()?;
+let backend = backend(execution.stream(), execution.stream());
+let devices = backend.devices()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -65,9 +47,8 @@ sampling primitives those policies require. Runtime `Sampler` and
 `SpeculativeSampler` implementations bind to it through `MlxTensor`; the MLX
 backend does not define parallel policy traits.
 
-The `native` module exposes composition-owned model sessions, inputs, outputs,
-inspection policy, realtime types, execution contexts, and random state for
-concrete MLX tooling. Raw arrays, devices, streams, operations, allocator
+The `native` module exposes mechanism bindings, capability facts, realtime
+resources, execution contexts, and random state for concrete MLX tooling. Raw arrays, devices, streams, operations, allocator
 state, platform setup, and collective groups are imported directly from their
 canonical `safemlx` paths; this crate does not create a second public path for
 the binding crate. Backend configuration, errors, topology, prepared models,

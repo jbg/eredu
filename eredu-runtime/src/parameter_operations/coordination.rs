@@ -1,8 +1,9 @@
 //! Live parameter operations with separately admitted rejection/commit control.
 use super::*;
-use crate::CommunicationSessionIdentity;
+use eredu_core::communication::CommunicationSessionIdentity;
+use eredu_core::parameters::ParameterOperationTransport;
+
 use eredu_core::{
-    consensus::BoundedConsensusTransport,
     parameters::{
         ParameterCoordinationError as Error, ParameterCoordinationStage as Stage,
         ParameterCoordinationUsage,
@@ -20,25 +21,6 @@ pub const PARAMETER_CONTROL_WORDS: usize = 38;
 // has a second completed-validation exchange. Unused allowance is not refunded.
 const CONTROL_ROUNDS: u64 = 8;
 const PAYLOAD_HEADER: usize = 8;
-
-/// Ordinary native portable-word transport and exact retained session facts.
-pub trait ParameterOperationTransport: BoundedConsensusTransport {
-    /// Actual world rank, not an application-supplied label.
-    fn parameter_rank(&self) -> usize;
-    /// Actual retained setup identity.
-    fn parameter_setup(&self) -> CommunicationSessionIdentity;
-    /// Selected bounded completion policy, queried without submission.
-    fn parameter_wait(&self) -> Result<BoundedCompletionWait, ParameterError>;
-    /// Exact conservative native/host bound for one equally sized gather.
-    /// Runtime adds its framing and decoding buffers separately.
-    fn estimate_parameter_gather(&self, local_words: usize)
-        -> Result<CaptureUsage, ParameterError>;
-    /// Rejects a failed native session before new work.
-    fn ensure_parameter_active(&self) -> Result<(), BackendFailure>;
-    /// Fences the shared execution on ambiguous failure. Exact submitted native
-    /// completions still retain or quarantine resources independently.
-    fn fail_parameter_operation(&self, error: &Error);
-}
 
 /// Common operation category. Local immutable admission remains separate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

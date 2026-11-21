@@ -54,7 +54,7 @@ impl CaptureSession {
     where
         B: InterventionBackend,
         T: PartitionCaptureHookTransport,
-        L: PartitionActivationLayout + PartitionCaptureLayout,
+        L: PartitionActivationLayout + PartitionCaptureLayout + ?Sized,
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
@@ -66,7 +66,7 @@ impl CaptureSession {
             .identity
             .world_size;
         let rank = transport.capture_rank();
-        let wait = transport.capture_wait()?;
+        let wait = crate::capture::partition::capture_wait(transport)?;
         if !T::Completion::supports_cancellation(wait.cancellation()) {
             return Err(CaptureError::Unsupported(
                 "sparse intervention cancellation policy".into(),
@@ -217,8 +217,7 @@ impl CaptureSession {
         if coverage != geometry.components()? {
             return Err(invalid("sparse intervention ownership is incomplete").into());
         }
-        let votes = transport
-            .estimate_capture_hook(&members)?
+        let votes = crate::capture::partition::estimate_hook(transport, &members)?
             .checked_mul(mul(members.len() as u64, 2)?)?;
         let receipt = super::super::super::exchange::gather_usage(transport, world, RECEIPT_WORDS)?
             .checked_mul(world as u64)?;

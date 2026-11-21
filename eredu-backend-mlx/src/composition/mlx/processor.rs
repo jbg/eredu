@@ -1,30 +1,23 @@
 //! MLX tensor conversion for architecture-selected portable media processing.
 
 #[cfg(any(feature = "image", feature = "audio"))]
-use eredu_architectures::processor_execution::{
-    OptionalProcessorMechanism, PreparedProcessor, ProcessorExecutionError, ProcessorMechanisms,
+use crate::backend::{
+    error::Error,
+    submission_recovery::{finish_detached_preparation, Recovery},
 };
 #[cfg(any(feature = "image", feature = "audio"))]
-use eredu_core::{InputTensorIdentity, PreparedInputError, TokenizedMultimodalRequest};
+use eredu_core::input::PreparedInputInspector;
 #[cfg(any(feature = "image", feature = "audio"))]
-use eredu_runtime::PreparedInputInspector;
+use eredu_core::input::{
+    MediaInputLowering, OptionalProcessorMechanism, ProcessorMechanisms, ProcessorPreparationScope,
+};
+#[cfg(any(feature = "image", feature = "audio"))]
+use eredu_core::{InputTensorIdentity, PreparedInputError};
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::error::Error;
-#[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::runtime::media::{PreparedModelInput, ProcessorPreparationError};
-
-/// Architecture-erased media processor selected during model composition.
-#[derive(Debug, Clone)]
-#[cfg(any(feature = "image", feature = "audio"))]
-pub struct ModelProcessor {
-    processor: PreparedProcessor,
-}
-
-#[cfg(any(feature = "image", feature = "audio"))]
-#[derive(Default)]
+#[cfg_attr(test, derive(Default))]
 struct MlxProcessorMechanisms {
     roots: ProcessorRoots,
 }
@@ -50,9 +43,9 @@ impl crate::backend::submission_recovery::Retention for ProcessorRoots {
     fn observe(&self, _: crate::backend::submission_recovery::Status) {}
 }
 
-pub(crate) fn capabilities() -> eredu_runtime::MediaPrimitiveCapabilities {
+pub(crate) fn capabilities() -> eredu_core::media::MediaPrimitiveCapabilities {
+    use eredu_core::media::ProcessorPrimitive;
     use eredu_core::InputModality;
-    use eredu_runtime::ProcessorPrimitive;
 
     #[allow(unused_mut)]
     let mut raw_modalities = Vec::new();
@@ -84,7 +77,7 @@ pub(crate) fn capabilities() -> eredu_runtime::MediaPrimitiveCapabilities {
             ProcessorPrimitive::AudioLogarithm,
         ]);
     }
-    eredu_runtime::MediaPrimitiveCapabilities::new(
+    eredu_core::media::MediaPrimitiveCapabilities::new(
         raw_modalities,
         [
             InputModality::Text,
@@ -122,6 +115,10 @@ impl PreparedInputInspector<Array> for MlxProcessorMechanisms {
 impl ProcessorMechanisms for MlxProcessorMechanisms {
     type Tensor = Array;
     type Error = Error;
+
+    fn inspector(&self) -> &dyn PreparedInputInspector<Array> {
+        self
+    }
 
     fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Array, Self::Error> {
         Ok(self
@@ -173,378 +170,81 @@ fn mlx_shape(shape: &[usize]) -> Result<Vec<i32>, Error> {
         .collect()
 }
 
-#[cfg(all(test, feature = "image"))]
-mod processor_tests {
-    use super::*;
-    use eredu_runtime::processor_resources::ProcessorResourceError;
-
-    struct Admit;
-    impl eredu_architectures::processor_execution::ProcessorInputAdmission for Admit {
-        fn validate<T>(
-            &self,
-            _: &eredu_runtime::PreparedModelInput<T>,
-            _: &impl PreparedInputInspector<T>,
-        ) -> Result<(), eredu_architectures::processor_execution::ProcessorInputAdmissionError>
-        {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn optional_coarse_budget_preserves_exact_integer_copy() {
-        use eredu_runtime::processor_resources::ProcessorRequestBudget;
-        let processor = PreparedProcessor::from_qwen(
-            eredu_architectures::processor_plan::QwenProcessorPlan::tokens_only(),
-        );
-        let budget = ProcessorRequestBudget {
-            decoded_input_bytes: 12,
-            host_buffer_bytes: 1024,
-            output_tensor_bytes: 12,
-            planning_items: 128,
-            decoder_positions: 3,
-        };
-        let constructed = std::cell::Cell::new(0);
-        let prepare = |budget| {
-            let request =
-                eredu_core::MultimodalRequest::new(vec![eredu_core::MultimodalSegment::TokenIds(
-                    vec![3, 16_777_217, i32::MAX as u32],
-                )])
-                .unwrap()
-                .tokenize::<String>(|_| unreachable!())
-                .unwrap();
-            let mut mechanisms = MlxProcessorMechanisms::default();
-            let result = processor.prepare_with_admission(
-                &request,
-                &mut mechanisms,
-                &mut |_| Ok::<_, String>(vec![]),
-                &Admit,
-                budget,
-            );
-            constructed.set(mechanisms.roots.0.borrow().len());
-            result
-        };
-        let prepared = prepare(budget).unwrap();
-        assert_eq!(constructed.get(), 1);
-        assert_eq!(prepared.resources().output_tensor_bytes, 12);
-        assert_eq!(
-            prepared.parts()[0]
-                .payload()
-                .value()
-                .evaluated()
-                .unwrap()
-                .as_slice::<u32>(),
-            &[3, 16_777_217, i32::MAX as u32]
-        );
-        let mut denied = budget;
-        denied.output_tensor_bytes = 11;
-        assert!(matches!(
-            prepare(denied),
-            Err(ProcessorExecutionError::Resources(
-                ProcessorResourceError::Exhausted { .. }
-            ))
-        ));
-        assert_eq!(
-            constructed.get(),
-            0,
-            "coarse output rejection precedes native constructors"
-        );
-    }
-
-    #[test]
-    fn partial_preparation_keeps_constructed_and_replaced_roots_until_terminal() {
-        use crate::backend::submission_recovery::{Probe, Recovery, Status};
-        use std::{cell::Cell, rc::Rc};
-
-        struct Pending(Rc<Cell<Status>>);
-        impl Probe for Pending {
-            fn seal(&mut self) {}
-            fn progress(&self) -> Status {
-                self.0.get()
-            }
-        }
-        struct Replace;
-        impl eredu_runtime::ActivationObserver<Array, safemlx::error::Exception> for Replace {
-            fn observe(&mut self, _: &str, _: &Array) -> Result<(), safemlx::error::Exception> {
-                Ok(())
-            }
-            fn intervene(
-                &mut self,
-                _: &str,
-                _: &Array,
-            ) -> Result<Option<Array>, safemlx::error::Exception> {
-                Ok(Some(Array::from_slice(&[41_u32, 42], &[1, 2])))
-            }
-        }
-
-        // Both an error result and an unwind can abandon a partially prepared
-        // request while submitted native work is still unobservable.
-        for unwind in [false, true] {
-            let roots = ProcessorRoots::default();
-            let retained = Rc::downgrade(&roots.0);
-            let status = Rc::new(Cell::new(Status {
-                settled: false,
-                failed: !unwind,
-                blocked: unwind,
-            }));
-            let recovery = Recovery::with_probe(roots.clone(), Pending(Rc::clone(&status)));
-            let operation = || {
-                let _recovery = recovery;
-                let mut mechanisms = MlxProcessorMechanisms {
-                    roots: roots.clone(),
-                };
-                let source = mechanisms.tensor_u32(&[16_777_217, 7], &[1, 2]).unwrap();
-                let mut observer = ProcessorObserver::<String> {
-                    inner: &mut Replace,
-                    roots: roots.clone(),
-                    marker: std::marker::PhantomData,
-                };
-                use eredu_runtime::ActivationObserver;
-                let replacement = observer
-                    .intervene("processor.test", &source)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    replacement.evaluated().unwrap().as_slice::<u32>(),
-                    &[41, 42]
-                );
-                assert_eq!(roots.0.borrow().len(), 2);
-                if unwind {
-                    panic!("injected partial preparation unwind");
-                }
-                Err::<(), _>("injected later preparation failure")
-            };
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
-            if unwind {
-                assert!(outcome.is_err());
-            } else {
-                assert_eq!(outcome.unwrap(), Err("injected later preparation failure"));
-            }
-            drop(roots);
-            let values = retained
-                .upgrade()
-                .expect("unresolved work retains source roots");
-            assert_eq!(values.borrow().len(), 2);
-            assert_eq!(
-                values.borrow()[0].evaluated().unwrap().as_slice::<u32>(),
-                &[16_777_217, 7]
-            );
-            drop(values);
-            status.set(Status {
-                settled: true,
-                failed: true,
-                blocked: false,
-            });
-            crate::backend::submission_recovery::wait_for_retirement(|| {
-                retained.upgrade().is_none()
-            });
-        }
-    }
-
-    #[test]
-    fn constructor_geometry_rejects_overflow_without_allocating() {
-        assert_eq!(mlx_shape(&[2, 3]).unwrap(), [2, 3]);
-        assert!(mlx_shape(&[65536, 65536]).is_err());
-        assert!(mlx_shape(&[usize::MAX, 2]).is_err());
-        assert!(mlx_shape(&[0, usize::MAX]).is_err());
-    }
+/// MLX tensor conversion and preparation recovery for a selected portable media program.
+#[cfg(any(feature = "image", feature = "audio"))]
+pub struct MlxProcessorScope {
+    mechanisms: MlxProcessorMechanisms,
+    recovery: Recovery<ProcessorRoots>,
 }
 
 #[cfg(any(feature = "image", feature = "audio"))]
-impl ModelProcessor {
-    /// Wraps a processor already prepared by the architecture construction driver.
-    pub fn from_prepared(processor: PreparedProcessor) -> Self {
-        Self { processor }
-    }
-
-    /// Lowers the authoritative architecture-owned processor plan to MLX execution.
-    #[cfg(all(test, feature = "image"))]
-    pub fn from_plan(
-        plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    ) -> Option<Self> {
-        PreparedProcessor::from_artifact(plan).map(|processor| Self { processor })
-    }
-
-    /// Prepares a portable request with the retained processor and semantic identity.
-    pub fn prepare<E>(
-        &self,
-        request: &TokenizedMultimodalRequest,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<
-        PreparedModelInput,
-        eredu_core::MultimodalPreparationFailure<eredu_core::BackendFailure, E>,
-    >
-    where
-        E: std::error::Error + 'static,
-    {
-        use eredu_core::MultimodalPreparationFailure as Failure;
-
-        self.prepare_portable_input(request, encode_text)
-            .map_err(|error| match error {
-                ProcessorPreparationError::Capability(error) => Failure::Capability(error),
-                ProcessorPreparationError::Backend(error) => {
-                    Failure::Backend(eredu_core::BackendFailure::from_error(error))
-                }
-                ProcessorPreparationError::Text(error) => Failure::Text(error),
-            })
-    }
-
-    /// Converts a portable ordered request into owned MLX model input.
-    #[cfg(any(feature = "image", feature = "audio"))]
-    pub(crate) fn prepare_portable_input<E>(
-        &self,
-        request: &TokenizedMultimodalRequest,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>>
-    where
-        E: std::fmt::Display,
-    {
-        self.prepare_portable_input_inner(
-            request,
-            encode_text,
-            &mut eredu_runtime::NoopObserver,
-            true,
-        )
-    }
-
-    /// Converts a portable request while exposing processor output before admission.
-    pub(crate) fn prepare_portable_input_with_observer<E>(
-        &self,
-        request: &TokenizedMultimodalRequest,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
-    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>>
-    where
-        E: std::fmt::Display,
-    {
-        self.prepare_portable_input_inner(request, encode_text, observer, false)
-    }
-
-    fn prepare_portable_input_inner<E>(
-        &self,
-        request: &TokenizedMultimodalRequest,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
-        retain_semantic_identity: bool,
-    ) -> Result<PreparedModelInput, ProcessorPreparationError<E>>
-    where
-        E: std::fmt::Display,
-    {
+impl MlxProcessorScope {
+    pub(crate) fn begin() -> Result<Self, Error> {
         let roots = ProcessorRoots::default();
-        crate::backend::submission_recovery::detached_preparation(
-            roots.clone(),
-            move || {
-                let mut mechanisms = MlxProcessorMechanisms {
-                    roots: roots.clone(),
-                };
-                let mut observer = ProcessorObserver::<E> {
-                    inner: observer,
-                    roots: roots.clone(),
-                    marker: std::marker::PhantomData,
-                };
-                self.processor
-                    .prepare_with_observer(request, &mut mechanisms, encode_text, &mut observer)
-                    .and_then(|prepared| {
-                        if retain_semantic_identity {
-                            PreparedModelInput::from_runtime_with_semantic_content(
-                                prepared,
-                                request.semantic_content_fingerprint(),
-                            )
-                            .map_err(ProcessorExecutionError::Mechanism)
-                        } else {
-                            Ok(PreparedModelInput::from_observed_runtime(prepared))
-                        }
-                    })
-                    .map_err(|error| match error {
-                        ProcessorExecutionError::Text(error) => {
-                            ProcessorPreparationError::Text(error)
-                        }
-                        ProcessorExecutionError::Resources(error) => {
-                            ProcessorPreparationError::Backend(Error::ProcessorResources(error))
-                        }
-                        ProcessorExecutionError::Admission(error) => {
-                            ProcessorPreparationError::Capability(error)
-                        }
-                        ProcessorExecutionError::Plan(error) => {
-                            ProcessorPreparationError::Backend(Error::Processor(error))
-                        }
-                        ProcessorExecutionError::Mechanism(error) => {
-                            ProcessorPreparationError::Backend(error)
-                        }
-                        ProcessorExecutionError::Prepared(error) => {
-                            ProcessorPreparationError::Backend(Error::Processor(error.to_string()))
-                        }
-                    })
-            },
-            ProcessorPreparationError::Backend,
-        )
+        let recovery = Recovery::begin(roots.clone())?;
+        Ok(Self {
+            mechanisms: MlxProcessorMechanisms { roots },
+            recovery,
+        })
     }
 }
 
 #[cfg(any(feature = "image", feature = "audio"))]
-struct ProcessorObserver<'a, E> {
-    inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
-    roots: ProcessorRoots,
-    marker: std::marker::PhantomData<E>,
+impl ProcessorMechanisms for MlxProcessorScope {
+    type Tensor = Array;
+    type Error = Error;
+
+    fn inspector(&self) -> &dyn PreparedInputInspector<Array> {
+        self.mechanisms.inspector()
+    }
+
+    fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Array, Error> {
+        self.mechanisms.tensor_u32(values, shape)
+    }
+
+    fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<Array, Error> {
+        self.mechanisms.tensor_f32(values, shape)
+    }
+
+    fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<Array, Error> {
+        self.mechanisms.tensor_i32(values, shape)
+    }
+
+    fn tensor_bool(
+        &mut self,
+        values: &[bool],
+        shape: &[usize],
+    ) -> Result<Array, OptionalProcessorMechanism<Error>> {
+        self.mechanisms.tensor_bool(values, shape)
+    }
 }
 
 #[cfg(any(feature = "image", feature = "audio"))]
-impl<E> eredu_runtime::ActivationObserver<Array, ProcessorExecutionError<E, Error>>
-    for ProcessorObserver<'_, E>
-where
-    E: std::fmt::Display,
-{
-    fn observe(
-        &mut self,
-        path: &str,
-        value: &Array,
-    ) -> Result<(), ProcessorExecutionError<E, Error>> {
-        self.inner
-            .observe(path, value)
-            .map_err(|error| ProcessorExecutionError::Mechanism(Error::from(error)))
-    }
-
-    fn intervene(
-        &mut self,
-        path: &str,
-        value: &Array,
-    ) -> Result<Option<Array>, ProcessorExecutionError<E, Error>> {
-        self.inner
-            .intervene(path, value)
-            .map(|replacement| replacement.map(|tensor| self.roots.retain(tensor)))
-            .map_err(|error| ProcessorExecutionError::Mechanism(Error::from(error)))
+impl ProcessorPreparationScope for MlxProcessorScope {
+    fn finish(self) -> Result<(), Error> {
+        finish_detached_preparation(self.recovery, Ok(()), |error| error)
     }
 }
 
-/// Lowers an independently selected portable media processor through MLX.
+/// Supplies native media tensor conversions for an already selected graph.
 #[cfg(any(feature = "image", feature = "audio"))]
 pub struct MlxMediaInputLowering;
 
 #[cfg(any(feature = "image", feature = "audio"))]
-impl eredu_architectures::processor_execution::MediaInputLowering<crate::MlxTensor>
-    for MlxMediaInputLowering
-{
+impl MediaInputLowering<crate::MlxTensor> for MlxMediaInputLowering {
+    type ProcessorTensor = Array;
+    type ProcessorError = Error;
+    type Scope = MlxProcessorScope;
+
+    fn begin(&self) -> Result<Self::Scope, Error> {
+        MlxProcessorScope::begin()
+    }
+
     fn inspector(&self) -> &impl PreparedInputInspector<crate::MlxTensor> {
         &crate::backend::runtime::media::input::MlxTensorInputInspector
     }
 
-    fn prepare_input<E: std::error::Error + Send + Sync + 'static>(
-        &self,
-        processor: &PreparedProcessor,
-        input: &TokenizedMultimodalRequest,
-        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-    ) -> Result<
-        (
-            eredu_runtime::PreparedModelInput<crate::MlxTensor>,
-            Option<eredu_runtime::PreparedInputCacheIdentity>,
-        ),
-        eredu_core::BackendFailure,
-    > {
-        let prepared = ModelProcessor::from_prepared(processor.clone())
-            .prepare(input, encode_text)
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        Ok((
-            prepared.to_runtime_input()?,
-            prepared.cache_identity().cloned(),
-        ))
+    fn convert_tensor(&self, tensor: &Array) -> crate::MlxTensor {
+        crate::MlxTensor::from_array(tensor.clone())
     }
 }

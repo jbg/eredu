@@ -1,17 +1,19 @@
 //! Cold exact binding plans for independently leased TTS MoG units.
 
+use eredu_core::SubmissionBackend;
+
 use eredu_core::BackendFailure;
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Tensor};
-use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms, SubmissionBackend};
+use eredu_runtime::{LayeredTensorCohort, ParameterUnitMechanisms};
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
     recipe::{RecipeDtype, RecipeError},
     store::SharedCheckpointSource,
 };
+use eredu_core::residency::parameter_binding::WeightBinding;
 use eredu_runtime::{
     ComponentPreparationError, LocalModelLayout, PreparedComponent, RecipeBindingError,
-    WeightBinding,
 };
 
 use super::{
@@ -37,7 +39,7 @@ pub enum MogPreparationError {
     Coordination(#[from] eredu_runtime::replicated_execution::CollectiveCoordinationError),
     /// Communication requirements cannot be represented.
     #[error(transparent)]
-    Communication(#[from] eredu_runtime::CommunicationManifestError),
+    Communication(#[from] eredu_core::communication::CommunicationManifestError),
     /// Mog geometry cannot be constructed.
     #[error(transparent)]
     Mog(#[from] TtsError),
@@ -261,13 +263,12 @@ impl PreparedMogBindings {
 /// Validates bounded agreement and sum authority before native TP construction.
 pub fn validate_parallel_communication(
     dimensions: MogDimensions,
-    manifest: &eredu_runtime::CommunicationManifest,
+    manifest: &eredu_core::communication::CommunicationManifest,
     group: eredu_core::CollectiveGroupId,
 ) -> Result<(), MogPreparationError> {
     use eredu_core::checkpoint::TensorDtype;
-    use eredu_runtime::{
-        CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
-    };
+    use eredu_core::communication::CommunicationOperation;
+    use eredu_core::communication::{CommunicationOperationRequirement, CommunicationTensorLimits};
     dimensions.validate()?;
     let selected = eredu_runtime::replicated_execution::validate_collective_coordination(
         manifest,

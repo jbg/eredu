@@ -7,12 +7,26 @@ use eredu_nn::{
 
 use crate::ExpertPass;
 
+mod acquisition;
+pub use acquisition::{
+    acquire_addressable_demand, acquire_grouped_bank, BankAcquisitionError,
+    BankAcquisitionResources, BankPassStatistics, BankTierStatistics, BankTransfer,
+    GroupedBankAcquisitionGuard, ParameterBankStatistics,
+};
 mod agreement;
 mod banks;
 mod catalog;
 mod placement;
 mod quantization;
 mod route_intervention;
+mod storage;
+mod telemetry;
+pub use storage::{
+    publish_bank_parameter_replacements, AddressableParameterBank, SharedAddressableParameterBank,
+};
+pub use telemetry::{
+    ParameterBankResidencyReport, ParameterBanksResidencyReport, RowLookupPoolReport,
+};
 mod units;
 use crate::{
     observe_and_intervene, ActivationObserver, ParameterBankAccess, ParameterBankKey,
@@ -35,7 +49,10 @@ pub use placement::{
     AddressableBankPlacementError, AddressableBankSelectionError,
 };
 pub use preparation::{
-    AddressableBankPreparation, AddressableBankPreparationError, PreparedSelectedAddressableBank,
+    materialize_addressable_bank_conversion, preflight_addressable_bank,
+    prepare_addressable_bank_members, prepare_selected_addressable_bank,
+    AddressableBankPreparation, AddressableBankPreparationError, AddressableBankStorage,
+    PreparedAddressableBankStorage, PreparedSelectedAddressableBank,
 };
 pub use quantization::{
     prepare_addressable_bank_quantization, AddressableBankQuantizationBindings,
@@ -153,10 +170,12 @@ impl<'a> AddressableBankTaskCache<'a> {
         &mut self,
         target: &str,
         shape: &[usize],
-        companions: Option<&crate::QuantizationCompanionBindings>,
+        companions: Option<
+            &eredu_core::residency::parameter_binding::QuantizationCompanionBindings,
+        >,
         declare_outputs: impl FnOnce(
             &ReplicatedTextMaterializationTask,
-            &crate::QuantizationCompanionBindings,
+            &eredu_core::residency::parameter_binding::QuantizationCompanionBindings,
         ) -> Result<Vec<crate::ReplicatedTextOutputCompanion>, E>,
     ) -> Result<AddressableBankTask, E>
     where
@@ -202,7 +221,8 @@ pub struct AddressableBankParameter {
     recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
     source_output: eredu_checkpoint::recipe::RecipeMetadata,
     selected_bytes: u64,
-    quantization_companions: Option<crate::QuantizationCompanionBindings>,
+    quantization_companions:
+        Option<eredu_core::residency::parameter_binding::QuantizationCompanionBindings>,
 }
 
 impl AddressableBankParameter {
@@ -213,7 +233,9 @@ impl AddressableBankParameter {
         recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
         source_output: eredu_checkpoint::recipe::RecipeMetadata,
         selected_bytes: u64,
-        quantization_companions: Option<crate::QuantizationCompanionBindings>,
+        quantization_companions: Option<
+            eredu_core::residency::parameter_binding::QuantizationCompanionBindings,
+        >,
     ) -> Result<Self, AddressableBankMemberError> {
         Self::from_shared_task(
             binding_name,
@@ -232,7 +254,9 @@ impl AddressableBankParameter {
         recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
         source_output: eredu_checkpoint::recipe::RecipeMetadata,
         selected_bytes: u64,
-        quantization_companions: Option<crate::QuantizationCompanionBindings>,
+        quantization_companions: Option<
+            eredu_core::residency::parameter_binding::QuantizationCompanionBindings,
+        >,
     ) -> Result<Self, AddressableBankMemberError> {
         let task = shared_task.task();
         let binding_name = binding_name.into();
@@ -401,7 +425,9 @@ impl AddressableBankParameter {
     }
 
     /// Returns exact local scale and affine-bias binding names for a transform.
-    pub const fn quantization_companions(&self) -> Option<&crate::QuantizationCompanionBindings> {
+    pub const fn quantization_companions(
+        &self,
+    ) -> Option<&eredu_core::residency::parameter_binding::QuantizationCompanionBindings> {
         self.quantization_companions.as_ref()
     }
 }
@@ -599,7 +625,7 @@ impl AddressableBindingTransform {
 #[derive(Debug, Clone)]
 pub struct AddressableBankBindingPlan {
     key: ParameterBankKey,
-    bindings: Vec<crate::WeightBinding>,
+    bindings: Vec<eredu_core::residency::parameter_binding::WeightBinding>,
     transformations: std::collections::BTreeMap<String, AddressableBindingTransform>,
     footprint: AddressableBankFootprint,
     parameter_targets: std::collections::BTreeMap<String, String>,
@@ -612,7 +638,7 @@ impl AddressableBankBindingPlan {
         self.key
     }
     /// Source-side canonical bindings.
-    pub fn bindings(&self) -> &[crate::WeightBinding] {
+    pub fn bindings(&self) -> &[eredu_core::residency::parameter_binding::WeightBinding] {
         &self.bindings
     }
     /// Per-binding transforms selected by architecture admission.
@@ -644,7 +670,7 @@ impl AddressableBankBindingPlan {
         self,
     ) -> (
         ParameterBankKey,
-        Vec<crate::WeightBinding>,
+        Vec<eredu_core::residency::parameter_binding::WeightBinding>,
         std::collections::BTreeMap<String, AddressableBindingTransform>,
         AddressableBankFootprint,
         AddressableBankMemberPlacement,
@@ -771,7 +797,7 @@ where
             } else {
                 inferred
             };
-            let mut binding = crate::WeightBinding::from_recipe(
+            let mut binding = eredu_core::residency::parameter_binding::WeightBinding::from_recipe(
                 parameter.binding_name(),
                 recipe,
                 metadata.byte_len(),
@@ -807,12 +833,12 @@ where
             }
             bindings.push(binding);
         }
-        crate::WeightBindingPlan::new(&bindings).map_err(|error| {
-            AddressableBankMemberError::InvalidParameter {
+        eredu_core::residency::parameter_binding::WeightBindingPlan::new(&bindings).map_err(
+            |error| AddressableBankMemberError::InvalidParameter {
                 parameter: format!("{:?}", member.key()),
                 detail: error.to_string(),
-            }
-        })?;
+            },
+        )?;
         let footprint = AddressableBankFootprint::try_from_parameters(
             member.key(),
             bindings
@@ -1059,87 +1085,6 @@ pub enum AddressableBankMemberError {
     },
 }
 
-/// Generic indexed tensor movement required by bounded grouped execution.
-///
-/// Implementations expose integer-index discovery and tensor movement without
-/// receiving architecture plans, bank meaning, or text lifecycle policy.
-pub trait IndexedMovement<B>
-where
-    B: GroupedNeuralBackend,
-{
-    /// Indexed movement failure.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Returns deterministic demand counts for integer indices below `upper_bound`.
-    fn index_demands(
-        &mut self,
-        indices: &B::Tensor,
-        upper_bound: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Vec<(usize, u64)>, Self::Error>;
-
-    /// Rewrites source indices through one exact source-to-compact mapping.
-    fn remap_indices(
-        &mut self,
-        indices: &B::Tensor,
-        mapping: &[(usize, usize)],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
-
-    /// Selects a contiguous range along the leading row axis.
-    fn select_rows(
-        &mut self,
-        value: &B::Tensor,
-        start: usize,
-        end: usize,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
-
-    /// Concatenates row partitions in their original order.
-    fn concatenate_rows(
-        &mut self,
-        values: &[B::Tensor],
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Self::Error>;
-}
-
-/// Backend-neutral tensor movement needed by an expert-exchange protocol.
-///
-/// Architecture code supplies already validated row and flattened-route
-/// indices. Implementations retain tensor storage and completion ownership;
-/// they do not receive expert identities, topology, or model-family policy.
-pub trait ExpertRouteTensorMovement<T> {
-    /// Tensor movement failure.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Returns the logical tensor shape without materializing its values.
-    fn shape(&self, value: &T) -> Vec<usize>;
-
-    /// Duplicates and reorders leading-axis rows in the supplied order.
-    fn gather_rows(&mut self, value: &T, rows: &[usize]) -> Result<T, Self::Error>;
-
-    /// Selects flattened route scalars and returns them as `[routes, 1]`.
-    fn gather_route_values(
-        &mut self,
-        value: &T,
-        flattened_routes: &[usize],
-    ) -> Result<T, Self::Error>;
-
-    /// Additively combines route rows into their architecture source rows.
-    /// With sequential reduction, consume each destination's contributions in
-    /// supplied row order, rounding to the input dtype after every addition.
-    ///
-    /// Every input row must be consumed exactly once. Repeated destination
-    /// rows are intentional and implement weighted routed-expert summation.
-    fn scatter_add_rows(
-        &mut self,
-        value: T,
-        destination_rows: &[usize],
-        output_rows: usize,
-        reduction: eredu_nn::GroupReduction,
-    ) -> Result<T, Self::Error>;
-}
-
 /// Opaque variable-count transport used by architecture-owned expert routing.
 ///
 /// Implementations must preserve peer-block and within-block order, validate
@@ -1157,14 +1102,14 @@ pub trait ExpertRouteExchange<T> {
     /// Exchanges one tensor whose leading rows match the supplied peer counts.
     fn exchange_tensor(
         &mut self,
-        counts: &crate::CommunicationPeerCounts,
+        counts: &eredu_core::communication::CommunicationPeerCounts,
         value: T,
     ) -> Result<T, Self::Error>;
 
     /// Exchanges one unsigned metadata value per leading tensor row.
     fn exchange_indices(
         &mut self,
-        counts: &crate::CommunicationPeerCounts,
+        counts: &eredu_core::communication::CommunicationPeerCounts,
         values: Vec<usize>,
     ) -> Result<Vec<usize>, Self::Error>;
 }
@@ -1283,10 +1228,16 @@ pub trait AddressableExpertRouteProvider<T> {
 /// The mechanism receives already translated bank keys, compact specifications,
 /// and access classes. Architecture identity, routing policy, global identity
 /// mapping, chunking, and text-session behavior remain outside this contract.
-pub trait AddressableGroupedBank<B>: crate::ParameterBank<B>
+pub trait AddressableGroupedBank<B>:
+    crate::ParameterBank<B, Error: From<eredu_core::BackendFailure>>
 where
     B: GroupedNeuralBackend,
 {
+    /// Holds stable access to this pool while the driver admits and acquires it.
+    fn acquisition_guard(
+        &self,
+    ) -> Result<impl GroupedBankAcquisitionGuard<Residency = Self::Residency> + '_, Self::Error>;
+
     /// Constructs one compact gated-product operator from acquired bindings.
     fn gated_product_groups(
         &mut self,
@@ -2393,3 +2344,7 @@ where
         .map(RoutedExpertTensorParallelOutput::Partial)
     }
 }
+
+mod installed;
+
+pub use storage::ScopedParameterBank;

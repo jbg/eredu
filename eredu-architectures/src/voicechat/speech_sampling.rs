@@ -8,13 +8,15 @@
 //! phase agreement within that same transaction. Pass `None` for local execution;
 //! each coordinated operation requires fresh recorded invocation authority.
 
+use eredu_core::sampling::DenseSamplingBackend;
+
 use super::tts_conditioning_layered::ConditioningExecution;
 use super::tts_mog_layered::MogExecution;
 use super::tts_rvq_layered::RvqExecution;
 use super::tts_transformer_layered::TransformerExecution;
 use eredu_codec::ear::AudioDecoderExecution;
 use eredu_nn::{NeuralBackend, Tensor};
-use eredu_runtime::{DenseSamplingBackend, RealtimeGenerationBranch, RealtimeScheduleState};
+use eredu_runtime::{RealtimeGenerationBranch, RealtimeScheduleState};
 
 use super::{
     speech::{SpeechComponents, SpeechFrame, SpeechOutput},

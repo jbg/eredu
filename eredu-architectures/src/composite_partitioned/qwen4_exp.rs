@@ -82,11 +82,11 @@ impl PreparedConditionalPartition {
         S::LayerState: AttentionCache<B::Tensor>
             + RuntimeStateComponents<B>
             + eredu_runtime::RuntimeAppendStreams<B>,
-        V: AuthoritativeCompositePartitionVisitor<B, S>,
+        V: AuthoritativeCompositePartitionVisitor<B, S, crate::SelectedRoutedBank>,
     {
         let prepared = self.prepare::<B, S, V::Error>(context)?;
         visitor
-            .visit(prepared)
+            .visit(prepared.into_binding::<B, S>())
             .map_err(CompositePartitionPreparationError::Visitor)
     }
 
@@ -94,7 +94,7 @@ impl PreparedConditionalPartition {
         self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
-        PreparedCompositePartition<
+        AdmittedCompositePartition<
             ConditionalModel<B>,
             TargetTensorPartition,
             <ConditionalModel<B> as PartitionedLayeredArchitecture<B, S>>::Boundary,
@@ -262,7 +262,6 @@ impl PreparedConditionalPartition {
         let routed = prepared_gated_composite_execution::<B, S, _>(
             &selected,
             &architecture,
-            &layout,
             experts,
             owner_units,
             target.spec().units.len(),
@@ -304,7 +303,7 @@ impl PreparedConditionalPartition {
         self,
         context: &<B::Tensor as Tensor>::Context,
         visitor: V,
-        binding: crate::prepared_execution::PredictionBinding,
+        binding: crate::prepared_execution::RetainedPredictionBinding,
     ) -> Result<V::Output, CompositePartitionPreparationError<V::Error>>
     where
         B: eredu_nn::TensorParallelGroupedNeuralBackend
@@ -316,7 +315,7 @@ impl PreparedConditionalPartition {
         S::LayerState: AttentionCache<B::Tensor>
             + RuntimeStateComponents<B>
             + eredu_runtime::RuntimeAppendStreams<B>,
-        V: AuthoritativeCompositePartitionVisitor<B, S>,
+        V: AuthoritativeCompositePartitionVisitor<B, S, crate::SelectedRoutedBank>,
     {
         let prediction = self
             .prediction_weights::<B>(context)
@@ -365,11 +364,11 @@ impl PreparedConditionalPartition {
         retained.extend_banks(banks).map_err(invalid)?;
         prepared.provider_layout = Some(provider_layout);
         visitor.visit_prediction(
-            prepared,
+            prepared.into_binding::<B, S>(),
             prediction,
             target_source,
             provider_source,
-            binding,
+            binding.into_facts(),
         )
     }
 }

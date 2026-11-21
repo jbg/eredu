@@ -1,5 +1,8 @@
 //! Portable Audio graph construction from retained routes and native mechanisms.
 
+use eredu_core::SubmissionBackend;
+
+use eredu_core::sampling::SamplingBackend;
 use eredu_core::BackendFailure;
 use eredu_nn::{
     DistributedNeuralBackend, GroupedNeuralBackend, NeuralBackend, RetainedTensorRoots, Tensor,
@@ -7,8 +10,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     execution_control::SnapshotRetainedGrowth, ComponentRankMechanisms, LocalComponentMechanisms,
-    PlacementRank, RealtimeGraphMechanisms, RealtimeStateMaterializer, SamplingBackend,
-    StateLayout, SubmissionBackend,
+    PlacementRank, RealtimeGraphMechanisms, StateLayout,
 };
 
 use super::{
@@ -42,6 +44,10 @@ where
         self.mechanisms.context()
     }
 
+    fn realize_state(&self, layout: &StateLayout) -> Result<Self::State, BackendFailure> {
+        self.mechanisms.realize_state(layout)
+    }
+
     fn branch_state(state: &Self::State) -> Result<Self::State, BackendFailure> {
         M::branch_state(state)
     }
@@ -50,27 +56,14 @@ where
         M::retained_values(state)
     }
 
-    fn with_input_recovery<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Result<T, E>
-    where
-        E: From<BackendFailure>,
-    {
-        M::with_input_recovery(operation)
+    fn open_input_recovery() -> Result<impl Sized, BackendFailure> {
+        M::open_input_recovery()
     }
 
-    fn with_fork_retention<T>(
+    fn hold_fork_retention(
         retention: SnapshotRetainedGrowth,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, BackendFailure> {
-        M::with_fork_retention(retention, operation)
-    }
-}
-
-impl<M, P, S> RealtimeStateMaterializer<StateLayout, S> for PlacedAudio<M, P>
-where
-    M: RealtimeStateMaterializer<StateLayout, S>,
-{
-    fn realize_state(&self, layout: &StateLayout) -> Result<S, BackendFailure> {
-        self.mechanisms.realize_state(layout)
+    ) -> Result<impl Sized, BackendFailure> {
+        M::hold_fork_retention(retention)
     }
 }
 

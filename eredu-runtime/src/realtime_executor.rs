@@ -4,6 +4,9 @@
 //! decisions, delayed payload history, and exact completion attachment. Model
 //! equations and native tensor operations remain behind narrow injected traits.
 
+use eredu_core::realtime_mechanisms::{
+    RealtimeCompletionCreationError, RealtimeFrameTensorMechanisms, RealtimeHostTokenMaterializer,
+};
 use std::{cell::RefCell, sync::Arc};
 
 use eredu_core::{
@@ -14,12 +17,12 @@ use eredu_core::{
 use crate::{
     complete_realtime_frame, prepare_realtime_frame, CompletedRealtimeFrame,
     MaterializedRealtimeInput, RealtimeCompletionAttachmentError, RealtimeFrameInterpretationError,
-    RealtimeFrameTensorMechanisms, RealtimeGenerationBranch, RealtimeHostTokenMaterializer,
-    RealtimeIngressContract, RealtimeIngressError, RealtimePayloadBranch, RealtimePayloadContract,
-    RealtimePayloadContractError, RealtimePayloadHistory, Sampler, SamplingBackend,
+    RealtimeGenerationBranch, RealtimeIngressContract, RealtimeIngressError, RealtimePayloadBranch,
+    RealtimePayloadContract, RealtimePayloadContractError, RealtimePayloadHistory, Sampler,
     SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
     SequentialDecisionPlanError,
 };
+use eredu_core::sampling::SamplingBackend;
 
 /// Architecture-owned execution of one already interpreted realtime frame.
 ///
@@ -91,31 +94,6 @@ pub struct RealtimeFrameResources<'a, T, M, R> {
     pub payload_history: &'a RealtimePayloadHistory<T>,
     /// Additional architecture execution resources.
     pub execution: Option<R>,
-}
-
-/// Failure before completion creation or after native work already began.
-pub enum RealtimeCompletionCreationError<C, E> {
-    /// No native work escaped the failed completion operation.
-    BeforeSubmission(E),
-    /// Native work began and its exact quarantine completion must be retained.
-    AfterSubmission {
-        /// Original native submission failure.
-        error: E,
-        /// Exact completion retaining every possibly live resource.
-        completion: C,
-    },
-}
-
-impl<C, E> RealtimeCompletionCreationError<C, E> {
-    /// Reports a failure proven to precede native submission.
-    pub const fn before_submission(error: E) -> Self {
-        Self::BeforeSubmission(error)
-    }
-
-    /// Reports a failure after submission while preserving quarantine ownership.
-    pub const fn after_submission(error: E, completion: C) -> Self {
-        Self::AfterSubmission { error, completion }
-    }
 }
 
 /// Submission failure which preserves exact quarantine ownership in the branch.
@@ -847,9 +825,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        PenaltyConfig, RealtimeGenerationState, RealtimePayloadGeneration,
-        RealtimePayloadOwnerIdentity, RealtimePayloadState, TokenDomain,
+        RealtimeGenerationState, RealtimePayloadGeneration, RealtimePayloadOwnerIdentity,
+        RealtimePayloadState,
     };
+    use eredu_core::sampling::{PenaltyConfig, TokenDomain};
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct Matrix {

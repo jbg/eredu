@@ -30,7 +30,6 @@ pub fn generated_capture_source(
 }
 
 #[derive(Debug, thiserror::Error)]
-#[cfg(feature = "tensor-capture")]
 pub(super) enum GeneratedFailure<E: std::error::Error + 'static> {
     #[error(transparent)]
     Backend(E),
@@ -44,7 +43,6 @@ pub(super) enum GeneratedFailure<E: std::error::Error + 'static> {
     Admission(CaptureError),
 }
 
-#[cfg(feature = "tensor-capture")]
 pub(super) struct GeneratedCapture<'a, B: CaptureBackend> {
     backend: &'a mut B,
     generate: &'a mut dyn FnMut() -> Result<B::Tensor, GeneratedFailure<B::Error>>,
@@ -52,7 +50,6 @@ pub(super) struct GeneratedCapture<'a, B: CaptureBackend> {
     value: Option<B::Tensor>,
 }
 
-#[cfg(feature = "tensor-capture")]
 impl<B: CaptureBackend> CaptureBackend for GeneratedCapture<'_, B> {
     type Tensor = B::Tensor;
     type Error = GeneratedFailure<B::Error>;
@@ -85,6 +82,7 @@ impl<B: CaptureBackend> CaptureBackend for GeneratedCapture<'_, B> {
         prototype: &Self::Tensor,
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
+        score_row: Option<u64>,
     ) -> Result<CapturePayload, Self::Error> {
         if elements(&slice.shape).map_err(GeneratedFailure::Admission)? == 0 {
             return super::empty_payload(
@@ -123,12 +121,12 @@ impl<B: CaptureBackend> CaptureBackend for GeneratedCapture<'_, B> {
                 self.value.as_ref().expect("generated value"),
                 selection,
                 slice,
+                score_row,
             )
             .map_err(GeneratedFailure::Backend)
     }
 }
 
-#[cfg(feature = "tensor-capture")]
 impl CaptureSession {
     /// Uses the same scheduled record, ledger and synchronous transformation path
     /// as an existing activation. Factory errors retain the observer's error type.
@@ -151,7 +149,6 @@ impl CaptureSession {
 /// Keeps deferred construction and its original error in one shared adapter.
 /// Both ordinary observations and partition fragments enter the same reservation
 /// path before invoking the factory; the prototype supplies geometry only.
-#[cfg(feature = "tensor-capture")]
 pub(super) fn capture_generated<B: CaptureBackend, E, T>(
     backend: &mut B,
     source: &GeneratedCaptureSource,
@@ -195,7 +192,6 @@ pub(super) fn capture_generated<B: CaptureBackend, E, T>(
 }
 
 // The host record and returned error must describe the same failure category.
-#[cfg(feature = "tensor-capture")]
 fn classify_generated_failure<E: std::error::Error + 'static>(
     error: CaptureExecutionError<GeneratedFailure<E>>,
 ) -> CaptureExecutionError<GeneratedFailure<E>> {

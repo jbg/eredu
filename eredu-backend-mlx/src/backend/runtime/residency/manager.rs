@@ -1,19 +1,16 @@
 //! MLX materialization and transfer execution for immutable weight units.
 //!
-//! A [`crate::backend::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
-//! checkpoint selections from an [`eredu_checkpoint::store::CheckpointSource`] into
-//! immutable typed host-transfer buffers or execution-stream arrays. The
-//! manager accounts for logical host and device copies independently, even on
-//! unified-memory systems.
-//! Missing units can be reserved and submitted as one batch. Caller-owned
-//! [`crate::backend::runtime::residency::manager::ResidentTransfer`] values retain
-//! source leases until MLX reports exact completion of the submitted
-//! transfer.
+//! Materializes exact checkpoint selections as immutable host-transfer buffers
+//! or execution-stream arrays. The portable residency driver accounts for
+//! logical host and device copies separately. MLX submits the admitted batches
+//! and retains their native resources through exact completion.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Condvar, Mutex, MutexGuard},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use safemlx::{
@@ -31,19 +28,15 @@ use crate::{
     },
 };
 use eredu_core::residency::{
-    EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId, PrefetchOutcome,
-    ResidencyLedgerError, TransferDirection, UnitResidencyReport,
+    MemoryTier, OffloadUnitId, ResidencyLease, ResidencyLeaseStorage, ResidencyLedgerError,
+    TransferDirection,
 };
 
-use eredu_runtime::residency::{
-    OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyLease,
-    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyWindowError, ResidencyWindowManager,
-    WeightBinding,
-};
-use eredu_runtime::ResidencyReport;
+use eredu_core::residency::parameter_binding::WeightBinding;
+use eredu_core::residency::ResidencyObservationBindings;
 
 /// A resident unit that prevents eviction of one tier until it is dropped.
-pub type ResidentUnitLease = ResidencyLease<ResidentLeaseStorage, ManagerInner>;
+pub type ResidentUnitLease = ResidencyLease<ResidentLeaseStorage>;
 
 /// Host or device storage retained by a weight-residency lease.
 pub enum ResidentLeaseStorage {
@@ -119,33 +112,19 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
 pub enum ResidencyError {
     /// Conversion registration or selection conflicts with its shared authority.
     #[error(transparent)]
-    ConversionRetention(
-        #[from] eredu_runtime::residency::conversion_retention::ConversionRetentionError,
-    ),
-    /// Fixed retention selection cannot change after registering native owners.
-    #[error("parameter conversion retention is already registered")]
-    ConversionRetentionAlreadyRegistered,
+    ConversionRetention(#[from] eredu_core::residency::conversion_claim::ConversionRetentionError),
     /// A backend resource observation violates its neutral accounting contract.
     #[error(transparent)]
     ResourceObservation(#[from] eredu_core::resources::ResourceDescriptionError),
-    /// A complete owner binding set is unsupported by the MLX parameter backend.
-    #[error("MLX residency binding preflight failed: {0}")]
-    BindingPreflight(String),
     /// A backend-neutral binding or offload-unit declaration was invalid.
     #[error(transparent)]
-    Declaration(#[from] eredu_runtime::residency::ResidencyDeclarationError),
+    Declaration(#[from] eredu_core::residency::parameter_binding::ResidencyDeclarationError),
     /// Backend-neutral ownership or capacity transition failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Ledger(#[from] ResidencyLedgerError),
-    /// Backend-neutral plan and declaration validation failed.
-    #[error(transparent)]
-    Controller(#[from] ResidencyControllerError),
     /// Backend-neutral binding selection rewrite failed.
     #[error(transparent)]
-    BindingSelection(#[from] eredu_runtime::residency::WeightBindingSelectionError),
-    /// Backend-neutral ordered-window validation or accounting failed.
-    #[error(transparent)]
-    Window(#[from] ResidencyWindowError),
+    BindingSelection(#[from] eredu_core::residency::parameter_binding::WeightBindingSelectionError),
     /// Binding sizes did not sum to the plan's unit size.
     #[error(
         "residency unit {id} defines {actual_bytes} bytes but its plan reserves {planned_bytes}"
@@ -245,729 +224,40 @@ pub enum ResidencyError {
         #[source]
         source: safemlx::error::Exception,
     },
-    /// Serialized manager state was poisoned by a prior panic.
+    /// Failure reported by the owner of the residency operation.
+    #[error("{0}")]
+    Operation(#[from] eredu_core::BackendFailure),
+    /// Native storage no longer matches its admitted slots.
     #[error("residency manager state is poisoned")]
     StatePoisoned,
 }
 
-/// Serialized, shareable manager for immutable checkpoint weight residency.
+/// Native resources shared by this residency installation.
+#[doc(hidden)]
 #[derive(Clone)]
-pub struct ResidencyManager {
-    inner: Arc<ManagerInner>,
+pub struct MlxResidencyResources {
+    failed_transfer: Arc<AtomicBool>,
+    resource_identity: eredu_core::resources::ResourceIdentity,
 }
 
-/// Immutable source identity is retained per physical unit. Transformed modules
-/// may use the same source key with different geometry or values.
-pub(super) struct ResidencySources {
-    primary: eredu_checkpoint::store::SharedCheckpointSource,
-    units: BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
-    row_ranges: Vec<eredu_runtime::RowResidencyRange>,
-}
-impl ResidencySources {
-    fn source(&self, unit: &OffloadUnitId) -> &dyn eredu_checkpoint::store::CheckpointSource {
-        if let Some(source) = self.units.get(unit) {
-            return source.as_ref();
-        }
-        if let Some(range) = self
-            .row_ranges
-            .iter()
-            .find(|range| range.range().member(unit).is_some())
-        {
-            return range.source();
-        }
-        self.primary.as_ref()
-    }
-}
-
-fn preflight_residency_owner_bindings(
-    sources: &ResidencySources,
-    control: &ResidencyController,
-) -> Result<(), ResidencyError> {
-    for unit in control.units() {
-        // The controller has already resolved and validated global aliases.
-        // Preflight only materialized owners against their exact source; a
-        // per-unit alias plan cannot resolve an owner in a different unit.
-        let owners = unit
-            .bindings()
-            .iter()
-            .filter(|b| !b.is_alias())
-            .cloned()
-            .collect::<Vec<_>>();
-        eredu_runtime::preflight_bindings::<MlxNeuralBackend>(sources.source(unit.id()), &owners)
-            .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
-    }
-    Ok(())
-}
-
-impl ResidencyManager {
-    /// Returns the MLX stream index used for device residency transfers.
-    pub fn device_stream_index(&self) -> Result<i32, ResidencyError> {
-        self.lock()?
-            .device_stream
-            .get_index()
-            .map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "device residency stream index",
-                source,
-            })
-    }
-
-    /// Validates plan/unit identity, binding sizes, selections, and streams.
-    ///
-    /// Construction does not create MLX arrays. Call [`Self::initialize`] to
-    /// materialize units assigned to host or device by the plan.
-    pub fn new<S>(
-        store: Arc<S>,
-        plan: OffloadPlan,
-        units: impl IntoIterator<Item = OffloadUnit>,
-        source_stream: Stream,
-        device_stream: Stream,
-    ) -> Result<Self, ResidencyError>
-    where
-        S: eredu_checkpoint::store::CheckpointSource + 'static,
-    {
-        let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = store;
-        Self::new_shared(store, plan, units, source_stream, device_stream)
-    }
-
-    /// Creates a manager from an already type-erased checkpoint store.
-    pub fn new_shared(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-        plan: OffloadPlan,
-        units: impl IntoIterator<Item = OffloadUnit>,
-        source_stream: Stream,
-        device_stream: Stream,
-    ) -> Result<Self, ResidencyError> {
-        Self::new_shared_sources(
-            store,
-            BTreeMap::new(),
-            plan,
-            units,
-            source_stream,
-            device_stream,
-        )
-    }
-
-    /// Creates one shared reservation ledger over exact per-unit source stores.
-    /// Units absent from `unit_sources` use the primary source. Sources are
-    /// retained as admitted; no checkpoint is reopened or resolved here.
-    pub fn new_shared_sources(
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-        unit_sources: BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
-        plan: OffloadPlan,
-        units: impl IntoIterator<Item = OffloadUnit>,
-        source_stream: Stream,
-        device_stream: Stream,
-    ) -> Result<Self, ResidencyError> {
-        Self::new_shared_row_ranges(
-            store,
-            unit_sources,
-            plan,
-            units,
-            Vec::new(),
-            source_stream,
-            device_stream,
-        )
-    }
-
-    /// Realizes compact row catalogs with the same reservation, transfer and
-    /// completion machinery used by explicit immutable parameter units.
-    pub fn new_shared_row_ranges(
-        store: eredu_checkpoint::store::SharedCheckpointSource,
-        unit_sources: BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
-        plan: OffloadPlan,
-        units: impl IntoIterator<Item = OffloadUnit>,
-        row_ranges: Vec<eredu_runtime::RowResidencyRange>,
-        source_stream: Stream,
-        device_stream: Stream,
-    ) -> Result<Self, ResidencyError> {
-        let sources = ResidencySources {
-            primary: store,
-            units: unit_sources,
-            row_ranges: row_ranges.clone(),
-        };
-        let units = units.into_iter().collect::<Vec<_>>();
-        use eredu_core::residency::ParameterConversionRetentionEligibility as Eligibility;
-        let eligibility = if plan.config().device_budget_bytes().is_some() {
-            Eligibility::DeviceResidencyLimit
-        } else if !row_ranges.is_empty()
-            || plan
-                .units()
-                .iter()
-                .any(|unit| unit.tier() == MemoryTier::Disk)
-        {
-            Eligibility::DiskStreamed
-        } else if plan
-            .units()
-            .iter()
-            .any(|unit| unit.tier() == MemoryTier::Host)
-        {
-            Eligibility::HostLayerwise
-        } else {
-            Eligibility::Eligible
-        };
-        let budget = crate::backend::nn::parameter_conversion::execution_budget(None, eligibility)?;
-        let control = ResidencyController::new_with_row_ranges(
-            |id| sources.source(id),
-            plan,
-            units,
-            row_ranges,
-        )?
-        .with_conversion_retention(budget);
-        for id in sources.units.keys() {
-            if control.unit(id).is_none() {
-                return Err(
-                    ResidencyControllerError::UnexpectedUnitDefinition { id: id.clone() }.into(),
-                );
-            }
-        }
-        preflight_residency_owner_bindings(&sources, &control)?;
-
-        let source_device = source_stream
-            .get_device()
-            .map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "source stream inspection",
-                source,
-            })?;
-        if source_device
-            .get_type()
-            .map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "source device inspection",
-                source,
-            })?
-            != DeviceType::Cpu
-        {
-            return Err(ResidencyError::InvalidSourceStream);
-        }
-
-        let storage = control
-            .units()
-            .map(|unit| (unit.id().clone(), UnitStorage::default()))
-            .collect();
-        let failed_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        Ok(Self {
-            inner: Arc::new(ManagerInner {
-                resource_identity: host_resources::identity("mlx.residency_manager"),
-                sources,
-                failed_transfer: Arc::clone(&failed_transfer),
-                state: Mutex::new(ManagerState {
-                    failed_transfer,
-                    conversion_retention_registered: false,
-                    control,
-                    storage,
-                    alias_owner_pins: BTreeSet::new(),
-                    materialization: MlxParameterMaterializationContext::new(
-                        &source_stream,
-                        &device_stream,
-                    ),
-                    source_stream,
-                    device_stream,
-                }),
-                changed: Condvar::new(),
-            }),
-        })
-    }
-
-    /// Declared permanent owners among the selected execution-unit identities.
-    /// Compact ranges are resolved only for those identities, without expansion.
-    pub(crate) fn pinned_unit_ids(
-        &self,
-        ids: &[OffloadUnitId],
-    ) -> Result<BTreeSet<OffloadUnitId>, ResidencyError> {
-        let state = self.observation_lock()?;
-        let plan = state.control.ledger().plan();
-        Ok(ids
-            .iter()
-            .filter(|id| {
-                plan.unit(id).is_some_and(|unit| {
-                    unit.policy() == eredu_core::residency::ResidencyPolicy::Pinned
-                })
-            })
-            .cloned()
-            .collect())
-    }
-
-    /// Materializes all planned host and device units in identifier order.
-    ///
-    /// Disk units remain array-free. A failure never publishes a partial unit;
-    /// units completed earlier remain resident and fully accounted, allowing a
-    /// caller to inspect the report and retry initialization.
-    pub fn initialize(&self) -> Result<(), ResidencyError> {
-        let mut state = self.lock()?;
-        if state.control.ledger_mut().initialized() {
-            return Ok(());
-        }
-        let assignments = state
-            .control
-            .ledger_mut()
-            .plan()
-            .units()
-            .iter()
-            .map(|unit| (unit.id().clone(), unit.tier()))
-            .collect::<Vec<_>>();
-        for (id, tier) in assignments {
-            if tier != MemoryTier::Disk {
-                ensure_resident(&mut state, &self.inner.sources, &id, tier, true)?;
-            }
-        }
-        state.control.ledger_mut().mark_initialized();
-        Ok(())
-    }
-
-    /// Synchronously prepares one host or device copy and records hit/miss telemetry.
-    ///
-    /// This provides caller-directed lookahead but does not overlap transfer
-    /// with computation.
-    pub fn prefetch(
-        &self,
-        id: &OffloadUnitId,
-        tier: MemoryTier,
-    ) -> Result<PrefetchOutcome, ResidencyError> {
-        validate_target(tier, "prefetch")?;
-        let mut state = self.lock()?;
-        loop {
-            state.control.ledger_mut().require_initialized()?;
-            let copy = state.control.ledger_mut().copy_status(id, tier)?;
-            if !copy.is_some_and(|copy| copy.in_flight().is_some()) {
-                break;
-            }
-            state = self.wait_for_transfer(state)?;
-        }
-        prefetch_locked(&mut state, &self.inner.sources, id, tier)
-    }
-
-    /// Ensures residency and returns an RAII lease protecting the requested copy.
-    pub fn acquire(
-        &self,
-        id: &OffloadUnitId,
-        tier: MemoryTier,
-    ) -> Result<ResidentUnitLease, ResidencyError> {
-        self.acquire_with_demand(id, tier, 1)
-    }
-
-    /// Ensures residency and records weighted demand for eviction policy.
-    ///
-    /// `demand` may be larger than one when duplicate entry requests
-    /// share a single acquisition. Frequency counters saturate on overflow.
-    pub fn acquire_with_demand(
-        &self,
-        id: &OffloadUnitId,
-        tier: MemoryTier,
-        demand: u64,
-    ) -> Result<ResidentUnitLease, ResidencyError> {
-        self.acquire_many_with_demand(&[(id.clone(), demand)], tier)?
-            .pop()
-            .ok_or(ResidencyError::StatePoisoned)
-    }
-
-    /// Acquires a deterministic entry set with one batched residency transition.
-    ///
-    /// Missing copies reserve capacity before any materialization starts. All
-    /// requested units are protected from eviction, all lazy outputs are
-    /// evaluated together, and leases are published only after the batch is
-    /// complete.
-    pub fn acquire_many_with_demand(
-        &self,
-        requests: &[(OffloadUnitId, u64)],
-        tier: MemoryTier,
-    ) -> Result<Vec<ResidentUnitLease>, ResidencyError> {
-        self.acquire_many_with_mode(requests, tier, false)
-            .map(|(leases, _)| leases)
-    }
-
-    /// Submits one residency batch and returns its owning completion lease.
-    ///
-    /// Missing copies are submitted to MLX for asynchronous evaluation, but
-    /// this method does not block the host for their completion. Call
-    /// [`ResidentTransfer::order_after`] before evaluating work on another
-    /// compatible stream. The transfer guard owns every source dependency
-    /// until it is synchronized or dropped.
-    pub fn acquire_many_with_transfer(
-        &self,
-        requests: &[(OffloadUnitId, u64)],
-        tier: MemoryTier,
-    ) -> Result<ResidentTransfer, ResidencyError> {
-        let (leases, submitted) = self.acquire_many_with_mode(requests, tier, true)?;
-        let transfer = match submitted {
-            None => ResidentTransfer::immediate(leases, tier),
-            Some(submitted) => ResidentTransfer::submitted(leases, submitted),
-        };
-        Ok(transfer)
-    }
-
-    fn acquire_many_with_mode(
-        &self,
-        requests: &[(OffloadUnitId, u64)],
-        tier: MemoryTier,
-        return_transfer: bool,
-    ) -> Result<(Vec<ResidentUnitLease>, Option<SubmittedResidentTransfer>), ResidencyError> {
-        validate_target(tier, "acquire")?;
-        let mut state = self.lock()?;
-        let ids = requests
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        state.control.ledger_mut().validate_batch(&ids, tier)?;
-        loop {
-            state.control.ledger_mut().require_initialized()?;
-            for (id, _) in requests {
-                state.control.ledger_mut().spec(id)?;
-            }
-            let waiting = requests.iter().any(|(id, _)| {
-                state
-                    .control
-                    .ledger_mut()
-                    .copy_status(id, tier)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|copy| copy.in_flight().is_some())
-            });
-            if !waiting {
-                break;
-            }
-            state = self.wait_for_transfer(state)?;
-        }
-        let missing = requests
-            .iter()
-            .filter(|(id, _)| {
-                !state
-                    .control
-                    .ledger_mut()
-                    .is_resident(id, tier)
-                    .unwrap_or(false)
-            })
-            .count();
-        let started = Instant::now();
-        let residency = ensure_many_resident(
-            &mut state,
-            &self.inner.sources,
-            &ids,
-            tier,
-            return_transfer,
-            false,
-        );
-        if missing > 0 {
-            state
-                .control
-                .ledger_mut()
-                .record_prefetch_stall(started.elapsed());
-        }
-        let (_, submitted) = residency?;
-        if let Some(submitted) = &submitted {
-            submitted.attach_owner(Arc::downgrade(&self.inner));
-        }
-        let mut leases = crate::backend::ordinary_retirement::OrdinaryRetirement::new(Vec::new());
-        let acquired = (|| -> Result<(), ResidencyError> {
-            for (id, demand) in requests {
-                let unit = state.storage.get(id).ok_or(ResidencyError::StatePoisoned)?;
-                let storage = match tier {
-                    MemoryTier::Host => ResidentLeaseStorage::Host(Arc::clone(
-                        unit.host.as_ref().ok_or(ResidencyError::StatePoisoned)?,
-                    )),
-                    MemoryTier::Device => ResidentLeaseStorage::Device(Arc::clone(
-                        unit.device.as_ref().ok_or(ResidencyError::StatePoisoned)?,
-                    )),
-                    MemoryTier::Disk => unreachable!("validated above"),
-                };
-                state.control.ledger_mut().pin(id, tier, *demand)?;
-                leases.push(ResidentUnitLease::new(
-                    id.clone(),
-                    tier,
-                    storage,
-                    Arc::downgrade(&self.inner),
-                ));
-            }
-            Ok(())
-        })();
-        if let Err(error) = acquired {
-            if let Some(submitted) = &submitted {
-                submitted.retain_partial_leases(leases.into_inner());
-            }
-            return Err(error);
-        }
-        Ok((leases.into_inner(), submitted))
-    }
-
-    /// Returns whether a logical copy currently resides in a memory tier.
-    pub fn is_resident(
-        &self,
-        id: &OffloadUnitId,
-        tier: MemoryTier,
-    ) -> Result<bool, ResidencyError> {
-        validate_target(tier, "is_resident")?;
-        let state = self.lock()?;
-        Ok(state.control.ledger().is_resident(id, tier)?)
-    }
-
-    /// Replaces the protected window and synchronously prepares bounded lookahead.
-    ///
-    /// `active` units are protected from automatic eviction. At most the first
-    /// configured number of distinct `upcoming` units are prefetched, in caller
-    /// order. Repeated and overlapping windows are deterministic.
-    pub fn prepare_window(
-        &self,
-        active: &[OffloadUnitId],
-        upcoming: &[OffloadUnitId],
-        tier: MemoryTier,
-    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
-        self.prepare_group_window("default", active, upcoming, tier)
-    }
-
-    /// Replaces one named group's protected window and prepares bounded lookahead.
-    ///
-    /// Protection owned by other groups remains active. This permits independent
-    /// text, vision, audio, temporal, and depth stack scheduling.
-    pub fn prepare_group_window(
-        &self,
-        group: &str,
-        active: &[OffloadUnitId],
-        upcoming: &[OffloadUnitId],
-        tier: MemoryTier,
-    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
-        validate_target(tier, "prepare_group_window")?;
-        let mut state = self.lock()?;
-        loop {
-            state.control.ledger_mut().require_initialized()?;
-            for id in active.iter().chain(upcoming) {
-                state.control.ledger_mut().spec(id)?;
-            }
-            let waiting = active.iter().chain(upcoming).any(|id| {
-                state
-                    .control
-                    .ledger_mut()
-                    .copy_status(id, tier)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|copy| copy.in_flight().is_some())
-            });
-            if !waiting {
-                break;
-            }
-            state = self.wait_for_transfer(state)?;
-        }
-        let selected = state
-            .control
-            .commit_group_window(group, active, upcoming, tier)?;
-        selected
-            .into_iter()
-            .map(|id| {
-                prefetch_locked(&mut state, &self.inner.sources, &id, tier)
-                    .map(|outcome| (id, outcome))
-            })
-            .collect()
-    }
-
-    /// Replaces one named protected window without materializing its units.
-    ///
-    /// This is used by schedulers that submit materialization through a
-    /// separate bounded service. Protection owned by other named windows is
-    /// preserved.
-    pub fn protect_group_window(
-        &self,
-        group: &str,
-        active: &[OffloadUnitId],
-        tier: MemoryTier,
-    ) -> Result<(), ResidencyError> {
-        let mut state = self.lock()?;
-        validate_target(tier, "protect_group_window")?;
-        state.control.protect_group_window(group, active, tier)?;
-        Ok(())
-    }
-
-    /// Explicitly evicts one host or device copy.
-    ///
-    /// Evicting an absent copy is an idempotent success returning `false`.
-    pub fn evict(&self, id: &OffloadUnitId, tier: MemoryTier) -> Result<bool, ResidencyError> {
-        validate_target(tier, "evict")?;
-        let mut state = self.lock()?;
-        let Some(evicted) = state.control.ledger_mut().evict(id, tier)? else {
-            return Ok(false);
-        };
-        if !state
-            .storage
-            .get_mut(id)
-            .is_some_and(|unit| unit.remove_storage(tier))
-        {
-            return Err(ResidencyError::StatePoisoned);
-        }
-        debug_assert_eq!(evicted.id, *id);
-        if state.control.retire_unit_if_unused(id)? {
-            state.storage.remove(id);
-        }
-        Ok(true)
-    }
-
-    /// Samples optional MLX allocator and process metrics on explicit request.
-    pub fn sample_memory(
-        &self,
-        include_mlx: bool,
-        include_process: bool,
-    ) -> Result<(), ResidencyError> {
-        let mut state = self.lock()?;
-        if include_mlx {
-            let metrics = sample_allocator_memory().map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "allocator memory sampling",
-                source,
-            })?;
-            state.control.ledger_mut().record_allocator_memory(metrics);
-        }
-        if include_process {
-            state.control.ledger_mut().sample_process_metrics();
-        }
-        Ok(())
-    }
-
-    /// Selects internal retention policy before permanent owners register.
-    pub(crate) fn configure_parameter_conversion_retention(
-        &self,
-        requested: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
-        eligibility: eredu_core::residency::ParameterConversionRetentionEligibility,
-    ) -> Result<(), ResidencyError> {
-        use eredu_core::residency::ParameterConversionRetentionEligibility as Eligibility;
-        let mut state = self.lock()?;
-        if state.conversion_retention_registered {
-            return Err(ResidencyError::ConversionRetentionAlreadyRegistered);
-        }
-        let prior = state
-            .control
-            .conversion_retention()
-            .expect("manager selection")
-            .report();
-        // A caller cannot override residency exclusions by requesting retention.
-        let eligibility = match &prior.policy.value().expect("exact policy").eligibility {
-            Eligibility::DeviceResidencyLimit => Eligibility::DeviceResidencyLimit,
-            Eligibility::HostLayerwise => Eligibility::HostLayerwise,
-            Eligibility::DiskStreamed => Eligibility::DiskStreamed,
-            _ => eligibility,
-        };
-        let budget =
-            crate::backend::nn::parameter_conversion::execution_budget(requested, eligibility)?;
-        state.control.set_conversion_retention(budget);
-        Ok(())
-    }
-
-    /// Enables reusable promotions only after all permanent device leases exist.
-    pub(crate) fn enable_resident_parameter_conversions(&self) -> Result<(), ResidencyError> {
-        let mut state = self.lock()?;
-        let budget = state
-            .control
-            .conversion_retention()
-            .expect("manager selection")
-            .clone();
-        state.conversion_retention_registered = true;
-        for unit in state
-            .storage
-            .values()
-            .filter_map(|unit| unit.device.as_ref())
-        {
-            unit.parameter_conversions
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .register(unit.arrays.values(), &budget)?;
-        }
-        Ok(())
-    }
-
-    /// Trims optional conversion claims after the session establishes completion.
-    pub(crate) fn trim_parameter_conversions(
-        &self,
-    ) -> Result<
-        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        let state = self
-            .lock()
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        let budget = state
-            .control
-            .conversion_retention()
-            .expect("manager selection");
-        crate::backend::nn::parameter_conversion::trim_budget(budget)
-            .map(|report| vec![report])
-            .map_err(|error| match error {
-                eredu_runtime::residency::conversion_retention::ConversionRetentionError::Busy => {
-                    eredu_core::residency::ParameterConversionTrimError::NotQuiescent
-                }
-                error => eredu_core::BackendFailure::from_error(error).into(),
-            })
-    }
-
-    /// Returns the retained generic pool limits without acquiring parameter data.
-    pub fn offload_config(&self) -> Result<eredu_core::residency::OffloadConfig, ResidencyError> {
-        Ok(self.lock()?.control.ledger().plan().config())
-    }
-
-    /// Resolves an exact retained compact catalog without materializing any row.
-    pub fn row_range(&self, prefix: &OffloadUnitId) -> Option<&eredu_runtime::RowResidencyRange> {
-        self.inner
-            .sources
-            .row_ranges
-            .iter()
-            .find(|range| range.range().prefix() == prefix)
-    }
-
-    /// Returns an immutable point-in-time residency and storage report.
-    pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
-        let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;
-        let retention = self
-            .observation_lock()?
-            .control
-            .conversion_retention()
-            .expect("manager selection")
-            .report();
-        let offload = offload.with_parameter_conversion_retention(eredu_core::Observed::exact(
-            vec![retention],
-            "MLX execution conversion admission ledger",
-        ));
-        Ok(ResidencyReport::new(
-            initialized,
-            offload,
-            units,
-            active_window,
-            self.inner.sources.primary.source_diagnostics()?,
-        )
-        .with_host_storage_resources(self.host_storage_resources()?)?
-        .with_detached_resources(Self::detached_storage_resources(
-            eredu_runtime::detached_resources::DetachedResourceLimits::new(64, 256)?,
-        )?)
-        .with_device_parameter_conversions(self.parameter_conversion_observations()?)?
-        .with_projection_storage(self.projection_storage_observations()?)
-        .with_f32_rms_normalization_gains(self.f32_rms_normalization_gains()?)
-        .with_unit_sources(
-            self.inner
-                .sources
-                .units
-                .iter()
-                .map(|(id, source)| {
-                    source
-                        .source_diagnostics()
-                        .map(|diagnostics| (id.clone(), diagnostics))
-                })
-                .collect::<Result<_, _>>()?,
-        ))
-    }
-
+impl NativeResidencyStorage {
     // MLX's ungrouped learned RMS output uses result_type(input, gain). A
     // rank-one F32 gain therefore guarantees F32 for supported floating inputs.
     // This reports representation, not whether a family uses an array as a gain;
     // that association and all downstream dtype preservation belong to topology.
-    fn f32_rms_normalization_gains(&self) -> Result<BTreeSet<String>, ResidencyError> {
-        let state = self.observation_lock()?;
+    fn f32_rms_normalization_gains(
+        &self,
+        bindings: &ResidencyObservationBindings<'_>,
+    ) -> BTreeSet<String> {
         let mut gains = BTreeSet::new();
         let mut conflicts = BTreeSet::new();
-        for (unit_id, storage) in &state.storage {
+        for (unit_id, storage) in &self.storage {
             let Some(unit) = &storage.device else {
                 continue;
             };
             for (name, array) in &unit.arrays {
-                let logical = state
-                    .control
-                    .unit(unit_id)
-                    .and_then(|unit| unit.bindings().iter().find(|b| b.name() == name))
-                    .and_then(WeightBinding::logical_target)
+                let logical = bindings
+                    .logical_target(unit_id, name)
                     .unwrap_or(name)
                     .to_owned();
                 if array.ndim() == 1 && array.dtype() == safemlx::Dtype::Float32 {
@@ -978,50 +268,37 @@ impl ResidencyManager {
             }
         }
         gains.retain(|name| !conflicts.contains(name));
-        Ok(gains)
+        gains
     }
 
     fn projection_storage_observations(
         &self,
+        bindings: &ResidencyObservationBindings<'_>,
     ) -> Result<
-        BTreeMap<String, eredu_runtime::projection_memory::ProjectionStorageFacts>,
+        BTreeMap<String, eredu_core::residency::projection::ProjectionStorageFacts>,
         ResidencyError,
     > {
-        let state = self.observation_lock()?;
-        let eligible = state
-            .control
-            .conversion_retention()
-            .and_then(|budget| budget.report().policy.value().cloned())
-            .is_some_and(|policy| {
-                policy.eligibility
-                    == eredu_core::residency::ParameterConversionRetentionEligibility::Eligible
-            });
         let mut facts = BTreeMap::new();
-        if !eligible || !state.conversion_retention_registered {
+        if !bindings.projection_storage_eligible || !self.conversion_retention_registered {
             return Ok(facts);
         }
         let mut conflicts = BTreeSet::new();
-        for (unit_id, storage) in &state.storage {
+        for (unit_id, storage) in &self.storage {
             let Some(unit) = &storage.device else {
                 continue;
             };
             for (name, array) in &unit.arrays {
-                let logical = state
-                    .control
-                    .unit(unit_id)
-                    .and_then(|unit| unit.bindings().iter().find(|b| b.name() == name))
-                    .and_then(WeightBinding::logical_target)
+                let logical = bindings
+                    .logical_target(unit_id, name)
                     .unwrap_or(name)
                     .to_owned();
-                let Some(fact) = crate::backend::nn::mixed_projection::storage_facts(
-                    array,
-                    &state.device_stream,
-                )
-                .map_err(|source| ResidencyError::Mlx {
-                    id: unit_id.clone(),
-                    operation: "projection storage facts",
-                    source,
-                })?
+                let Some(fact) =
+                    crate::backend::nn::mixed_projection::storage_facts(array, &self.device_stream)
+                        .map_err(|source| ResidencyError::Mlx {
+                            id: unit_id.clone(),
+                            operation: "projection storage facts",
+                            source,
+                        })?
                 else {
                     conflicts.insert(logical);
                     continue;
@@ -1041,7 +318,11 @@ impl ResidencyManager {
     /// Observe existing cache entries without evaluating or creating conversions.
     fn parameter_conversion_observations(
         &self,
-    ) -> Result<Vec<eredu_runtime::ResidentParameterConversion>, ResidencyError> {
+        bindings: &ResidencyObservationBindings<'_>,
+    ) -> Vec<eredu_core::residency::ResidentParameterConversion> {
+        use eredu_core::residency::{
+            ResidentParameterConversion, ResidentParameterConversionBinding,
+        };
         use eredu_core::{
             resources::{
                 ResourceAllocation, ResourceByteBounds, ResourceExtent, ResourceRole, ResourceSize,
@@ -1049,17 +330,10 @@ impl ResidencyManager {
             },
             Observed,
         };
-        use eredu_runtime::{ResidentParameterConversion, ResidentParameterConversionBinding};
 
-        let state = self.observation_lock()?;
         let mut observations = BTreeMap::new();
-        let retention_group = state
-            .control
-            .conversion_retention()
-            .expect("manager selection")
-            .report()
-            .group;
-        for (unit_id, storage) in &state.storage {
+        let retention_group = bindings.retention_group.cloned();
+        for (unit_id, storage) in &self.storage {
             let Some(unit) = storage.device.as_ref() else {
                 continue;
             };
@@ -1096,20 +370,11 @@ impl ResidencyManager {
                 if !observation.allocation.uses.contains(&usage) {
                     observation.allocation.uses.push(usage);
                 }
-                let logical_target = state
-                    .control
-                    .unit(unit_id)
-                    .and_then(|unit| {
-                        unit.bindings()
-                            .iter()
-                            .find(|binding| binding.name() == name)
-                    })
-                    .and_then(WeightBinding::logical_target)
-                    .map(str::to_owned);
+                let logical_target = bindings.logical_target(unit_id, name).map(str::to_owned);
                 observation
                     .bindings
                     .push(ResidentParameterConversionBinding {
-                        retention_group: Some(retention_group.clone()),
+                        retention_group: retention_group.clone(),
                         owner: owner.clone(),
                         unit: unit_id.clone(),
                         name: name.clone(),
@@ -1117,51 +382,104 @@ impl ResidencyManager {
                     });
             }
         }
-        Ok(observations.into_values().collect())
+        observations.into_values().collect()
     }
 
-    /// Returns initialized state, aggregate telemetry, unit reports, and active window.
-    pub fn telemetry_snapshot(
+    /// Observes currently cached host allocations under one storage lock. No
+    /// payload reads, evaluation, completion polling or native allocation occur.
+    /// Eviction removes cache ownership, not independently retained transfers.
+    fn host_storage_resources(
         &self,
+        identity: eredu_core::resources::ResourceIdentity,
+    ) -> Result<eredu_core::resources::ResourceDescription, ResidencyError> {
+        host_resources::describe(
+            identity,
+            self.storage.values().filter_map(|s| s.host.as_deref()),
+            None,
+        )
+    }
+}
+
+impl eredu_core::residency::ResidencyStorageMechanisms for MlxResidencyResources {
+    type Context = (Stream, Stream);
+    type Storage = NativeResidencyStorage;
+    type Error = ResidencyError;
+    type Transfer = ResidentTransfer;
+
+    fn register_conversion_resources(
+        storage: &mut NativeResidencyStorage,
+        budget: &eredu_core::residency::conversion_claim::ConversionRetentionBudget,
+    ) -> Result<(), ResidencyError> {
+        storage.conversion_retention_registered = true;
+        for unit in storage
+            .storage
+            .values()
+            .filter_map(|unit| unit.device.as_ref())
+        {
+            unit.parameter_conversions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .register(unit.arrays.values(), budget)?;
+        }
+        Ok(())
+    }
+
+    fn trim_conversion_resources(
+        budget: &eredu_core::residency::conversion_claim::ConversionRetentionBudget,
     ) -> Result<
-        (
-            bool,
-            OffloadReport,
-            Vec<UnitResidencyReport>,
-            Vec<OffloadUnitId>,
-        ),
-        ResidencyError,
+        eredu_core::residency::ParameterConversionRetentionTrimReport,
+        eredu_core::residency::conversion_claim::ConversionRetentionError,
     > {
-        let state = self.observation_lock()?;
-        let active = state.control.ledger().active_window();
-        let units = state.control.ledger().unit_reports();
+        crate::backend::nn::parameter_conversion::trim_budget(budget)
+    }
+
+    fn open_storage(
+        (source_stream, device_stream): Self::Context,
+    ) -> Result<(NativeResidencyStorage, Self), ResidencyError> {
+        let source_device = source_stream
+            .get_device()
+            .map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "source stream inspection",
+                source,
+            })?;
+        if source_device
+            .get_type()
+            .map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "source device inspection",
+                source,
+            })?
+            != DeviceType::Cpu
+        {
+            return Err(ResidencyError::InvalidSourceStream);
+        }
+
+        let failed_transfer = Arc::new(AtomicBool::new(false));
+        let storage = NativeResidencyStorage {
+            failed_transfer: Arc::clone(&failed_transfer),
+            conversion_retention_registered: false,
+            storage: BTreeMap::new(),
+            materialization: MlxParameterMaterializationContext::new(
+                &source_stream,
+                &device_stream,
+            ),
+            source_stream,
+            device_stream,
+        };
         Ok((
-            state.control.ledger().initialized(),
-            state.control.ledger().telemetry(),
-            units,
-            active.into_iter().collect(),
+            storage,
+            Self {
+                failed_transfer,
+                resource_identity: host_resources::identity("mlx.residency_manager"),
+            },
         ))
     }
 
-    // Read-only views must not advance recovery or turn a failed transfer into
-    // an unavailable diagnostic. The opaque guard exposes no mutable dereference.
-    fn observation_lock(
-        &self,
-    ) -> Result<impl std::ops::Deref<Target = ManagerState> + '_, ResidencyError> {
-        self.inner
-            .state
-            .lock()
-            .map_err(|_| ResidencyError::StatePoisoned)
-    }
-
-    fn lock(&self) -> Result<MutexGuard<'_, ManagerState>, ResidencyError> {
+    fn progress(&self) -> Result<(), ResidencyError> {
         crate::backend::submission_recovery::reap();
         crate::backend::ordinary_retirement::reclaim();
-        if self
-            .inner
-            .failed_transfer
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.failed_transfer.load(Ordering::Acquire) {
             return Err(ResidencyError::Mlx {
                 id: internal_id(),
                 operation: "resident transfer admission",
@@ -1170,73 +488,82 @@ impl ResidencyManager {
                 ),
             });
         }
-        self.inner
-            .state
-            .lock()
-            .map_err(|_| ResidencyError::StatePoisoned)
+        Ok(())
     }
 
-    fn wait_for_transfer<'a>(
-        &'a self,
-        state: MutexGuard<'a, ManagerState>,
-    ) -> Result<MutexGuard<'a, ManagerState>, ResidencyError> {
-        let (state, _) = self
-            .inner
-            .changed
-            .wait_timeout(state, std::time::Duration::from_millis(25))
-            .map_err(|_| ResidencyError::StatePoisoned)?;
-        drop(state);
-        // Recovery may stage manager-lock owners; never reclaim under this mutex.
-        self.lock()
+    fn transfer(
+        leases: Vec<ResidentUnitLease>,
+        submitted: Option<SubmittedResidentTransfer>,
+    ) -> ResidentTransfer {
+        match submitted {
+            Some(submitted) => ResidentTransfer::submitted(leases, submitted),
+            None => ResidentTransfer::immediate(leases),
+        }
     }
 }
 
-impl ResidencyWindowManager for ResidencyManager {
-    type Error = ResidencyError;
+impl eredu_core::residency::observations::DenseResidencyMechanisms for MlxResidencyResources {
+    /// Returns the MLX stream index used for device residency transfers.
+    fn transfer_stream_index(storage: &NativeResidencyStorage) -> Result<i32, ResidencyError> {
+        storage
+            .device_stream
+            .get_index()
+            .map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "device residency stream index",
+                source,
+            })
+    }
 
-    fn prepare_window(
+    fn settle_transfer(transfer: &mut ResidentTransfer) -> Result<(), ResidencyError> {
+        transfer.synchronize()
+    }
+
+    fn allocator_memory(
         &self,
-        active: &[OffloadUnitId],
-        upcoming: &[OffloadUnitId],
-        tier: MemoryTier,
-    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, Self::Error> {
-        ResidencyManager::prepare_window(self, active, upcoming, tier)
+    ) -> Result<eredu_core::residency::AllocatorMemoryMetrics, ResidencyError> {
+        sample_allocator_memory().map_err(|source| ResidencyError::Mlx {
+            id: internal_id(),
+            operation: "allocator memory sampling",
+            source,
+        })
     }
 
-    fn prepare_group_window(
+    fn observe_residency(
         &self,
-        group: &str,
-        active: &[OffloadUnitId],
-        upcoming: &[OffloadUnitId],
-        tier: MemoryTier,
-    ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, Self::Error> {
-        ResidencyManager::prepare_group_window(self, group, active, upcoming, tier)
+        storage: &NativeResidencyStorage,
+        bindings: ResidencyObservationBindings<'_>,
+    ) -> Result<eredu_core::residency::observations::NativeResidencyObservations, ResidencyError>
+    {
+        Ok(
+            eredu_core::residency::observations::NativeResidencyObservations {
+                host_storage: storage.host_storage_resources(self.resource_identity.clone())?,
+                conversions: storage.parameter_conversion_observations(&bindings),
+                projection_storage: storage.projection_storage_observations(&bindings)?,
+                f32_normalization_gains: storage.f32_rms_normalization_gains(&bindings),
+            },
+        )
     }
 
-    fn evict(&self, id: &OffloadUnitId, tier: MemoryTier) -> Result<bool, Self::Error> {
-        ResidencyManager::evict(self, id, tier)
-    }
-
-    fn unit_reports(&self) -> Result<Vec<UnitResidencyReport>, Self::Error> {
-        self.telemetry_snapshot().map(|(_, _, units, _)| units)
+    fn observe_detached(
+        &self,
+        limits: eredu_core::resources::detached::DetachedResourceLimits,
+    ) -> Result<eredu_core::resources::detached::DetachedResourceObservation, ResidencyError> {
+        Ok(crate::backend::submission_recovery::describe_resources(
+            limits,
+        )?)
     }
 }
 
 mod transfer;
 use transfer::*;
 pub use transfer::{
-    ManagerInner, ResidentArrays, ResidentHostBuffers, ResidentTransfer, ResidentTransferResources,
+    ResidentArrays, ResidentHostBuffers, ResidentTransfer, ResidentTransferResources,
 };
 
-mod loading_memory;
-pub(crate) use loading_memory::parameter_loading_memory_profile;
 mod materialization;
 pub use materialization::host_capacity_upper_bound_for_bindings;
 use materialization::*;
-
-#[cfg(test)]
-#[path = "manager/tests.rs"]
-mod tests;
 
 mod host_resources;
 use host_resources::ResidentHostAllocation;

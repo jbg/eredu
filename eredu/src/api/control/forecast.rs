@@ -1,11 +1,17 @@
 use super::*;
 use crate::api::forecast::{
-    add_retention, continuation_forecast, ContinuationForecast, ContinuationForecastBackend,
+    add_retention, continuation_forecast, ContinuationForecast, ContinuationForecastSession,
     GenerationForecastError, GenerationForecastOptions,
 };
 use eredu_runtime::execution_control::{SnapshotTokenController, TextSnapshotBackend};
 
-impl<B: ContinuationForecastBackend + TextSnapshotBackend> ControlledGenerationSession<'_, B> {
+impl<
+        B: TextSnapshotBackend<S>,
+        S: ContinuationForecastSession<B>
+            + eredu_core::TextExecutionSession<B>
+            + eredu_core::execution_control::NativeTextStateSession<B>,
+    > ControlledGenerationSession<'_, B, S>
+{
     /// Forecasts further ordinary predictions at a settled decode boundary. This
     /// includes sampler, semantic pipeline, capture/trace and live snapshot/branch
     /// retention. It never advances, copies state, consumes budgets or changes the
@@ -58,7 +64,7 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> ControlledGenerationS
             .boundary(&mut self.driver)
             .map_err(|e| GenerationForecastError::UnsupportedContinuation(e.to_string()))?;
         let (runtime, state, pending) = boundary.parts();
-        let mut result = continuation_forecast::<B>(
+        let mut result = continuation_forecast::<B, S>(
             runtime,
             state,
             pending,

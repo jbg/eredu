@@ -133,12 +133,14 @@ impl PartitionCaptureTransport for Transport {
     fn capture_rank(&self) -> usize {
         self.rank
     }
-    fn capture_wait(&self) -> Result<BoundedCompletionWait, CaptureError> {
-        Ok(BoundedCompletionWait::new(
-            std::time::Duration::from_secs(1),
-            CompletionCancellationMode::QuarantineUntilComplete,
+    fn capture_wait(&self) -> Option<BoundedCompletionWait> {
+        Some(
+            BoundedCompletionWait::new(
+                std::time::Duration::from_secs(1),
+                CompletionCancellationMode::QuarantineUntilComplete,
+            )
+            .unwrap(),
         )
-        .unwrap())
     }
     fn ensure_capture_active(&self) -> Result<(), BackendFailure> {
         if self.poison.load(Ordering::SeqCst) {
@@ -162,7 +164,7 @@ impl PartitionCaptureTransport for Transport {
             ..Default::default()
         })
     }
-    fn fail_capture_exchange(&self, _: &PartitionCaptureExchangeError) {
+    fn fence_capture_exchange(&self) {
         self.poison.store(true, Ordering::SeqCst);
     }
 }

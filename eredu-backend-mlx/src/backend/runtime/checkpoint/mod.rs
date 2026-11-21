@@ -12,9 +12,8 @@
 //! exclusive `eredu_checkpoint::schema::AlternativeLayoutGroup` variants. Companion tensors
 //! are ordinary constraints supplied by the architecture; validation contains
 //! no companion naming convention. Architecture adapters feed the same
-//! physical plan to structural admission and its
-//! [`BindingPlan`](eredu_runtime::BindingPlan)
-//! to resident, layerwise, or streamed loading.
+//! physical plan through structural admission to derive the exact bindings
+//! consumed by resident, layerwise, or streamed loading.
 
 /// Canonical unloaded-module checkpoint binding.
 pub mod binding;

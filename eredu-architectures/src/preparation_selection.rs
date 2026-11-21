@@ -2,17 +2,17 @@
 
 use std::num::NonZeroUsize;
 
+use eredu_core::communication::CommunicationCapabilities;
 use eredu_core::{
     admit_preparation, ArchitecturePreparationCapabilities, ArtifactFormat, ArtifactInspection,
     ParallelRankTopology, ParallelTopology, PreparationAdmissionError, PreparationAdmissionRequest,
     PreparationMechanismCapabilities, SessionCapabilities,
 };
 use eredu_runtime::{
-    BackendMechanismCapabilities, CommunicationCapabilities, DraftingLoadRequest,
-    GroupedOperationRequirement, MediaPrimitiveCapabilities, NormalizedLoadRequest,
+    DraftingLoadRequest, GroupedOperationRequirement, NormalizedLoadRequest,
     NormalizedLoadRequestError, ProcessorSelectionError, ReplicatedTextRequirements,
     ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, SelectedProcessorExecution,
-    SelectedReplicatedTextRealization, SpeculativeMechanismCapabilities, SpeculativeSelectionError,
+    SelectedReplicatedTextRealization, SpeculativeSelectionError,
 };
 
 use crate::{
@@ -50,103 +50,7 @@ use crate::{
     SelectedExecution, SelectedPreparation, SelectedRoutedTextRealization,
 };
 
-/// Side-effect-free backend facts consumed by total portable preparation selection.
-///
-/// Implementations must only describe mechanisms which are already implemented.
-/// They must not allocate native resources, open checkpoint payloads, select an
-/// execution branch, or inspect model-family identity. Architecture code supplies
-/// exact neutral requirements and retains every selection decision.
-pub trait PreparationMechanismProvider {
-    /// Floating activation and state representation produced by materializing the
-    /// declared embedding dtype. This is an immutable native mechanism fact.
-    fn floating_state_dtype(
-        &self,
-        _source: &eredu_core::checkpoint::TensorDtype,
-    ) -> Option<eredu_runtime::StateStorageDtype> {
-        None
-    }
-
-    /// Storage tiers and completion ownership for addressable table rows.
-    fn row_lookup_storage(&self) -> Option<eredu_runtime::AddressableStorageCapabilities> {
-        None
-    }
-
-    /// Exact row decoder and scalar-recipe support, using immutable headers only.
-    fn row_lookup_workspace(
-        &self,
-        _descriptor: &eredu_runtime::RowLookupDescriptor,
-    ) -> Result<Option<eredu_runtime::RowLookupWorkspace>, eredu_runtime::RowLookupError> {
-        Ok(None)
-    }
-
-    /// Native row decoder storage and retention facts for one bounded acquisition.
-    fn row_lookup_decode_memory(
-        &self,
-        descriptor: &eredu_runtime::RowLookupDescriptor,
-    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_runtime::RowLookupError>
-    {
-        descriptor.decode_memory()
-    }
-
-    /// Native temporary geometry for explicit input-score attention. No family
-    /// identity, tensor, stream or device is consulted.
-    fn input_score_attention_workspace(
-        &self,
-    ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
-        None
-    }
-
-    /// Conservative live buffers for one physical recipe, including native
-    /// copies and index buffers. This must inspect metadata only.
-    fn recipe_materialization_workspace<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-        &self,
-        _recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
-        _source: &C,
-    ) -> Result<u64, String> {
-        Err("backend did not report native recipe workspace".into())
-    }
-
-    /// Host observation collector facts, independent of model family and devices.
-    fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
-        eredu_core::ObservationMechanisms::default()
-    }
-
-    /// Bounded native transformations, without allocating or selecting a device.
-    fn capture_capabilities(&self) -> eredu_core::capture::CaptureCapabilities {
-        Default::default()
-    }
-
-    /// Portable artifact, residency, topology, modality, completion, and session mechanisms.
-    fn preparation_capabilities(&self) -> PreparationMechanismCapabilities;
-
-    /// Whether one exact grouped-compute semantic is implemented.
-    fn supports_grouped_operation(&self, requirement: GroupedOperationRequirement) -> bool;
-
-    /// Mechanisms applicable to one exact neutral text requirement and request.
-    fn replicated_text_capabilities(
-        &self,
-        requirements: &ReplicatedTextRequirements,
-        request: &ReplicatedTextSelectionRequest,
-    ) -> BackendMechanismCapabilities;
-
-    /// Mechanisms for an independently owned auxiliary state role.
-    fn state_capabilities(
-        &self,
-        _requirements: &eredu_runtime::StateRealizationRequirements,
-        _policy: &eredu_runtime::CacheResidencyPolicy,
-    ) -> eredu_runtime::StateMechanismCapabilities {
-        eredu_runtime::StateMechanismCapabilities::new([])
-    }
-
-    /// Portable media and prepared-tensor primitives.
-    fn processor_capabilities(&self) -> MediaPrimitiveCapabilities;
-
-    /// Portable speculative execution mechanisms.
-    fn speculative_capabilities(&self) -> SpeculativeMechanismCapabilities;
-
-    /// Portable communication operations, bounds, framing, and completion support.
-    fn communication_capabilities(&self) -> CommunicationCapabilities;
-}
+pub use eredu_runtime::PreparationMechanismProvider;
 
 /// Projects preparation facts into the shared metadata-only row selector.
 /// The borrowed provider can record every query for cached-selection agreement.
@@ -431,6 +335,73 @@ where
                 })
             }
         }
+    }
+}
+
+/// Normalized portable admission inputs for direct model loading.
+pub struct ArchitectureLoadAdmission<P> {
+    request: NormalizedLoadRequest,
+    mechanisms: P,
+}
+
+impl<P> ArchitectureLoadAdmission<P> {
+    /// Combines a normalized request with side-effect-free backend facts.
+    pub const fn new(request: NormalizedLoadRequest, mechanisms: P) -> Self {
+        Self {
+            request,
+            mechanisms,
+        }
+    }
+}
+
+impl<P: PreparationMechanismProvider> ArchitectureLoadAdmission<P> {
+    /// Admits one exact candidate for the automatic planner without preparing sources.
+    pub fn candidate_admission(
+        self,
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> eredu_core::CandidateAdmission {
+        let rejection = select_preparation(inspection, &self.request, &self.mechanisms)
+            .err()
+            .map(|error| error.to_string());
+        eredu_core::CandidateAdmission {
+            supported: rejection.is_none(),
+            rejection,
+        }
+    }
+
+    /// Derives the bounded window from the exact selected text realization.
+    pub fn bounded_residency_requirement(
+        self,
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_core::AutomaticPlanningError> {
+        let selected =
+            select_preparation(inspection, &self.request, &self.mechanisms).map_err(|error| {
+                eredu_core::AutomaticPlanningError::Backend {
+                    operation: "select_model_preparation",
+                    message: error.to_string(),
+                }
+            })?;
+        let (text, excluded) = selected.selected_bounded_residency();
+        eredu_runtime::selected_text_bounded_requirement(&text, &excluded).map_err(|error| {
+            eredu_core::AutomaticPlanningError::Backend {
+                operation: "selected_text_residency",
+                message: error.to_string(),
+            }
+        })
+    }
+}
+
+impl<P: PreparationMechanismProvider> eredu_core::ModelLoadAdmission<ArtifactArchitecturePlan>
+    for eredu_runtime::ModelLoadFacts<P>
+{
+    type SourcePreparation = SelectedPreparation;
+    type Error = PreparationSelectionError;
+
+    fn select(
+        self,
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> Result<Self::SourcePreparation, Self::Error> {
+        select_preparation(inspection, &self.request, &self.mechanisms)
     }
 }
 
@@ -747,7 +718,7 @@ fn select_lfm3_vl(
                     .pipeline_wire_contract()
                     .expect("parallel wire")
                     .activation_dtype()
-                    != eredu_runtime::PipelineActivationDtype::Float32
+                    != eredu_core::communication::PipelineActivationDtype::Float32
             {
                 return Err(invalid(
                     "VL distributed generation requires batch one and an F32 wire",

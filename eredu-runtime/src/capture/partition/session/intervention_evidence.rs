@@ -15,7 +15,7 @@ impl CaptureSession {
     ) -> Result<Vec<SessionPartitionCapture<'a, T>>, PartitionCaptureExchangeError>
     where
         T: PartitionCaptureTransport,
-        L: PartitionCaptureLayout + PartitionActivationLayout,
+        L: PartitionCaptureLayout + PartitionActivationLayout + ?Sized,
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {

@@ -1,5 +1,7 @@
 //! Audio composition with selected language and speech input traversal.
 
+use eredu_core::SubmissionBackend;
+
 #[cfg(feature = "audio")]
 mod ingress;
 mod transcription;
@@ -23,11 +25,14 @@ use super::{
     PolicyEncoder, PreparedAudio, PreparedAudioDepth, PreparedAudioEncoder, PreparedAudioLanguage,
     SpeechPrompt,
 };
+#[cfg(feature = "audio")]
+use crate::lfm3::omni::PreparedOmni;
 use crate::lfm3::{
-    omni::{OmniProjectedRows, OmniPrompt, OmniReadout, PreparedOmni},
+    omni::{OmniProjectedRows, OmniPrompt, OmniReadout},
     vision::MediaTokens,
 };
 use eredu_codec::liquid::{DecoderExecution, DecoderModule, DecoderState, PolicyDecoder};
+use eredu_core::sampling::SamplingBackend;
 use eredu_core::{
     execution_control::SnapshotEstimate, scheduler::SemanticStateTransaction, BackendFailure,
     Completion,
@@ -39,7 +44,7 @@ use eredu_runtime::{
         snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateFork,
         SnapshotReservation, SnapshotRetainedGrowth, SnapshotValue,
     },
-    ParameterUnitMechanisms, SamplingBackend, StateLayout, SubmissionBackend,
+    ParameterUnitMechanisms, StateLayout,
 };
 use std::{marker::PhantomData, sync::Arc};
 
@@ -177,7 +182,7 @@ impl PreparedResidentAudio {
             ("codec", residency.codec),
         ] {
             policy.offload()?;
-            if !facts.supports_residency(policy.execution_residency()) {
+            if !facts.supports_residency(policy.execution_residency().weight_storage()) {
                 return Err(ResidentAudioError::Selection(format!(
                     "{component} parameter residency {:?}",
                     policy.execution_residency(),
@@ -348,10 +353,11 @@ where
     }
 
     fn copy_isolated(&self, retention: &SnapshotReservation) -> Result<Self, BackendFailure> {
+        let retention = retention.authority();
         Ok(Self {
-            language: self.language.copy_snapshot_value(retention)?,
-            hidden: self.hidden.copy_snapshot_value(retention)?,
-            codec: self.codec.copy_snapshot_value(retention)?,
+            language: self.language.copy_snapshot_value(&retention)?,
+            hidden: self.hidden.copy_snapshot_value(&retention)?,
+            codec: self.codec.copy_snapshot_value(&retention)?,
             origin: self.origin.clone(),
             fork_retention: None,
             binding: PhantomData,
@@ -434,18 +440,8 @@ where
             binding.components(),
         )?;
         let context = binding.context();
-        let encoder = encoder.bind(context, |source, addresses, units, build| {
-            binding
-                .components()
-                .bind_units(source, addresses, units, residency.encoder, build)
-                .map(|(policy, _)| policy)
-        })?;
-        let depth = depth.bind(context, |source, addresses, units, build| {
-            binding
-                .components()
-                .bind_units(source, addresses, units, residency.depth, build)
-                .map(|(policy, _)| policy)
-        })?;
+        let encoder = encoder.bind(context, residency.encoder, binding.components())?;
+        let depth = depth.bind(context, residency.depth, binding.components())?;
         let codec = codec.bind(context, binding.components(), residency.codec)?;
         Ok(Self {
             language,
@@ -860,10 +856,9 @@ where
         self.language.commit_audio(self.binding.context())
     }
 
-    fn with_fork_retention<T>(
+    fn hold_fork_retention(
         retention: SnapshotRetainedGrowth,
-        operation: impl FnOnce() -> T,
-    ) -> Result<T, BackendFailure> {
-        H::with_fork_retention(retention, operation)
+    ) -> Result<impl Sized, BackendFailure> {
+        H::hold_fork_retention(retention)
     }
 }

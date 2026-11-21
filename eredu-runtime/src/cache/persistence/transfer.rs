@@ -1,95 +1,15 @@
 //! Portable prompt-cache publication and restoration over native state transfers.
 use super::*;
-use eredu_core::{
-    cache::{
-        PromptCacheDescriptor, PromptCacheOptions, PromptCacheRead, PromptCacheStore,
-        PromptCacheStoreError, PromptCacheStreamFrontier, StateTensorOwner, StateTensorRole,
+use eredu_core::cache::{
+    mechanisms::{
+        PromptCacheBlockRestore, PromptCacheExport, PromptCachePayload, PromptCacheStateRestore,
+        PromptCacheTensorLayout,
     },
-    BackendFailure,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheRead, PromptCacheStore,
+    PromptCacheStoreError, PromptCacheStreamFrontier,
 };
 use std::sync::Arc;
 
-/// Exact tensor geometry and payload extent reported by a native state binding.
-#[derive(Debug, Clone)]
-pub struct PromptCacheTensorLayout {
-    /// Exact logical dimensions; no native capacity padding.
-    pub shape: Vec<i32>,
-    /// Canonical backend-neutral dtype name used by the cache schema.
-    pub dtype: String,
-    /// Exact payload extent in bytes.
-    pub bytes: u64,
-}
-impl PromptCacheTensorLayout {
-    /// Validates a logical tensor layout and computes its exact byte extent.
-    pub fn new(shape: Vec<i32>, dtype: String) -> Result<Self, PromptCacheStoreError> {
-        let width = match dtype.as_str() {
-            "Bool" | "Uint8" | "Int8" => 1u64,
-            "Uint16" | "Int16" | "Float16" | "Bfloat16" => 2,
-            "Uint32" | "Int32" | "Float32" => 4,
-            "Uint64" | "Int64" | "Float64" => 8,
-            _ => return Err(invalid("unsupported prompt-cache dtype")),
-        };
-        let bytes = shape
-            .iter()
-            .try_fold(width, |n, d| {
-                u64::try_from(*d).ok().and_then(|d| n.checked_mul(d))
-            })
-            .ok_or_else(|| invalid("invalid prompt-cache tensor extent"))?;
-        Ok(Self {
-            shape,
-            dtype,
-            bytes,
-        })
-    }
-}
-/// A native block, independent of serialized shard naming or storage medium.
-#[derive(Debug, Clone)]
-pub struct PromptCacheExportBlock {
-    /// Logical block identity and architecture-declared representation.
-    pub id: CacheBlockId,
-    /// Ordered first and second tensor layouts for this representation.
-    pub tensors: [PromptCacheTensorLayout; 2],
-}
-/// One architecture-declared fixed or recurrent tensor.
-#[derive(Debug, Clone)]
-pub struct PromptCacheExportState {
-    /// Architecture-declared layer or model-global owner.
-    pub owner: StateTensorOwner,
-    /// Architecture-declared mutable-state tensor role.
-    pub role: StateTensorRole,
-    /// Exact native tensor layout.
-    pub tensor: PromptCacheTensorLayout,
-}
-/// State inventory obtained without copying native payloads.
-#[derive(Debug, Clone)]
-pub struct PromptCacheExportInventory {
-    /// Selected physical block extent in token positions.
-    pub block_size_tokens: i32,
-    /// Stable ordered native block inventory.
-    pub blocks: Vec<PromptCacheExportBlock>,
-    /// Stable ordered fixed and recurrent state inventory.
-    pub states: Vec<PromptCacheExportState>,
-    /// Native streams whose mutable tails have not been sealed.
-    pub unsealed_streams: Vec<eredu_core::cache::CacheStreamId>,
-    /// Peak simultaneous native host-transfer capacity, excluding encoded bytes.
-    pub transfer_bytes: u64,
-}
-/// Completed host transfers. Their owner keeps exact bytes alive during encoding.
-pub trait PromptCachePayload {
-    /// Borrows completed native transfer buffers in inventory order.
-    fn bytes(&self) -> Result<Vec<&[u8]>, BackendFailure>;
-}
-/// Native operations only: inventory and completed byte transfers.
-pub trait PromptCacheExport {
-    /// Owner of completed host-transfer buffers.
-    type Payload: PromptCachePayload;
-    /// Returns the stable inventory without copying native state.
-    fn inventory(&self) -> &PromptCacheExportInventory;
-    /// Completes the indexed native block transfer.
-    fn transfer_block(&self, index: usize) -> Result<Self::Payload, BackendFailure>;
-    /// Completes the indexed fixed/recurrent tensor transfer.
-    fn transfer_state(&self, index: usize) -> Result<Self::Payload, BackendFailure>;
-}
 fn invalid(message: &str) -> PromptCacheStoreError {
     PromptCacheError::Malformed(message.into()).into()
 }
@@ -313,34 +233,10 @@ pub fn publish_prompt_cache(
     };
     manifest.validate_compatibility(&descriptor, prefix)?;
     publication.commit(&manifest)?;
+    source.record_publication(payload);
     Ok(manifest)
 }
 
-/// Native allocation and transfer binding used by portable restore orchestration.
-pub trait PromptCacheBlockRestore {
-    /// Retains an immutable file handle for the existing lazy paging mechanism.
-    fn retain_block(
-        &mut self,
-        block: &PromptCacheBlock,
-        source: Arc<RetainedCacheShard>,
-        path: PathBuf,
-    ) -> Result<(), BackendFailure>;
-    /// Completes host-to-native restoration of a bounded, validated block.
-    fn transfer_block(
-        &mut self,
-        block: &PromptCacheBlock,
-        source: &RetainedCacheShard,
-    ) -> Result<(), BackendFailure>;
-}
-/// Binds a fixed/recurrent tensor to native allocation and completion operations.
-pub trait PromptCacheStateRestore {
-    /// Allocates native fixed state and completes its exact byte transfer.
-    fn transfer_state(
-        &mut self,
-        state: &PromptCacheStateTensor,
-        source: &RetainedCacheShard,
-    ) -> Result<(), BackendFailure>;
-}
 /// A validated, pinned input generation. Store-medium policy stays in the runtime.
 pub struct PromptCacheRestore<'a> {
     read: &'a dyn PromptCacheRead,
@@ -365,6 +261,13 @@ impl<'a> PromptCacheRestore<'a> {
         store::validate_artifact(read)?;
         Ok(Self { read })
     }
+    /// Transfers fixed state from this same pinned generation.
+    pub fn restore_states(
+        &self,
+        target: &mut impl PromptCacheStateRestore,
+    ) -> Result<(), PromptCacheStoreError> {
+        restore_prompt_cache_states(self.read, self.manifest(), target)
+    }
     /// Returns the admitted immutable manifest.
     pub fn manifest(&self) -> &PromptCacheManifest {
         self.read.manifest()
@@ -383,10 +286,14 @@ impl<'a> PromptCacheRestore<'a> {
                 )
                 .map_err(PromptCacheStoreError::from_error)?,
             );
+            let pinned = !matches!(
+                block.representation,
+                CacheRepresentation::AppendStream { .. }
+            ) && block.end <= self.manifest().sink_tokens as i64;
             if let Some(path) = self.read.shard_path(&block.shard) {
-                target.retain_block(block, source, path)
+                target.retain_block(block, pinned, source, path)
             } else {
-                target.transfer_block(block, &source)
+                target.transfer_block(block, pinned, source.as_ref())
             }
             .map_err(PromptCacheStoreError::Storage)?;
         }
@@ -421,7 +328,7 @@ pub fn restore_prompt_cache_states(
 
 /// Applies canonical rank scoping without exposing store-medium decisions to a
 /// native binding. Process-local stores retain their existing ownership scope.
-pub fn with_rank_prompt_cache_store<T>(
+pub(crate) fn with_rank_prompt_cache_store<T>(
     store: &dyn PromptCacheStore,
     topology: &eredu_core::cache::PromptCacheTopology,
     operation: impl FnOnce(&dyn PromptCacheStore) -> T,
@@ -447,15 +354,15 @@ pub struct PreparedPromptCachePublication {
 }
 impl PreparedPromptCachePublication {
     /// Stages one rank's export without replacing its active generation.
-    pub fn stage(
+    pub fn stage<E: From<PromptCacheStoreError>>(
         destination: &Path,
         topology: &eredu_core::cache::PromptCacheTopology,
         options: &PromptCacheOptions,
         export: impl FnOnce(
             &dyn PromptCacheStore,
             &PromptCacheOptions,
-        ) -> Result<PromptCacheManifest, BackendFailure>,
-    ) -> Result<Self, PromptCacheStoreError> {
+        ) -> Result<PromptCacheManifest, E>,
+    ) -> Result<Self, E> {
         let destination = super::prompt_cache_rank_path(destination, topology);
         let publication = super::ReversiblePromptCachePublication::begin(
             &destination,
@@ -467,9 +374,9 @@ impl PreparedPromptCachePublication {
             options.capture_limit().unwrap_or(u64::MAX),
         );
         let staging_options =
-            PromptCacheOptions::new(options.application_namespace().map(str::to_owned), false)?;
-        let manifest =
-            export(&staging, &staging_options).map_err(PromptCacheStoreError::Storage)?;
+            PromptCacheOptions::new(options.application_namespace().map(str::to_owned), false)
+                .map_err(PromptCacheStoreError::from)?;
+        let manifest = export(&staging, &staging_options)?;
         Ok(Self {
             publication,
             manifest,
