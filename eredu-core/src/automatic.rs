@@ -848,8 +848,9 @@ pub trait AutomaticPlanningBackend<P>: BackendHardware {
 // One planning call owns one inspection. Admission and bounded geometry are
 // facts about an exact candidate, so feedback and final selection can consume
 // the same results without probing that candidate a second time.
-struct PlanningValidation<'a, B> {
+struct PlanningValidation<'a, B, P> {
     backend: &'a B,
+    catalog: std::marker::PhantomData<fn() -> P>,
     admissions: std::cell::RefCell<
         Vec<(
             ExecutionPlan,
@@ -864,7 +865,7 @@ struct PlanningValidation<'a, B> {
     >,
 }
 
-impl<B: BackendHardware> BackendHardware for PlanningValidation<'_, B> {
+impl<B: AutomaticPlanningBackend<P>, P> PlanningValidation<'_, B, P> {
     fn backend_id(&self) -> crate::execution::BackendId {
         self.backend.backend_id()
     }
@@ -872,32 +873,16 @@ impl<B: BackendHardware> BackendHardware for PlanningValidation<'_, B> {
     fn discover_hardware(&self) -> Result<HardwareProfile, AutomaticPlanningError> {
         self.backend.discover_hardware()
     }
-}
-
-impl<B: AutomaticPlanningBackend<P>, P> AutomaticPlanningBackend<P> for PlanningValidation<'_, B> {
-    type Inspection = B::Inspection;
-    type ModelFacts<'a>
-        = B::ModelFacts<'a>
-    where
-        Self: 'a;
-
-    fn planning_inputs(
-        &self,
-        plan: Option<&ExecutionPlan>,
-    ) -> Result<<Self::ModelFacts<'_> as AdmissionFacts>::Inputs, AutomaticPlanningError> {
-        self.backend.planning_inputs(plan)
-    }
-
     fn inspect_resources(
         &self,
         path: &std::path::Path,
-    ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
+    ) -> Result<(ModelResourceProfile, B::Inspection), AutomaticPlanningError> {
         self.backend.inspect_resources(path)
     }
 
     fn admit_candidate(
         &self,
-        inspection: &Self::Inspection,
+        inspection: &B::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
         let mut admissions = self.admissions.borrow_mut();
@@ -911,7 +896,7 @@ impl<B: AutomaticPlanningBackend<P>, P> AutomaticPlanningBackend<P> for Planning
 
     fn bounded_residency_requirement(
         &self,
-        inspection: &Self::Inspection,
+        inspection: &B::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
         let mut bounds = self.bounds.borrow_mut();
@@ -1777,6 +1762,7 @@ impl AutomaticPlanner {
         validate_request(request, &self.policy)?;
         let backend = &PlanningValidation {
             backend,
+            catalog: std::marker::PhantomData::<fn() -> P>,
             admissions: Default::default(),
             bounds: Default::default(),
         };
@@ -2151,7 +2137,7 @@ fn validate_candidate(
 }
 
 fn probe_candidate<B: AutomaticPlanningBackend<P>, P>(
-    backend: &B,
+    backend: &PlanningValidation<'_, B, P>,
     inspection: &B::Inspection,
     plan: &ExecutionPlan,
     default_device_budget: u64,
@@ -2181,7 +2167,7 @@ fn probe_candidate<B: AutomaticPlanningBackend<P>, P>(
 }
 
 fn apply_bounded_probe<B: AutomaticPlanningBackend<P>, P>(
-    backend: &B,
+    backend: &PlanningValidation<'_, B, P>,
     inspection: &B::Inspection,
     plan: &ExecutionPlan,
     budget: u64,
@@ -2261,7 +2247,7 @@ fn with_expert_cache(mut plan: ExecutionPlan, policy: &AutomaticPlannerPolicy) -
 }
 
 fn select_feedback_plan<B: AutomaticPlanningBackend<P>, P>(
-    backend: &B,
+    backend: &PlanningValidation<'_, B, P>,
     inspection: &B::Inspection,
     request: &AutomaticPlanRequest,
     hardware: &HardwareProfile,
