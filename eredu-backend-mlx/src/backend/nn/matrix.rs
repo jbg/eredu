@@ -569,7 +569,11 @@ fn bf16_paired_row_tile(
 
     thread_local! {
         static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+        static STAGED: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     }
+    // Two shared-memory fills cover this reduction without enlarging the
+    // accumulator tile. Longer reductions keep the direct-load implementation.
+    let staged = width == 2048;
     let mut shape = input.shape().to_vec();
     *shape.last_mut().expect("matrix input rank") = outputs;
     let config = CustomKernelConfig::new()
@@ -580,13 +584,25 @@ fn bf16_paired_row_tile(
         .with_grid([32, outputs / 8, (rows - 1) / 4 + 1])
         .with_thread_group([32, 4, 1])
         .with_output_arg(shape, Dtype::Bfloat16);
-    KERNEL.with(|cell| {
+    let kernel = if staged { &STAGED } else { &KERNEL };
+    kernel.with(|cell| {
         if cell.borrow().is_none() {
+            let (name, source) = if staged {
+                (
+                    "bf16_staged_row_tile",
+                    include_str!("bf16_staged_row_tile.metal"),
+                )
+            } else {
+                (
+                    "bf16_paired_row_tile",
+                    include_str!("bf16_paired_row_tile.metal"),
+                )
+            };
             *cell.borrow_mut() = Some(MetalKernel::new(
-                "bf16_paired_row_tile",
+                name,
                 ["input", "weight"],
                 ["output"],
-                include_str!("bf16_paired_row_tile.metal"),
+                source,
                 "",
                 true,
                 false,
