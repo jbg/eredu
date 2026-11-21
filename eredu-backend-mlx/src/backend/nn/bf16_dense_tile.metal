@@ -4,12 +4,23 @@
 uint lane = thread_position_in_threadgroup.x;
 uint chain_group = lane % 8;
 uint column = thread_position_in_grid.y * 4 + lane / 8;
-uint first_row = thread_position_in_grid.z * TILE_ROWS;
+uint tile = thread_position_in_grid.z;
+uint head = 0;
+uint bank = 0;
+if (GROUPED) {
+    head = tile / ROW_TILES;
+    bank = (head / HEADS) * KV_HEADS + (head % HEADS) / REPEATS;
+    tile %= ROW_TILES;
+}
+uint first_row = tile * TILE_ROWS;
 uint valid_rows = min(uint(TILE_ROWS), uint(ROWS) - first_row);
 device const auto* weights = reinterpret_cast<device const packed_ushort4*>(weight);
 device const auto* activations = reinterpret_cast<device const packed_ushort4*>(input);
 constexpr uint vectors = WIDTH / 4;
-size_t weight_base = size_t(column) * vectors;
+// Padded subgroups participate in the shuffles with a valid weight address.
+uint weight_column = GROUPED ? min(column, uint(OUTPUTS - 1)) : column;
+size_t weight_base = (size_t(bank) * OUTPUTS + weight_column) * vectors;
+size_t input_base = (size_t(head) * ROWS + first_row) * vectors;
 float4 sums[TILE_ROWS] = {};
 
 if (valid_rows == TILE_ROWS) {
@@ -18,7 +29,7 @@ if (valid_rows == TILE_ROWS) {
         float4 w = as_type<float4>(uint4(ushort4(weights[weight_base + k])) << 16);
         #pragma unroll
         for (uint row = 0; row < TILE_ROWS; ++row) {
-            size_t offset = size_t(first_row + row) * vectors + k;
+            size_t offset = input_base + size_t(row) * vectors + k;
             float4 x = as_type<float4>(uint4(ushort4(activations[offset])) << 16);
             sums[row] += x * w;
         }
@@ -28,7 +39,7 @@ if (valid_rows == TILE_ROWS) {
     for (uint k = chain_group; k < vectors; k += 8) {
         float4 w = as_type<float4>(uint4(ushort4(weights[weight_base + k])) << 16);
         for (uint row = 0; row < valid_rows; ++row) {
-            size_t offset = size_t(first_row + row) * vectors + k;
+            size_t offset = input_base + size_t(row) * vectors + k;
             float4 x = as_type<float4>(uint4(ushort4(activations[offset])) << 16);
             sums[row] += x * w;
         }
@@ -43,8 +54,8 @@ for (uint row = 0; row < TILE_ROWS; ++row) {
     sum += simd_shuffle_down(sum, 4);
     sum += simd_shuffle_down(sum, 2);
     sum += simd_shuffle_down(sum, 1);
-    if (chain_group == 0 && row < valid_rows) {
-        output[size_t(first_row + row) * OUTPUTS + column] =
+    if (chain_group == 0 && row < valid_rows && (!GROUPED || column < OUTPUTS)) {
+        output[(size_t(head) * ROWS + first_row + row) * OUTPUTS + column] =
             bfloat16_t((sum.x + sum.y) + (sum.z + sum.w));
     }
 }
