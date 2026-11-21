@@ -34,6 +34,9 @@ pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
 
 /// Applies sigmoid with FP32 exponential and quotient rounding.
 pub fn sigmoid(input: Array, stream: &Stream) -> Result<Array, Exception> {
+    if let Some(output) = super::arithmetic::bf16_pointwise(&input, None, stream)? {
+        return Ok(output);
+    }
     let dtype = input.dtype();
     // Sigmoid is one pointwise operation. Reduced-precision exp/add/divide
     // intermediates would introduce additional rounding before its result.
@@ -71,6 +74,11 @@ pub(crate) fn gated_product(
     policy
         .validate()
         .map_err(|error| Exception::custom(error.to_string()))?;
+    if policy == eredu_nn::GatedProductPolicy::ordinary_silu() {
+        if let Some(output) = super::arithmetic::bf16_pointwise(&gate, Some(&up), stream)? {
+            return Ok(output);
+        }
+    }
     let gate_dtype = gate.dtype();
     let up_dtype = up.dtype();
     // Scalars keep their full precision during the operation; the result rounds
