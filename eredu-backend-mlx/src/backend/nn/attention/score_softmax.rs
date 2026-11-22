@@ -6,7 +6,7 @@ use safemlx::{
 use std::cell::RefCell;
 
 // One row of FP32 exponentials fits in threadgroup memory.
-const MAX_KEYS: i32 = 4096;
+pub(super) const MAX_KEYS: i32 = 4096;
 
 pub(super) fn apply(
     scores: &Array,

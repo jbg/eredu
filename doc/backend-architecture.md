@@ -1324,6 +1324,10 @@ value products in FP32 before the output cast. Cache telemetry counts both
 scans and their transfers; page size does not introduce extra output rounding.
 Resident attention tiles query rows while complete key rows fit its bounded
 score workspace, preserving the ordinary softmax and value-product reductions.
+The full-key memory contract can report a wider per-tile score bound separately
+from the threshold that selects tiling. MLX uses it for eligible BF16 Metal
+invocations. Portable forecasts use the larger tile for scratch accounting and
+claim a synchronous dependency release only when that tile geometry requires it.
 Larger key rows retain the two-scan bounded mechanism. Explicit rotary input
 products retain inverse frequencies directly so positions multiply the same
 rounded coefficients instead of dividing by reconstructed denominators.
@@ -1345,6 +1349,9 @@ includes conditional layout copies and BF16 host results, with unresolved
 allocator capacity, donation and contiguous sharing stated explicitly.
 Metal realizes complete BF16 row and batched products, cascade normalization
 and FP32 softmax/sigmoid with the same accumulation and rounding boundaries.
+The paired BF16 projection tile shares weight loads across short multi-row
+invocations, including causal target verification. Proposal generation and
+accepted-prefix state publication remain in the portable speculative driver.
 The Metal FP32 last-axis softmax uses one cooperative SIMD group per row.
 Maximum selection is parallel; four lanes retain the ordered exponential sum
 chains and their fixed final merge. A device-memory barrier separates writing

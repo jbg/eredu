@@ -243,12 +243,28 @@ pub struct InputScoreAttentionMechanism {
     pub full_key_tiles: Option<FullKeyAttentionTiles>,
 }
 
+impl InputScoreAttentionMechanism {
+    /// Upper bound on one query tile for a given key length. A wider full-key
+    /// path may require exact dtype and operator support at execution time.
+    pub fn query_tile_score_bound(&self, keys: u64) -> u64 {
+        self.full_key_tiles
+            .filter(|full| keys <= full.max_key_positions)
+            .and_then(|full| full.wider_score_tile_elements)
+            .unwrap_or(self.score_tile_elements)
+            .max(self.score_tile_elements)
+    }
+}
+
 /// Native retention contract for tiles that each attend to the entire key row.
 /// Beyond this contract's key limit, the mechanism's legacy allowances apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FullKeyAttentionTiles {
     /// Largest key row covered by shared preparation and bounded evaluation.
     pub max_key_positions: u64,
+    /// Optional score-element bound for a wider full-key tile. The ordinary
+    /// tiling threshold and the fallback key-tile limit stay independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wider_score_tile_elements: Option<u64>,
     /// Expanded K/V and native contiguous layouts, in query-width payloads.
     /// This is charged once per invocation rather than once per query tile.
     pub shared_key_value_copies: u64,

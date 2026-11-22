@@ -335,7 +335,12 @@ fn bf16_projection(
         if weight.dim(-1) != width || weight.ndim() != if groups.is_some() { 3 } else { 2 } {
             return Err(Exception::custom("invalid row projection geometry"));
         }
-        if tile_dense && (rows == 1 || rows >= 8) && outputs >= 64 && outputs % 8 == 0 {
+        let paired_rows = rows > 1 && outputs % 32 == 0;
+        if tile_dense
+            && (rows == 1 || paired_rows || rows >= 8)
+            && outputs >= 64
+            && outputs % 8 == 0
+        {
             return bf16_row_tile(input, weight, rows, width, outputs, None, stream).map(Some);
         }
         if let Some(group) = &groups {
@@ -497,7 +502,7 @@ fn bf16_row_tile(
     }
     // Four query rows per tile leave room for a second output accumulator
     // and let each activation load serve both output columns.
-    if batches.is_none() && rows >= 8 && outputs % 32 == 0 {
+    if batches.is_none() && rows > 1 && outputs % 32 == 0 {
         return bf16_paired_row_tile(input, weight, rows, width, outputs, stream);
     }
     let grouped = batches.is_some();
@@ -573,7 +578,7 @@ fn bf16_paired_row_tile(
     }
     // Two shared-memory fills cover this reduction without enlarging the
     // accumulator tile. Longer reductions keep the direct-load implementation.
-    let staged = width == 2048;
+    let staged = width == 2048 && rows >= 8;
     let mut shape = input.shape().to_vec();
     *shape.last_mut().expect("matrix input rank") = outputs;
     let config = CustomKernelConfig::new()
