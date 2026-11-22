@@ -1415,9 +1415,11 @@ surface; application tool emulation can consume visible text independently.
 Unsupported native-tool requests cannot bypass admission through a response-only
 plan. The same semantic plan supplies ordinary, controlled, speculative and
 snapshot execution, including each profile's framing and stop policy.
-Delimited parsers bind initial state to the actual generation suffix rather than
-older messages. Atomic added delimiters survive decoding regardless of their
-special-token flag; ordinary delimiters use bounded incremental lookbehind.
+Delimited response parsers and compatible declarative tool grammars bind
+initial reasoning state to the actual generation suffix. Admitted reasoning
+tags and optional framing newlines are independent of the tool envelope.
+Atomic added delimiters survive decoding regardless of their special-token flag;
+ordinary delimiters use bounded incremental lookbehind.
 Chat preparation validates application tool declarations and request consistency
 before selecting native capabilities. `TextModelError::InvalidRequest` identifies
 invalid schemas, history, names and options; `UnsupportedCapability` identifies

@@ -134,8 +134,17 @@ pub(super) fn output_model(
     pieces: [&str; 2],
     template: &str,
 ) -> (LoadedModel<MockBackend, MockSession>, Vec<u32>) {
+    output_model_for_request(method, pieces, template, request())
+}
+
+pub(super) fn output_model_for_request(
+    method: usize,
+    pieces: [&str; 2],
+    template: &str,
+    request: ChatTemplateRequest,
+) -> (LoadedModel<MockBackend, MockSession>, Vec<u32>) {
     let mut probe = unicode_model_with_template(None, 64, template);
-    let chat = probe.prepare_chat(request()).unwrap();
+    let chat = probe.prepare_chat(request).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let ids = if method == 0 {
         vec![first, first + 1, first + 2]

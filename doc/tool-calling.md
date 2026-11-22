@@ -56,18 +56,23 @@ available to application emulators. Boolean and named-effort controls are also
 recognized without requiring tools. Thinking controls change the prompt;
 response-format recognition remains available for tool-free requests.
 
-For the delimited response profiles, the parser starts inside reasoning only
-when the actual generation suffix opens it. Otherwise it accepts an opening marker at the start of generated output;
-once visible output starts, later markers remain literal text. A suffix that
-already closes reasoning starts in visible text. Generated whitespace inside
-each channel is preserved. EOS or a token limit preserves incomplete reasoning
-as reasoning, including an unfinished closing marker. Cancellation publishes no
-buffered delimiter lookbehind.
+For admitted delimited reasoning, the actual generation suffix determines
+whether the parser starts inside reasoning, expects a generated opener, or
+starts in visible text after a preclosed block. Once visible output starts, later
+reasoning markers remain literal text. EOS or a token limit preserves incomplete
+reasoning as reasoning, including an unfinished closing marker. Cancellation
+publishes no buffered delimiter lookbehind.
+
+Declarative native tool envelopes compose with independently recognized
+`<think>` and `<thinking>` framing. The semantic parser and tool grammar accept
+the bare closing tag, including when the template uses a framing newline around
+it. The parser consumes the template's framing newlines when present and
+preserves reasoning and visible text within their channels. Response-only
+parsing preserves generated whitespace.
 
 Use semantic output when emulating tools in application text: route only
 `TextDelta` to the emulator and handle `ReasoningDelta` independently. Native tool
-capabilities remain separately gated. QwQ composes its prefilled reasoning with
-the recognized XML tool envelope. Explicitly unavailable reasoning and unsupported
+capabilities remain separately gated. Explicitly unavailable reasoning and unsupported
 delimited reasoning controls return `TextModelError::UnsupportedCapability` with
 `ChatCapabilityRejection::ReasoningParsing` or `ReasoningControl`.
 `OutputMode::Text` remains literal and requires the existing

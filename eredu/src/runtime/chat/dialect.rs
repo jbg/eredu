@@ -39,6 +39,7 @@ impl GenerationPromptBehavior {
 #[derive(Clone, Copy)]
 pub(crate) enum DialectParameters {
     Declarative(&'static DeclarativeDialectSpec),
+    BoundDeclarative(&'static DeclarativeDialectSpec, ReasoningFraming),
     Custom(&'static (dyn Any + Send + Sync)),
 }
 
@@ -48,7 +49,7 @@ impl DialectParameters {
             Self::Custom(parameters) => parameters
                 .downcast_ref()
                 .ok_or_else(|| "custom dialect received parameters of the wrong type".into()),
-            Self::Declarative(_) => {
+            Self::Declarative(_) | Self::BoundDeclarative(..) => {
                 Err("custom dialect received declarative dialect parameters".into())
             }
         }
@@ -57,6 +58,9 @@ impl DialectParameters {
     pub(crate) fn ptr_eq(self, other: Self) -> bool {
         match (self, other) {
             (Self::Declarative(left), Self::Declarative(right)) => std::ptr::eq(left, right),
+            (Self::BoundDeclarative(left, a), Self::BoundDeclarative(right, b)) => {
+                std::ptr::eq(left, right) && a == b
+            }
             (Self::Custom(left), Self::Custom(right)) => std::ptr::eq(left, right),
             _ => false,
         }
@@ -67,6 +71,11 @@ impl fmt::Debug for DialectParameters {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Declarative(spec) => formatter.debug_tuple("Declarative").field(spec).finish(),
+            Self::BoundDeclarative(spec, framing) => formatter
+                .debug_tuple("BoundDeclarative")
+                .field(spec)
+                .field(framing)
+                .finish(),
             Self::Custom(_) => formatter.write_str("Custom(..)"),
         }
     }
@@ -166,6 +175,31 @@ pub(crate) struct DelimitedChannel {
     pub(crate) required: bool,
     /// Whether the template's generation prompt has already emitted `prefix`.
     pub(crate) prefix_in_prompt: bool,
+}
+
+/// Request-bound reasoning for a declarative tool envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReasoningFraming {
+    pub(crate) channel: Option<DelimitedChannel>,
+    pub(crate) special_tokens: [Option<(&'static str, u32)>; 2],
+}
+
+fn delimiter_parts(delimiter: &str) -> (&str, &str, &str) {
+    let marker = delimiter.trim_matches('\n');
+    let (before, after) = delimiter
+        .split_once(marker)
+        .expect("delimiter contains marker");
+    (before, marker, after)
+}
+
+fn framing_newlines(input: &str, newlines: &str, final_input: bool) -> Option<usize> {
+    if input.starts_with(newlines) {
+        Some(newlines.len())
+    } else if !final_input && newlines.starts_with(input) {
+        None
+    } else {
+        Some(0)
+    }
 }
 
 /// Exact JSON syntax and semantic fields for one function call.
@@ -558,6 +592,7 @@ impl DeclarativeDialectSpec {
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: &[u32],
+        framing: Option<ReasoningFraming>,
     ) -> Result<String, String> {
         self.validate()?;
         if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
@@ -573,6 +608,28 @@ impl DeclarativeDialectSpec {
                 self.required_structural_tokens,
                 resolved_structural_token_ids,
             )
+        };
+        let reasoning_literal = |delimiter: &str| {
+            let Some(framing) = framing else {
+                return literal(delimiter);
+            };
+            let (before, marker, after) = delimiter_parts(delimiter);
+            let mut rule = Vec::new();
+            if !before.is_empty() {
+                rule.push(format!("{}?", literal(before)?));
+            }
+            rule.push(
+                framing
+                    .special_tokens
+                    .into_iter()
+                    .flatten()
+                    .find(|(token, _)| *token == marker)
+                    .map_or_else(|| literal(marker), |(_, id)| Ok(format!("<[{id}]>")))?,
+            );
+            if !after.is_empty() {
+                rule.push(format!("{}?", literal(after)?));
+            }
+            Ok::<_, String>(rule.join(" "))
         };
         if self
             .protocol_max_tools
@@ -612,8 +669,15 @@ impl DeclarativeDialectSpec {
         let constrained_reasoning_channel = self
             .reasoning_channel
             .filter(|channel| !(channel.prefix_in_prompt && tool_choice == ToolChoice::Auto));
+        let prefilled_with_text = framing.is_some()
+            && constrained_reasoning_channel
+                .is_some_and(|channel| channel.prefix_in_prompt && !channel.required)
+            && self.text_channel.is_none()
+            && self.raw_text_before_calls;
         let mut grammar = String::from("start: ");
-        if let Some(channel) = constrained_reasoning_channel {
+        if prefilled_with_text {
+            grammar.push_str("(reasoning raw_text?)? ");
+        } else if let Some(channel) = constrained_reasoning_channel {
             grammar.push_str(if channel.required {
                 "reasoning "
             } else {
@@ -626,7 +690,7 @@ impl DeclarativeDialectSpec {
             } else {
                 "visible_text? "
             });
-        } else if self.raw_text_before_calls {
+        } else if self.raw_text_before_calls && !prefilled_with_text {
             grammar.push_str("raw_text? ");
         }
         grammar.push_str("tool_output\n");
@@ -634,12 +698,12 @@ impl DeclarativeDialectSpec {
         if let Some(channel) = constrained_reasoning_channel {
             grammar.push_str(&format!(
                 "reasoning: {} channel_text {}\n",
-                literal(if channel.prefix_in_prompt {
-                    ""
+                if channel.prefix_in_prompt {
+                    literal("")?
                 } else {
-                    channel.prefix
-                })?,
-                literal(channel.suffix)?
+                    reasoning_literal(channel.prefix)?
+                },
+                reasoning_literal(channel.suffix)?
             ));
         }
         if let Some(channel) = self.text_channel {
@@ -1484,16 +1548,19 @@ pub(crate) struct DeclarativeDialect;
 pub(crate) static DECLARATIVE_DIALECT: DeclarativeDialect = DeclarativeDialect;
 
 impl DeclarativeDialect {
-    fn spec(parameters: DialectParameters) -> Result<&'static DeclarativeDialectSpec, String> {
-        match parameters {
-            DialectParameters::Declarative(spec) => {
-                spec.validate()?;
-                Ok(spec)
-            }
+    fn spec(parameters: DialectParameters) -> Result<DeclarativeDialectSpec, String> {
+        let spec = match parameters {
+            DialectParameters::Declarative(spec) => *spec,
+            DialectParameters::BoundDeclarative(spec, framing) => DeclarativeDialectSpec {
+                reasoning_channel: framing.channel,
+                ..*spec
+            },
             DialectParameters::Custom(_) => {
-                Err("declarative dialect received custom parameters".into())
+                return Err("declarative dialect received custom parameters".into());
             }
-        }
+        };
+        spec.validate()?;
+        Ok(spec)
     }
 }
 
@@ -1545,6 +1612,10 @@ impl FormatDialect for DeclarativeDialect {
             tool_choice,
             parallel_tool_calls,
             resolved_structural_token_ids,
+            match parameters {
+                DialectParameters::BoundDeclarative(_, framing) => Some(framing),
+                _ => None,
+            },
         )?;
         Ok(ConstraintConfiguration {
             grammar: TopLevelGrammar::from_lark(grammar),
@@ -1576,7 +1647,7 @@ impl FormatDialect for DeclarativeDialect {
         &self,
         parameters: DialectParameters,
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
-        Ok(Box::new(DeclarativeParser::new(Self::spec(parameters)?)))
+        self.incremental_parser_state_for_request(parameters, &[], true)
     }
 
     fn incremental_parser_state_for_request(
@@ -1589,6 +1660,7 @@ impl FormatDialect for DeclarativeDialect {
             Self::spec(parameters)?,
             tools,
             tool_surface,
+            matches!(parameters, DialectParameters::BoundDeclarative(..)),
         )?))
     }
 }
@@ -1601,6 +1673,7 @@ enum ChannelKind {
 
 #[derive(Debug, Clone)]
 enum DeclarativeParserState {
+    GeneratedReasoning(DelimitedChannel),
     PrefilledChannelOrTool {
         kind: ChannelKind,
         suffix: &'static str,
@@ -1651,22 +1724,20 @@ enum DeclarativeParserState {
 
 #[derive(Debug, Clone)]
 struct DeclarativeParser {
-    spec: &'static DeclarativeDialectSpec,
+    spec: DeclarativeDialectSpec,
     tagged_tools: BTreeMap<String, TaggedToolSchema>,
     tool_surface: bool,
+    bound_reasoning: bool,
     state: DeclarativeParserState,
     pending: String,
 }
 
 impl DeclarativeParser {
-    fn new(spec: &'static DeclarativeDialectSpec) -> Self {
-        Self::new_with_tools(spec, &[], true).expect("empty declarative parser schema is valid")
-    }
-
     fn new_with_tools(
-        spec: &'static DeclarativeDialectSpec,
+        spec: DeclarativeDialectSpec,
         tools: &[Value],
         tool_surface: bool,
+        bound_reasoning: bool,
     ) -> Result<Self, String> {
         let tagged_tools = if tool_surface
             && matches!(
@@ -1681,10 +1752,9 @@ impl DeclarativeParser {
             spec,
             tagged_tools,
             tool_surface,
-            state: spec
-                .reasoning_channel
-                .filter(|channel| channel.prefix_in_prompt)
-                .map_or(DeclarativeParserState::Outside, |channel| {
+            bound_reasoning,
+            state: match spec.reasoning_channel {
+                Some(channel) if channel.prefix_in_prompt => {
                     if tool_surface {
                         DeclarativeParserState::PrefilledChannelOrTool {
                             kind: ChannelKind::Reasoning,
@@ -1696,7 +1766,12 @@ impl DeclarativeParser {
                             suffix: channel.suffix,
                         }
                     }
-                }),
+                }
+                Some(channel) if bound_reasoning => {
+                    DeclarativeParserState::GeneratedReasoning(channel)
+                }
+                _ => DeclarativeParserState::Outside,
+            },
             pending: String::new(),
         })
     }
@@ -1732,7 +1807,7 @@ impl DeclarativeParser {
         if let Some(channel) = self
             .spec
             .reasoning_channel
-            .filter(|channel| !channel.prefix_in_prompt)
+            .filter(|channel| !self.bound_reasoning && !channel.prefix_in_prompt)
         {
             delimiters.push(channel.prefix);
         }
@@ -1845,10 +1920,27 @@ impl DeclarativeParser {
         }
     }
 
-    fn process(&mut self, sink: &mut SemanticEventSink) -> Result<(), String> {
+    fn process(&mut self, sink: &mut SemanticEventSink, final_input: bool) -> Result<(), String> {
         loop {
             let tool_start_delimiter = self.tool_start_delimiter();
             match &mut self.state {
+                DeclarativeParserState::GeneratedReasoning(channel) => {
+                    let (_, marker, after) = delimiter_parts(channel.prefix);
+                    if let Some(rest) = self.pending.strip_prefix(marker) {
+                        let Some(trailing) = framing_newlines(rest, after, final_input) else {
+                            return Ok(());
+                        };
+                        self.pending.drain(..marker.len() + trailing);
+                        self.state = DeclarativeParserState::Channel {
+                            kind: ChannelKind::Reasoning,
+                            suffix: channel.suffix,
+                        };
+                    } else if !final_input && marker.starts_with(&self.pending) {
+                        return Ok(());
+                    } else {
+                        self.state = DeclarativeParserState::Outside;
+                    }
+                }
                 DeclarativeParserState::PrefilledChannelOrTool { kind, suffix } => {
                     if self.pending.is_empty() {
                         return Ok(());
@@ -1876,7 +1968,7 @@ impl DeclarativeParser {
                     let generated_reasoning_channel = self
                         .spec
                         .reasoning_channel
-                        .filter(|channel| !channel.prefix_in_prompt);
+                        .filter(|channel| !self.bound_reasoning && !channel.prefix_in_prompt);
                     let reasoning_index = generated_reasoning_channel.map(|_| 0);
                     let text_index = self
                         .spec
@@ -1918,15 +2010,39 @@ impl DeclarativeParser {
                 DeclarativeParserState::Channel { kind, suffix } => {
                     let channel_kind = *kind;
                     let channel_suffix = *suffix;
-                    let Some(position) = self.pending.find(channel_suffix) else {
-                        self.emit_before_partial_delimiter(&[channel_suffix], channel_kind, sink);
+                    let (before, marker, after) =
+                        if self.bound_reasoning && channel_kind == ChannelKind::Reasoning {
+                            delimiter_parts(channel_suffix)
+                        } else {
+                            ("", channel_suffix, "")
+                        };
+                    let Some(position) = self.pending.find(marker) else {
+                        self.emit_before_partial_delimiter(
+                            &[channel_suffix, marker],
+                            channel_kind,
+                            sink,
+                        );
                         return Ok(());
                     };
-                    let visible = self.pending[..position].to_owned();
-                    self.pending.drain(..position + channel_suffix.len());
+                    let end = position + marker.len();
+                    let visible = self.pending[..position]
+                        .strip_suffix(before)
+                        .unwrap_or(&self.pending[..position])
+                        .to_owned();
+                    let trailing = framing_newlines(&self.pending[end..], after, final_input);
+                    self.pending.drain(
+                        ..if let Some(trailing) = trailing {
+                            end + trailing
+                        } else {
+                            visible.len()
+                        },
+                    );
                     match channel_kind {
                         ChannelKind::Reasoning => sink.reasoning(visible),
                         ChannelKind::Text => sink.text(visible),
+                    }
+                    if trailing.is_none() {
+                        return Ok(());
                     }
                     self.state = DeclarativeParserState::Outside;
                 }
@@ -3136,12 +3252,15 @@ impl ProtocolParser for DeclarativeParser {
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         self.pending.push_str(text);
-        self.process(sink)
+        self.process(sink, false)
     }
 
     fn finish(&mut self, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
-        self.process(sink)?;
+        self.process(sink, true)?;
         match self.state {
+            DeclarativeParserState::GeneratedReasoning(_) => {
+                unreachable!("final input resolves the opening marker")
+            }
             DeclarativeParserState::PrefilledChannelOrTool {
                 kind: ChannelKind::Reasoning,
                 ..
@@ -3634,9 +3753,7 @@ mod tests {
         let plan = ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
                 &DECLARATIVE_DIALECT,
-                DialectParameters::Declarative(
-                    &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
-                ),
+                DialectParameters::Declarative(&crate::runtime::chat::TAGGED_PARAMETER_TOOL_SPEC),
                 &tools,
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
@@ -3739,7 +3856,7 @@ mod tests {
                 .compile_tool_plan(
                     &DECLARATIVE_DIALECT,
                     DialectParameters::Declarative(
-                        &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                        &crate::runtime::chat::TAGGED_PARAMETER_TOOL_SPEC,
                     ),
                     &tools,
                     ToolChoice::Required,
@@ -3774,9 +3891,7 @@ mod tests {
         let plan = ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
                 &DECLARATIVE_DIALECT,
-                DialectParameters::Declarative(
-                    &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
-                ),
+                DialectParameters::Declarative(&crate::runtime::chat::TAGGED_PARAMETER_TOOL_SPEC),
                 &tools,
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,

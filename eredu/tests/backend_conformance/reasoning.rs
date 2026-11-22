@@ -1,33 +1,46 @@
 use super::*;
 use eredu::api::{ObservedGenerationEvent, OutputMode};
+use eredu::runtime::chat::ToolChoice;
 use eredu_core::execution_control::SnapshotLimits;
 use std::ops::ControlFlow;
 
 const TEMPLATE: &str =
     include_str!("../fixtures/chat_templates/deepseek-r1-distill-qwen-1.5b-ad9f0ae0.jinja");
+const TAGGED_TEMPLATE: &str =
+    include_str!("../fixtures/chat_templates/qwen3.8-flash-next-de4b8e4d.jinja");
+const EMULATED_TEXT: &str = "Answer<tool_call>emulated</tool_call>";
 
 fn setup(
     method: usize,
+    tool_choice: Option<ToolChoice>,
 ) -> (
     LoadedModel<MockBackend, MockSession>,
     PreparedChat,
     Vec<u32>,
 ) {
-    let (mut model, ids) = text::output_model(
-        method,
-        ["Check</thi", "nk>Answer<tool_call>emulated</tool_call>"],
-        TEMPLATE,
-    );
-    let chat = model
-        .prepare_chat(ChatTemplateRequest {
-            messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
-            enable_thinking: Some(true),
-            add_generation_prompt: true,
-            ..Default::default()
-        })
-        .unwrap();
+    let mut request = ChatTemplateRequest {
+        messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
+        enable_thinking: Some(true),
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let (template, tail) = if let Some(choice) = tool_choice {
+        request.tool_choice = choice;
+        request.tools = vec![serde_json::json!({"type":"function","function":{
+            "name":"lookup", "parameters":{"type":"object"}
+        }})];
+        (TAGGED_TEMPLATE, "nk>Answer")
+    } else {
+        (TEMPLATE, "nk>Answer<tool_call>emulated</tool_call>")
+    };
+    let (mut model, ids) =
+        text::output_model_for_request(method, ["Check</thi", tail], template, request.clone());
+    let chat = model.prepare_chat(request).unwrap();
     assert!(chat.capabilities().reasoning_parser.is_supported());
-    assert!(!chat.native_tool_support().is_supported());
+    assert_eq!(
+        chat.native_tool_support().is_supported(),
+        tool_choice.is_some()
+    );
     (model, chat, ids)
 }
 
@@ -54,11 +67,11 @@ fn channels(events: &[SemanticEvent]) -> (String, String) {
 }
 
 #[test]
-fn reasoning_only_generation_matches_controlled_and_speculative_delivery() {
-    for method in 0..2 {
+fn reasoning_generation_matches_controlled_and_speculative_delivery() {
+    for (native_tools, method) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
         let mut expected = None;
         for controlled in [false, true] {
-            let (mut model, chat, ids) = setup(method);
+            let (mut model, chat, ids) = setup(method, native_tools.then_some(ToolChoice::Auto));
             let mut events = vec![];
             let request = GenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&chat),
@@ -104,7 +117,12 @@ fn reasoning_only_generation_matches_controlled_and_speculative_delivery() {
                 channels(&events),
                 (
                     "Check".into(),
-                    "Answer<tool_call>emulated</tool_call>".into()
+                    if native_tools {
+                        "Answer"
+                    } else {
+                        EMULATED_TEXT
+                    }
+                    .into()
                 )
             );
             assert_eq!(
@@ -124,47 +142,44 @@ fn reasoning_only_generation_matches_controlled_and_speculative_delivery() {
 }
 
 #[test]
-fn reasoning_only_snapshot_restores_a_partial_closing_marker() {
-    let (mut model, chat, ids) = setup(0);
-    let prepared = model.prepare_controlled_chat(&chat, settings()).unwrap();
-    let mut events = vec![];
-    let mut collect = |record: eredu::api::ControlledGenerationRecord| {
-        if let ObservedGenerationEvent::Semantic { event, .. } = record.generation.event {
-            events.push(event);
-        }
-        ControlFlow::Continue(())
-    };
-    let mut session = model
-        .start_controlled(
-            prepared,
-            &[],
-            Default::default(),
-            &mut collect,
-            OutputMode::Semantic,
-        )
-        .unwrap();
-    session
-        .enable_snapshots(SnapshotLimits {
-            max_snapshots: 1,
-            max_branches: 0,
-            retained_bytes: 4_000_000,
-            cumulative_copy_bytes: 32_000_000,
-        })
-        .unwrap();
-    session.step(&mut collect).unwrap();
-    let saved = session.snapshot(&mut collect).unwrap();
-    session.run(&mut collect).unwrap();
-    assert_eq!(session.token_ids(), ids);
-    session.restore(&saved, &mut collect).unwrap();
-    session.run(&mut collect).unwrap();
-    assert_eq!(session.token_ids(), ids);
-    assert_eq!(
-        channels(&events),
-        (
-            "Check".into(),
-            "Answer<tool_call>emulated</tool_call>Answer<tool_call>emulated</tool_call>".into()
-        )
-    );
+fn reasoning_snapshot_restores_a_partial_closing_marker() {
+    // A forbidden-call plan retains a declarative parser with bounded controller state.
+    for (choice, visible) in [(None, EMULATED_TEXT), (Some(ToolChoice::None), "Answer")] {
+        let (mut model, chat, ids) = setup(0, choice);
+        let prepared = model.prepare_controlled_chat(&chat, settings()).unwrap();
+        let mut events = vec![];
+        let mut collect = |record: eredu::api::ControlledGenerationRecord| {
+            if let ObservedGenerationEvent::Semantic { event, .. } = record.generation.event {
+                events.push(event);
+            }
+            ControlFlow::Continue(())
+        };
+        let mut session = model
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                &mut collect,
+                OutputMode::Semantic,
+            )
+            .unwrap();
+        session
+            .enable_snapshots(SnapshotLimits {
+                max_snapshots: 1,
+                max_branches: 0,
+                retained_bytes: 4_000_000,
+                cumulative_copy_bytes: 32_000_000,
+            })
+            .unwrap();
+        session.step(&mut collect).unwrap();
+        let saved = session.snapshot(&mut collect).unwrap();
+        session.run(&mut collect).unwrap();
+        assert_eq!(session.token_ids(), ids);
+        session.restore(&saved, &mut collect).unwrap();
+        session.run(&mut collect).unwrap();
+        assert_eq!(session.token_ids(), ids);
+        assert_eq!(channels(&events), ("Check".into(), visible.repeat(2)));
+    }
 }
 
 #[test]
