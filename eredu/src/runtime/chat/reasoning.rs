@@ -15,38 +15,49 @@ pub(crate) enum InitialChannel {
     Text,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ReasoningFormat {
     pub(crate) opening: &'static str,
     pub(crate) closing: &'static str,
+    pub(crate) opening_with_newline: &'static str,
+    pub(crate) closing_with_newline: &'static str,
     pub(crate) initial: InitialChannel,
 }
 
-const fn formats(opening: &'static str, closing: &'static str) -> [ReasoningFormat; 3] {
+const fn formats(
+    opening: &'static str,
+    closing: &'static str,
+    opening_with_newline: &'static str,
+    closing_with_newline: &'static str,
+) -> [ReasoningFormat; 3] {
+    let generated = ReasoningFormat {
+        opening,
+        closing,
+        opening_with_newline,
+        closing_with_newline,
+        initial: InitialChannel::Generated,
+    };
     [
+        generated,
         ReasoningFormat {
-            opening,
-            closing,
-            initial: InitialChannel::Generated,
-        },
-        ReasoningFormat {
-            opening,
-            closing,
             initial: InitialChannel::Reasoning,
+            ..generated
         },
         ReasoningFormat {
-            opening,
-            closing,
             initial: InitialChannel::Text,
+            ..generated
         },
     ]
 }
 
 pub(crate) static DELIMITED_FORMATS: [(&str, [ReasoningFormat; 3]); 2] = [
-    ("reasoning.think.v1", formats("<think>", "</think>")),
+    (
+        "reasoning.think.v1",
+        formats("<think>", "</think>", "<think>\n", "\n</think>"),
+    ),
     (
         "reasoning.thinking.v1",
-        formats("<thinking>", "</thinking>"),
+        formats("<thinking>", "</thinking>", "<thinking>\n", "\n</thinking>"),
     ),
 ];
 

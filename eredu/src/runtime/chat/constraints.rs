@@ -1256,7 +1256,7 @@ mod tests {
                 .compile_tool_plan(
                     &DECLARATIVE_DIALECT,
                     DialectParameters::Declarative(
-                        &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                        &crate::runtime::chat::TAGGED_PARAMETER_TOOL_SPEC,
                     ),
                     &tools,
                     choice,
@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn qwen_parallel_calls_remain_open_until_eos_or_call_limit() {
         use crate::runtime::chat::{
-            QWEN3_XML_TOOL_SPEC, QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_XML_TOOL_SPEC,
+            QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC, TAGGED_PARAMETER_TOOL_SPEC,
         };
 
         let json_call = "<tool_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</tool_call>";
@@ -1298,7 +1298,7 @@ mod tests {
             (&QWEN_XML_TOOL_SPEC, json_call),
             (&QWEN3_XML_TOOL_SPEC, json_call),
             (
-                &QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
+                &TAGGED_PARAMETER_TOOL_SPEC,
                 "<tool_call>\n<function=ping>\n</function>\n</tool_call>",
             ),
         ] {

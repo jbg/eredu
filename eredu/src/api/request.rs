@@ -1605,9 +1605,7 @@ fn recognize_remaining_protocols(
                 tokenizer,
                 identity,
                 &DECLARATIVE_DIALECT,
-                DialectParameters::Declarative(
-                    &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING,
-                ),
+                DialectParameters::Declarative(&crate::runtime::chat::TAGGED_PARAMETER_TOOL_SPEC),
                 tagged_mapping,
                 false,
             )?;
@@ -1819,14 +1817,29 @@ pub(super) fn prepare_chat_from_parts_with_history(
             profile = recognized;
         }
     }
+    let mut reasoning_channel = None;
     if !profile
         .dialect
         .zip(profile.dialect_parameters)
         .is_some_and(|(dialect, parameters)| dialect.supports_reasoning_parsing(parameters))
     {
-        if let Some(reasoning) =
-            reasoning::recognize(tokenizer, &selected_template, model_id, &request)
-        {
+        let tool_reasoning = (profile.tool_dialect.is_some()
+            && request.tool_choice != ToolChoice::None
+            && !request.tools.is_empty())
+        .then(|| {
+            reasoning::recognize(
+                tokenizer,
+                &selected_template,
+                model_id,
+                &request,
+                &request.tools,
+            )
+        })
+        .flatten();
+        if let Some((reasoning, channel)) = tool_reasoning.or_else(|| {
+            reasoning::recognize(tokenizer, &selected_template, model_id, &request, &[])
+        }) {
+            reasoning_channel = Some(channel);
             if profile.tool_dialect.is_none() {
                 profile.identity = reasoning.identity;
                 profile.native_tool_unavailable_reason = reasoning.native_tool_unavailable_reason;
@@ -1839,12 +1852,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
             profile.dialect_parameters = reasoning.dialect_parameters;
             for marker in reasoning.required_structural_tokens {
                 if !profile.required_structural_tokens.contains(&marker) {
-                    profile.required_structural_tokens.push(marker.clone());
-                }
-                if reasoning::can_bind_tools(&profile)
-                    && !profile.tool_required_structural_tokens.contains(&marker)
-                {
-                    profile.tool_required_structural_tokens.push(marker);
+                    profile.required_structural_tokens.push(marker);
                 }
             }
 
@@ -1942,27 +1950,11 @@ pub(super) fn prepare_chat_from_parts_with_history(
             .into());
         }
     }
-    let add_generation_prompt = profile
-        .generation_prompt_behavior
-        .resolve(request.add_generation_prompt);
-    if profile.identity.as_deref().is_some_and(|identity| {
-        identity.starts_with("qwen3.6.") || identity.starts_with("qwen3.8.")
-    }) {
-        use crate::runtime::chat::{
-            QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING, QWEN_TAGGED_TOOL_SPEC_NO_REASONING,
-            QWEN_TAGGED_TOOL_SPEC_PREFILLED_REASONING,
-        };
-        let spec = if request.enable_thinking == Some(false) {
-            &QWEN_TAGGED_TOOL_SPEC_NO_REASONING
-        } else if add_generation_prompt {
-            &QWEN_TAGGED_TOOL_SPEC_PREFILLED_REASONING
-        } else {
-            &QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING
-        };
-        let parameters = crate::runtime::chat::dialect::DialectParameters::Declarative(spec);
-        profile.tool_dialect_parameters = Some(parameters);
-
-        validate_tagged_history(&request.messages, "</parameter>", "Qwen")?;
+    if matches!(profile.tool_dialect_parameters,
+        Some(crate::runtime::chat::dialect::DialectParameters::Declarative(spec))
+            if spec == &crate::runtime::chat::TAGGED_PARAMETER_TOOL_SPEC)
+    {
+        validate_tagged_history(&request.messages, "</parameter>", "XML")?;
     }
     if let crate::runtime::chat::ReasoningTemplateControl::RequiredEffort { kwarg, .. } =
         profile.reasoning_template_control
@@ -2047,33 +2039,17 @@ pub(super) fn prepare_chat_from_parts_with_history(
         profile
             .tool_dialect
             .zip(profile.tool_dialect_parameters)
-            .map(|(dialect, parameters)| {
-                (
-                    dialect,
-                    parameters,
-                    &profile.tool_required_structural_tokens,
-                    true,
-                )
-            })
+            .map(|(dialect, _)| (dialect, true))
     } else if tool_surface_requested && profile.tool_dialect.is_none() {
         None
     } else {
         profile
             .dialect
             .zip(profile.dialect_parameters)
-            .map(|(dialect, parameters)| {
-                (
-                    dialect,
-                    parameters,
-                    &profile.required_structural_tokens,
-                    false,
-                )
-            })
+            .map(|(dialect, _)| (dialect, false))
     };
     let selected_runtime = selected_runtime
-        .map(|(dialect, _, structural_tokens, has_tool_surface)| {
-            let ids = resolve_structural_tokens(tokenizer, structural_tokens)
-                .map_err(|reason| ConstraintPreparationError::StructuralTokens { reason })?;
+        .map(|(dialect, has_tool_surface)| {
             if tool_surface_requested {
                 constraint_compiler
                     .ok_or_else(|| {
@@ -2086,7 +2062,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
                         reason: reason.clone(),
                     })?;
             }
-            Ok::<_, TextModelError>((dialect, structural_tokens.clone(), ids, has_tool_surface))
+            Ok::<_, TextModelError>((dialect, has_tool_surface))
         })
         .transpose()?;
     if request.tool_choice != ToolChoice::None
@@ -2170,21 +2146,41 @@ pub(super) fn prepare_chat_from_parts_with_history(
         without_generation_prompt
     };
 
+    let thinking = request.enable_thinking.or_else(|| {
+        let crate::runtime::chat::ReasoningTemplateControl::Boolean(kwarg) =
+            profile.reasoning_template_control
+        else {
+            return None;
+        };
+        extra_template_kwargs
+            .get(kwarg)
+            .and_then(serde_json::Value::as_bool)
+    });
     reasoning::bind_generation_prompt(
         &mut profile,
+        tokenizer,
+        reasoning_channel,
         &generation_prompt,
         add_generation_prompt,
-        request.enable_thinking,
+        thinking,
     )?;
 
     let generation_runtime_plan = match selected_runtime {
-        Some((dialect, structural_tokens, resolved_ids, has_tool_surface)) => {
-            let parameters = if has_tool_surface {
-                profile.tool_dialect_parameters
+        Some((dialect, has_tool_surface)) => {
+            let (parameters, structural_tokens) = if has_tool_surface {
+                (
+                    profile.tool_dialect_parameters,
+                    &profile.tool_required_structural_tokens,
+                )
             } else {
-                profile.dialect_parameters
-            }
-            .expect("admitted format parameters");
+                (
+                    profile.dialect_parameters,
+                    &profile.required_structural_tokens,
+                )
+            };
+            let parameters = parameters.expect("admitted format parameters");
+            let resolved_ids = resolve_structural_tokens(tokenizer, structural_tokens)
+                .map_err(|reason| ConstraintPreparationError::StructuralTokens { reason })?;
             Some(
                 crate::runtime::chat::GenerationRuntimePlan::prepare(
                     constraint_compiler.and_then(|compiler| compiler.as_ref().ok()),
@@ -2201,7 +2197,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
                         ToolChoice::None
                     },
                     request.parallel_tool_calls,
-                    structural_tokens,
+                    structural_tokens.clone(),
                     resolved_ids,
                     profile.stop_sequences.clone(),
                     has_tool_surface,

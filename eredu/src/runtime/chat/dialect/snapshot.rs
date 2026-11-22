@@ -26,9 +26,16 @@ snapshot_fields!(DeclarativeParser {
     spec,
     tagged_tools,
     tool_surface,
+    bound_reasoning,
     state,
     pending
 });
+
+impl SnapshotStorage for DeclarativeDialectSpec {
+    fn heap_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+}
 snapshot_fields!(TaggedToolSchema {
     parameters,
     required
@@ -86,7 +93,8 @@ impl SnapshotStorage for DeclarativeParserState {
                 .checked_add(arguments.heap_bytes()?)?
                 .checked_add(declared_type.heap_bytes()?),
             Self::StructuralPayload { normalizer } => normalizer.heap_bytes(),
-            Self::Outside
+            Self::GeneratedReasoning(_)
+            | Self::Outside
             | Self::ToolStart
             | Self::JsonEnvelopeStart
             | Self::NamedJsonName

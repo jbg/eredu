@@ -317,13 +317,7 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
         logits,
         ..Default::default()
     };
-    if family == ModelKind::Lfm3 {
-        // Replay a complete publisher-format call through the real tokenizer
-        // and grammar. Flat mock logits otherwise prefer unbounded whitespace.
-        backend.calls.borrow_mut().scripted_tokens = tokenizer.encode(
-            "<tool_call>\n<function=lookup>\n<parameter=value>\n7\n</parameter>\n</function>\n</tool_call><|im_end|>", false,
-        ).unwrap().get_ids().iter().copied().collect();
-    }
+    let calls = backend.calls.clone();
     let runtime = ModelRuntime::install::<MockSession>(
         backend,
         PreparedModel::new((), SessionCapabilities::default()),
@@ -345,77 +339,138 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
             checkpoint_generation_config: None,
         },
     );
-    let prepared = model
-        .prepare_chat(ChatTemplateRequest {
-            messages: vec![json!({"role": "user", "content": "Look up value 7."})],
-            tools: vec![json!({"type": "function", "function": {
-                "name": "lookup",
-                "parameters": {
-                    "type": "object", "properties": {"value": {"type": "integer", "enum": [7]}},
-                    "required": ["value"], "additionalProperties": false
-                }
-            }})],
-            tool_choice: ToolChoice::Auto,
-            parallel_tool_calls: ParallelToolCallPolicy::Disabled,
-            add_generation_prompt: true,
-            enable_thinking: (family == ModelKind::Lfm3).then_some(false),
-            ..Default::default()
-        })
-        .unwrap();
-    let mut events = Vec::new();
-    let output = model
-        .session()
-        .generate(GenerationRequest {
-            output_mode: eredu::api::OutputMode::Semantic,
-            control_handle: None,
-            input: PreparedChatInput::rendered_prompt(&prepared),
-            settings: PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    max_new_tokens: Some(64),
+    let request = ChatTemplateRequest {
+        messages: vec![json!({"role": "user", "content": "Look up value 7."})],
+        tools: vec![json!({"type": "function", "function": {
+            "name": "lookup",
+            "parameters": {
+                "type": "object", "properties": {"value": {"type": "integer", "enum": [7]}},
+                "required": ["value"], "additionalProperties": false
+            }
+        }})],
+        parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let call = "<tool_call>\n<function=lookup>\n<parameter=value>\n7\n</parameter>\n</function>\n</tool_call>";
+    let cases = if family == ModelKind::Lfm3 {
+        vec![
+            (Some(false), ToolChoice::Auto, call.to_owned(), "", "", true),
+            (
+                None,
+                ToolChoice::Auto,
+                "Check</think>Answer".to_owned(),
+                "Check",
+                "Answer",
+                false,
+            ),
+            (
+                None,
+                ToolChoice::Auto,
+                format!("Check</think>{call}"),
+                "Check",
+                "",
+                true,
+            ),
+            (
+                None,
+                ToolChoice::Required,
+                format!("Check</think>{call}"),
+                "Check",
+                "",
+                true,
+            ),
+        ]
+    } else {
+        vec![(None, ToolChoice::Auto, String::new(), "", "", true)]
+    };
+    for (thinking, choice, script, reasoning, visible, expect_call) in cases {
+        let prepared = model
+            .prepare_chat(ChatTemplateRequest {
+                enable_thinking: thinking,
+                tool_choice: choice,
+                ..request.clone()
+            })
+            .unwrap();
+        if !script.is_empty() {
+            calls.borrow_mut().scripted_tokens = model
+                .tokenizer()
+                .encode(format!("{script}<|im_end|>"), false)
+                .unwrap()
+                .get_ids()
+                .iter()
+                .copied()
+                .collect();
+        }
+        let mut events = Vec::new();
+        let output = model
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                control_handle: None,
+                input: PreparedChatInput::rendered_prompt(&prepared),
+                settings: PreparedChatGenerationSettings {
+                    overrides: GenerationConfigOverrides {
+                        max_new_tokens: Some(64),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |event| events.push(event),
-        })
-        .unwrap();
-    assert_eq!(output.token_ids.first(), Some(&start));
-    assert!(matches!(
-        output.finish_reason,
-        FinishReason::GrammarComplete | FinishReason::StopSequence
-    ));
-    assert!(
-        matches!(events.first(), Some(SemanticEvent::ToolCallStart { index: 0, name, .. }) if name == "lookup")
-    );
-    let arguments = events
-        .iter()
-        .filter_map(|event| match event {
-            SemanticEvent::ToolArgumentsDelta {
-                index: 0,
-                json_fragment,
-            } => Some(json_fragment.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
-        json!({"value": 7})
-    );
-    assert_eq!(
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |event| events.push(event),
+            })
+            .unwrap();
+        if expect_call && reasoning.is_empty() {
+            assert_eq!(output.token_ids.first(), Some(&start));
+        }
+        assert!(matches!(
+            output.finish_reason,
+            FinishReason::GrammarComplete | FinishReason::StopSequence
+        ));
+        let mut actual_reasoning = String::new();
+        let mut actual_visible = String::new();
+        for event in &events {
+            match event {
+                SemanticEvent::ReasoningDelta(text) => actual_reasoning.push_str(text),
+                SemanticEvent::TextDelta(text) => actual_visible.push_str(text),
+                _ => {}
+            }
+        }
+        assert_eq!(actual_reasoning, reasoning);
+        assert_eq!(actual_visible, visible);
+        let arguments = events
+            .iter()
+            .filter_map(|event| match event {
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment,
+                } => Some(json_fragment.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if expect_call {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+                json!({"value": 7})
+            );
+        } else {
+            assert!(arguments.is_empty());
+        }
+        assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
+            .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { name, .. } if name == "lookup"))
             .count(),
-        1
+        usize::from(expect_call)
     );
-    assert_eq!(
-        events.last(),
-        Some(&SemanticEvent::Finished {
-            reason: output.finish_reason
-        })
-    );
+        assert_eq!(
+            events.last(),
+            Some(&SemanticEvent::Finished {
+                reason: output.finish_reason
+            })
+        );
+    }
 }
 
 #[test]

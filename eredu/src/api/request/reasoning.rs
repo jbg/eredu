@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::runtime::chat::{
-    dialect::DialectParameters,
+    dialect::{DelimitedChannel, DialectParameters, ReasoningFraming},
     reasoning::{DELIMITED_FORMATS, REASONING_DIALECT},
     PreparedFormatProfile,
 };
@@ -13,7 +13,8 @@ pub(super) fn recognize(
     template: &ModelChatTemplate,
     model_id: &str,
     request: &ChatTemplateRequest,
-) -> Option<PreparedFormatProfile> {
+    tools: &[serde_json::Value],
+) -> Option<(PreparedFormatProfile, DelimitedChannel)> {
     use crate::runtime::chat::{ReasoningEffortControl, ReasoningTemplateControl};
     let user = vec![json!({"role":"user", "content":"__eredu_user_probe__"})];
     let history = vec![
@@ -30,7 +31,7 @@ pub(super) fn recognize(
             .apply_chat_template_json(
                 template.clone(),
                 [messages],
-                Some(&[]),
+                Some(tools),
                 model_id,
                 generation,
                 Some(kwargs),
@@ -55,17 +56,35 @@ pub(super) fn recognize(
             let Some(suffix) = with.strip_prefix(&without) else {
                 continue;
             };
-            let framed = render(tokenizer, history.clone(), false, &kwargs).is_some_and(|text| {
-                text.split_once(format.opening)
-                    .and_then(|(_, rest)| rest.split_once(format.closing))
-                    .is_some_and(|(reasoning, rest)| {
-                        reasoning.trim() == "__eredu_reasoning_probe__"
-                            && rest.trim_start().starts_with("__eredu_visible_probe__")
-                    })
-            });
-            if !suffix.trim_end().ends_with(format.opening) && !framed {
+            let history = render(tokenizer, history.clone(), false, &kwargs);
+            let framed = history
+                .as_deref()
+                .and_then(|text| text.split_once(format.opening))
+                .and_then(|(_, rest)| rest.split_once(format.closing))
+                .filter(|(reasoning, rest)| {
+                    reasoning.trim() == "__eredu_reasoning_probe__"
+                        && rest.trim_start().starts_with("__eredu_visible_probe__")
+                })
+                .map(|(reasoning, _)| reasoning);
+            if !suffix.trim_end().ends_with(format.opening) && framed.is_none() {
                 continue;
             }
+            let channel = DelimitedChannel {
+                prefix: if framed.is_some_and(|body| body.starts_with('\n'))
+                    || suffix.ends_with(format.opening_with_newline)
+                {
+                    format.opening_with_newline
+                } else {
+                    format.opening
+                },
+                suffix: if framed.is_some_and(|body| body.ends_with('\n')) {
+                    format.closing_with_newline
+                } else {
+                    format.closing
+                },
+                required: false,
+                prefix_in_prompt: false,
+            };
             // A Boolean control must change rendered response framing. Accepting
             // an ignored kwarg is not evidence that the template can disable reasoning.
             if let Some(control) = control {
@@ -116,7 +135,7 @@ pub(super) fn recognize(
                     });
                 }
             }
-            return Some(profile);
+            return Some((profile, channel));
         }
     }
     None
@@ -125,6 +144,8 @@ pub(super) fn recognize(
 /// Bind the parser to this conversation's actual suffix, never the probe history.
 pub(super) fn bind_generation_prompt(
     profile: &mut PreparedFormatProfile,
+    tokenizer: &ChatTokenizer,
+    channel: Option<DelimitedChannel>,
     suffix: &str,
     added: bool,
     thinking: Option<bool>,
@@ -158,31 +179,85 @@ pub(super) fn bind_generation_prompt(
     }
     let index = if prefilled {
         1
-    } else if closed {
+    } else if closed || thinking == Some(false) {
         2
     } else {
         0
     };
     profile.dialect_parameters = Some(DialectParameters::Custom(&formats[index]));
-    if can_bind_tools(profile) {
-        use crate::runtime::chat::{QWEN_XML_TOOL_SPEC, XML_THINK_GENERATED, XML_THINK_PREFILLED};
-        let spec = match index {
-            1 => &XML_THINK_PREFILLED,
-            2 => &QWEN_XML_TOOL_SPEC,
-            _ => &XML_THINK_GENERATED,
+    if let (Some(channel), Some(DialectParameters::Declarative(spec))) =
+        (channel, profile.tool_dialect_parameters)
+    {
+        if !can_bind_tools(profile) {
+            return Ok(());
+        }
+        let channel = if index == 2 {
+            None
+        } else {
+            Some(DelimitedChannel {
+                prefix_in_prompt: prefilled,
+                ..spec
+                    .reasoning_channel
+                    .filter(|declared| {
+                        declared.prefix.trim_matches('\n') == format.opening
+                            && declared.suffix.trim_matches('\n') == format.closing
+                    })
+                    .unwrap_or(channel)
+            })
         };
-        profile.tool_dialect_parameters = Some(DialectParameters::Declarative(spec));
-        profile.identity = Some("xml-tools.think.v1".into());
+        let mut special_tokens = [None; 2];
+        if channel.is_some() {
+            let added_tokens = tokenizer.get_added_tokens_decoder();
+            for (slot, marker) in special_tokens
+                .iter_mut()
+                .zip([format.opening, format.closing])
+            {
+                let spelling = marker.to_owned();
+                if let Ok(ids) =
+                    resolve_structural_tokens(tokenizer, std::slice::from_ref(&spelling))
+                {
+                    if !profile.tool_required_structural_tokens.contains(&spelling) {
+                        profile.tool_required_structural_tokens.push(spelling);
+                    }
+                    if added_tokens.get(&ids[0]).is_some_and(|token| token.special) {
+                        *slot = Some((marker, ids[0]));
+                    }
+                }
+            }
+        }
+        profile.tool_dialect_parameters = Some(DialectParameters::BoundDeclarative(
+            spec,
+            ReasoningFraming {
+                channel,
+                special_tokens,
+            },
+        ));
+        if spec == &crate::runtime::chat::QWEN_XML_TOOL_SPEC && format.opening == "<think>" {
+            profile.identity = Some("xml-tools.think.v1".into());
+        }
     }
     Ok(())
 }
 
-/// Existing XML envelopes can compose the admitted reasoning channel directly.
+/// Declarative tool envelopes can compose independently admitted tag framing.
 pub(super) fn can_bind_tools(profile: &PreparedFormatProfile) -> bool {
-    profile.dialect_parameters.is_some_and(|parameters| {
-        parameters
-            .custom::<crate::runtime::chat::reasoning::ReasoningFormat>()
-            .is_ok_and(|format| format.opening == "<think>")
-    }) && matches!(profile.tool_dialect_parameters, Some(DialectParameters::Declarative(spec))
-        if spec == &crate::runtime::chat::QWEN_XML_TOOL_SPEC)
+    let Some(DialectParameters::Declarative(spec)) = profile.tool_dialect_parameters else {
+        return false;
+    };
+    spec.supports_tool_reasoning
+        && profile
+            .dialect_parameters
+            .and_then(|parameters| {
+                parameters
+                    .custom::<crate::runtime::chat::reasoning::ReasoningFormat>()
+                    .ok()
+            })
+            .is_some()
+        && spec.reasoning_channel.is_none_or(|channel| {
+            DELIMITED_FORMATS.iter().any(|(_, formats)| {
+                let format = &formats[0];
+                channel.prefix.trim_matches('\n') == format.opening
+                    && channel.suffix.trim_matches('\n') == format.closing
+            })
+        })
 }

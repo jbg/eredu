@@ -749,26 +749,6 @@ pub(crate) const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialec
     ..QWEN_XML_TOOL_SPEC
 };
 
-// The same XML tool envelope with independently admitted, untrimmed reasoning.
-pub(crate) const XML_THINK_GENERATED: DeclarativeDialectSpec = DeclarativeDialectSpec {
-    reasoning_channel: Some(DelimitedChannel {
-        prefix: "<think>",
-        suffix: "</think>",
-        required: false,
-        prefix_in_prompt: false,
-    }),
-    ..QWEN_XML_TOOL_SPEC
-};
-pub(crate) const XML_THINK_PREFILLED: DeclarativeDialectSpec = DeclarativeDialectSpec {
-    reasoning_channel: Some(DelimitedChannel {
-        prefix: "<think>",
-        suffix: "</think>",
-        required: false,
-        prefix_in_prompt: true,
-    }),
-    ..QWEN_XML_TOOL_SPEC
-};
-
 const QWEN_TAGGED_PARAMETERS: TaggedParametersEncoding = TaggedParametersEncoding {
     function_prefix: "<function=",
     function_name_suffix: ">",
@@ -781,7 +761,7 @@ const QWEN_TAGGED_PARAMETERS: TaggedParametersEncoding = TaggedParametersEncodin
     function_suffix: "</function>",
 };
 
-const QWEN_TAGGED_TOOL_SPEC_BASE: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const TAGGED_PARAMETER_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
     reasoning_template_kwarg: "enable_thinking",
     supports_tool_reasoning: true,
@@ -806,31 +786,6 @@ const QWEN_TAGGED_TOOL_SPEC_BASE: DeclarativeDialectSpec = DeclarativeDialectSpe
     required_structural_tokens: &["<|im_end|>"],
     stop_sequences: &["<|im_end|>"],
 };
-
-pub(crate) const QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING: DeclarativeDialectSpec =
-    DeclarativeDialectSpec {
-        reasoning_channel: Some(DelimitedChannel {
-            prefix: "<think>\n",
-            suffix: "\n</think>",
-            required: false,
-            prefix_in_prompt: false,
-        }),
-        ..QWEN_TAGGED_TOOL_SPEC_BASE
-    };
-
-pub(crate) const QWEN_TAGGED_TOOL_SPEC_PREFILLED_REASONING: DeclarativeDialectSpec =
-    DeclarativeDialectSpec {
-        reasoning_channel: Some(DelimitedChannel {
-            prefix: "<think>\n",
-            suffix: "\n</think>",
-            required: false,
-            prefix_in_prompt: true,
-        }),
-        ..QWEN_TAGGED_TOOL_SPEC_BASE
-    };
-
-pub(crate) const QWEN_TAGGED_TOOL_SPEC_NO_REASONING: DeclarativeDialectSpec =
-    QWEN_TAGGED_TOOL_SPEC_BASE;
 
 pub(crate) const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
