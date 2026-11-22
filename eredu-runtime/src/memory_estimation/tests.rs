@@ -713,6 +713,7 @@ fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() 
     let plain = e.clone();
     let full = FullKeyAttentionTiles {
         max_key_positions: 32,
+        wider_score_tile_elements: None,
         shared_key_value_copies: 4,
         max_live_query_tiles: 3,
         retained_output_copies: 2,
@@ -762,6 +763,35 @@ fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() 
         );
         assert_eq!(projected.lower_bytes, base.lower_bytes);
     }
+
+    let mut wider = e.clone();
+    wider
+        .workspace
+        .as_mut()
+        .unwrap()
+        .input_score_attention
+        .as_mut()
+        .unwrap()
+        .mechanism = Some(InputScoreAttentionMechanism {
+        full_key_tiles: Some(FullKeyAttentionTiles {
+            wider_score_tile_elements: Some(64),
+            ..full
+        }),
+        ..facts
+    });
+    let ordinary = workspace(&e, &r, 32, 7, 0).unwrap();
+    let widened = workspace(&wider, &r, 32, 7, 0).unwrap();
+    let g = e.workspace.as_ref().unwrap();
+    // The wider bound keeps six query rows live instead of three.
+    assert_eq!(
+        widened.upper_bytes.unwrap() - ordinary.upper_bytes.unwrap(),
+        g.query_heads * 3 * 33 * 16 * r.batch_size * 2
+    );
+    // The full-key allowance cannot change the blockwise fallback.
+    assert_eq!(
+        workspace(&wider, &r, 33, 7, 0).unwrap(),
+        workspace(&e, &r, 33, 7, 0).unwrap()
+    );
 
     // Promotion changes shared K/V and retained outputs, while score scratch
     // already includes conversion widths. Also include promoted projected logits,
@@ -1073,6 +1103,7 @@ fn generic_explicit_attention_uses_native_tile_contract_without_score_matrix_fal
             score_bytes: 20,
             full_key_tiles: Some(FullKeyAttentionTiles {
                 max_key_positions: 128,
+                wider_score_tile_elements: None,
                 shared_key_value_copies: 4,
                 max_live_query_tiles: 2,
                 retained_output_copies: 2,
@@ -1281,6 +1312,7 @@ fn archived_aggregate_mechanism_bounds_remain_exact_after_lifetime_lowering() {
                     .unwrap()
                     .full_key_tiles = Some(FullKeyAttentionTiles {
                     max_key_positions: 32,
+                    wider_score_tile_elements: None,
                     shared_key_value_copies: 4,
                     max_live_query_tiles: 3,
                     retained_output_copies: 2,
@@ -1363,6 +1395,7 @@ fn native_attention_frontiers_release_only_completed_transient_workspaces() {
         score_bytes: 32,
         full_key_tiles: Some(FullKeyAttentionTiles {
             max_key_positions: 64,
+            wider_score_tile_elements: None,
             shared_key_value_copies: 4,
             max_live_query_tiles: 2,
             retained_output_copies: 2,

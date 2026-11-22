@@ -1033,7 +1033,7 @@ fn input_score_evaluates_dependencies(
     {
         return Ok(false);
     }
-    let tile = (facts.score_tile_elements / keys.max(1)).clamp(1, facts.max_query_rows);
+    let tile = (facts.query_tile_score_bound(keys) / keys.max(1)).clamp(1, facts.max_query_rows);
     Ok(queries.div_ceil(tile) > full.max_live_query_tiles)
 }
 
@@ -1083,7 +1083,7 @@ fn explicit_attention(
     {
         query.max(1)
     } else {
-        (facts.score_tile_elements / positions.max(1)).clamp(1, facts.max_query_rows)
+        (facts.query_tile_score_bound(positions) / positions.max(1)).clamp(1, facts.max_query_rows)
     };
     let tiles = query.div_ceil(tile);
     let (copies, live_rows, output_copies, score_positions) = match facts

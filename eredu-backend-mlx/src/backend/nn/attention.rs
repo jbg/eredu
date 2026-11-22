@@ -55,8 +55,8 @@ pub(crate) fn memory_tile_geometry(
 ) -> (u64, u64) {
     match path {
         AttentionMemoryPath::QueryTiles => (
-            (INPUT_SCORE_WORKSPACE.score_tile_elements / keys)
-                .max(1)
+            (INPUT_SCORE_WORKSPACE.query_tile_score_bound(keys) / keys)
+                .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows)
                 .min(queries),
             keys,
         ),
@@ -340,6 +340,7 @@ pub fn sliding_window_prefill_attention_with_softcap(
 }
 
 const INPUT_SCORE_TILE_ELEMENTS: u64 = 8192;
+const WIDE_BF16_SCORE_TILE_ELEMENTS: u64 = 32768;
 
 /// Conservative native live-buffer facts shared with cold memory selection.
 pub(crate) const INPUT_SCORE_WORKSPACE: eredu_core::attention::InputScoreAttentionMechanism =
@@ -351,6 +352,11 @@ pub(crate) const INPUT_SCORE_WORKSPACE: eredu_core::attention::InputScoreAttenti
         score_bytes: 32,
         full_key_tiles: Some(eredu_core::attention::FullKeyAttentionTiles {
             max_key_positions: INPUT_SCORE_TILE_ELEMENTS,
+            wider_score_tile_elements: if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+                Some(WIDE_BF16_SCORE_TILE_ELEMENTS)
+            } else {
+                None
+            },
             shared_key_value_copies: 4,
             max_live_query_tiles: INPUT_SCORE_LIVE_TILE_BATCH as u64,
             retained_output_copies: 2,
@@ -767,7 +773,29 @@ fn input_score_attention_with_tile_batches(
         })
         .transpose()?;
     let mut outputs = Vec::new();
-    let query_step = (INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let wide_tile = prepared.is_some()
+        && keys.dim(2) <= score_softmax::MAX_KEYS
+        && sinks.is_none()
+        && softcap.is_none()
+        && mask.as_ref().is_none_or(|value| {
+            matches!(
+                value.dtype(),
+                Dtype::Bool | Dtype::Bfloat16 | Dtype::Float32
+            )
+        })
+        && [queries, keys, values]
+            .iter()
+            .all(|value| value.dtype() == Dtype::Bfloat16)
+        && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu;
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    let wide_tile = false;
+    let score_tile_elements = if wide_tile {
+        INPUT_SCORE_WORKSPACE.query_tile_score_bound(keys.dim(2) as u64)
+    } else {
+        INPUT_SCORE_WORKSPACE.score_tile_elements
+    };
+    let query_step = (score_tile_elements as i32 / keys.dim(2))
         .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
     let tile_count = (queries.dim(2) as usize).div_ceil(query_step as usize);
     let evaluate_batches = prepared.is_some() && tile_count > live_tile_batch;
