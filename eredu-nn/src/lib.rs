@@ -6665,6 +6665,22 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         Ok(None)
     }
 
+    /// Optional multi-token version of [`Self::gated_causal_depthwise_step`].
+    ///
+    /// Accepts `[batch, rows, 3 * channels]` with at least two rows and returns
+    /// `[batch, rows, channels]` and replacement history. Absent history is
+    /// treated as `taps - 1` zero rows. The replacement is the last `taps - 1`
+    /// rows of the prior history followed by the rounded input-gated values.
+    /// Arithmetic, layout and fallback follow the single-token contract.
+    fn gated_causal_depthwise_block(
+        _projected: &Self,
+        _history: Option<&Self>,
+        _weight: &Self,
+        _context: &Self::Context,
+    ) -> Result<Option<(Self, Self)>, Error> {
+        Ok(None)
+    }
+
     /// One-dimensional convolution.
     #[allow(clippy::too_many_arguments)]
     fn conv1d(
@@ -7351,30 +7367,33 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
     ) -> Result<(B::Tensor, Option<B::Tensor>), Error> {
         let projected = self.input_projection.forward(input, context)?;
         let convolution = &self.convolution;
-        let step_history = match (history, projected.shape()) {
-            (Some(history), &[batch, 1, width])
-                if convolution.arithmetic == ConvolutionArithmetic::FourLaneFloat32Affine
-                    && convolution.activation == ConvolutionActivation::Identity
-                    && convolution.dilation == 1
-                    && convolution.bias.is_none()
-                    && batch > 0
-                    && width == self.input_layout.output_width()
-                    && convolution.history_len > 0
-                    && history.shape()
-                        == [batch, convolution.history_len, convolution.channels] =>
+        if let &[batch, rows, width] = projected.shape() {
+            if convolution.arithmetic == ConvolutionArithmetic::FourLaneFloat32Affine
+                && convolution.activation == ConvolutionActivation::Identity
+                && convolution.dilation == 1
+                && convolution.bias.is_none()
+                && batch > 0
+                && rows > 0
+                && width == self.input_layout.output_width()
+                && convolution.history_len > 0
+                && rows.checked_add(convolution.history_len).is_some()
+                && history.is_none_or(|history| {
+                    history.shape() == [batch, convolution.history_len, convolution.channels]
+                })
             {
-                Some(history)
-            }
-            _ => None,
-        };
-        if let Some(history) = step_history {
-            if let Some((output, history)) = B::Tensor::gated_causal_depthwise_step(
-                &projected,
-                history,
-                convolution.weight.as_ref(),
-                context,
-            )? {
-                return Ok((output, Some(history)));
+                let weight = convolution.weight.as_ref();
+                let fused = match (rows, history) {
+                    (1, Some(history)) => B::Tensor::gated_causal_depthwise_step(
+                        &projected, history, weight, context,
+                    )?,
+                    (1, None) => None,
+                    _ => B::Tensor::gated_causal_depthwise_block(
+                        &projected, history, weight, context,
+                    )?,
+                };
+                if let Some((output, history)) = fused {
+                    return Ok((output, Some(history)));
+                }
             }
         }
         let [b, c, x]: [B::Tensor; 3] = self
