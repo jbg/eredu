@@ -35,7 +35,8 @@ impl eredu_core::checkpoint_mechanisms::ExactParameterMaterializer<MlxNeuralBack
         recipe: DerivedWeightRecipe,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<DerivedWeightRecipe, eredu_core::BackendFailure> {
-        super::recipe::lower_mxfp4_recipe(recipe, source)
+        recipe
+            .lower_mxfp4_words(source)
             .map_err(eredu_core::BackendFailure::from_error)
     }
 

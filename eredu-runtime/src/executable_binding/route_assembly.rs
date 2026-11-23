@@ -16,6 +16,15 @@ use eredu_nn::{BlockwiseAttentionBackend, NeuralBackend, Tensor};
 use std::collections::BTreeSet;
 
 mod local;
+
+/// Native resources for a retained rank-local composite.
+pub struct RetainedCompositeRank<'a, B: NeuralBackend, S, V> {
+    /// Execution context.
+    pub context: &'a Context<B>,
+    /// Native binding resources.
+    pub visitor: V,
+    pub(crate) state: std::marker::PhantomData<fn() -> S>,
+}
 mod prediction;
 pub(super) mod weights;
 use prediction::LocalPrediction;
@@ -79,13 +88,20 @@ pub trait TextRankRoutes<'a, M: TextBindingContext<'a>>: private::RankPlacement 
     type Routed;
     /// Composite partition route.
     type Composite;
+    /// Retained composite rank route.
+    type RetainedComposite;
 
     /// Assembles portable rank routes from an already selected native context.
     fn bind(
         execution: &'a Context<M::Neural>,
         weights: &'a Context<M::Neural>,
         local: M::TextResources,
-    ) -> (Self::Dense, Self::Routed, Self::Composite);
+    ) -> (
+        Self::Dense,
+        Self::Routed,
+        Self::Composite,
+        Self::RetainedComposite,
+    );
 }
 
 mod private {
@@ -98,13 +114,19 @@ impl<'a, M: TextBindingContext<'a>> TextRankRoutes<'a, M> for LocalTextPlacement
     type Dense = Unavailable;
     type Routed = Unavailable;
     type Composite = Unavailable;
+    type RetainedComposite = Unavailable;
 
     fn bind(
         _: &'a Context<M::Neural>,
         _: &'a Context<M::Neural>,
         _: M::TextResources,
-    ) -> (Self::Dense, Self::Routed, Self::Composite) {
-        (Unavailable, Unavailable, Unavailable)
+    ) -> (
+        Self::Dense,
+        Self::Routed,
+        Self::Composite,
+        Self::RetainedComposite,
+    ) {
+        (Unavailable, Unavailable, Unavailable, Unavailable)
     }
 }
 
@@ -118,13 +140,25 @@ where
     type Dense = DensePartition<'a, M>;
     type Routed = RoutedPartition<'a, M>;
     type Composite = CompositePartition<'a, M>;
+    type RetainedComposite = RetainedCompositeRank<'a, Neural<M>, State<M>, Local<'a, M>>;
 
     fn bind(
         execution: &'a Context<M::Neural>,
         weights: &'a Context<M::Neural>,
         local: M::TextResources,
-    ) -> (Self::Dense, Self::Routed, Self::Composite) {
-        bind_partitions::<M>(execution, weights, local)
+    ) -> (
+        Self::Dense,
+        Self::Routed,
+        Self::Composite,
+        Self::RetainedComposite,
+    ) {
+        let (dense, routed, composite) = bind_partitions::<M>(execution, weights, local.clone());
+        let retained = RetainedCompositeRank {
+            context: execution,
+            visitor: local,
+            state: std::marker::PhantomData,
+        };
+        (dense, routed, composite, retained)
     }
 }
 
@@ -254,6 +288,7 @@ pub type BoundExecutionRoutes<'a, M> = PreparedExecutionRoutes<
     <Rank<M> as TextRankRoutes<'a, M>>::Dense,
     <Rank<M> as TextRankRoutes<'a, M>>::Routed,
     <Rank<M> as TextRankRoutes<'a, M>>::Composite,
+    <Rank<M> as TextRankRoutes<'a, M>>::RetainedComposite,
 >;
 
 pub(super) fn bind_text_routes<'a, M>(native: &'a M) -> BoundExecutionRoutes<'a, M>

@@ -43,14 +43,14 @@ pub(super) enum GeneratedFailure<E: std::error::Error + 'static> {
     Admission(CaptureError),
 }
 
-pub(super) struct GeneratedCapture<'a, B: CaptureBackend> {
+pub(super) struct GeneratedCapture<'a, B: CaptureBackend + ?Sized> {
     backend: &'a mut B,
     generate: &'a mut dyn FnMut() -> Result<B::Tensor, GeneratedFailure<B::Error>>,
     source: &'a GeneratedCaptureSource,
     value: Option<B::Tensor>,
 }
 
-impl<B: CaptureBackend> CaptureBackend for GeneratedCapture<'_, B> {
+impl<B: CaptureBackend + ?Sized> CaptureBackend for GeneratedCapture<'_, B> {
     type Tensor = B::Tensor;
     type Error = GeneratedFailure<B::Error>;
     fn source_dtype(&self, _: &Self::Tensor) -> Option<eredu_core::checkpoint::TensorDtype> {
@@ -131,7 +131,7 @@ impl CaptureSession {
     /// Uses the same scheduled record, ledger and synchronous transformation path
     /// as an existing activation. Factory errors retain the observer's error type.
     /// Temporary native values are dropped before returning to the forward driver.
-    pub(crate) fn observe_generated<B: CaptureBackend, E>(
+    pub(crate) fn observe_generated<B: CaptureBackend + ?Sized, E>(
         &mut self,
         backend: &mut B,
         path: &str,
@@ -149,7 +149,7 @@ impl CaptureSession {
 /// Keeps deferred construction and its original error in one shared adapter.
 /// Both ordinary observations and partition fragments enter the same reservation
 /// path before invoking the factory; the prototype supplies geometry only.
-pub(super) fn capture_generated<B: CaptureBackend, E, T>(
+pub(super) fn capture_generated<B: CaptureBackend + ?Sized, E, T>(
     backend: &mut B,
     source: &GeneratedCaptureSource,
     generate: &mut dyn FnMut() -> Result<B::Tensor, E>,

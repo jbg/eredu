@@ -307,21 +307,6 @@ impl<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> TextGenerationDri
         Ok(advanced)
     }
 
-    /// Consumes a prefill-only continuation and completes its final input
-    /// without sampling. This commits the prepared input's cache provenance.
-    pub fn complete_prefill<C: TokenFilterController>(
-        &mut self,
-        mut state: TextGenerationContinuation<B, C, S>,
-    ) -> Result<bool, TextContinuationError<B::Error, C::Error>> {
-        self.validate(&state)?;
-        state.require_quiescent()?;
-        let Some(PendingTextInput::Prefill(prompt)) = state.inner.step.take() else {
-            return Ok(false);
-        };
-        S::complete_text_prefill(self.runtime, prompt, &mut state.inner.backend_state)
-            .map_err(|error| ControlledTextGenerationError::Backend(error).into())
-    }
-
     /// Requests selected scores for the next refinement operation.
     pub fn configure_refinement_readout<C: TokenFilterController>(
         &self,
@@ -436,6 +421,7 @@ impl<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> TextGenerationDri
         )
     }
 
+    #[cfg(feature = "tensor-capture")]
     fn validate_installation<C: TokenFilterController>(
         &self,
         state: &TextGenerationContinuation<B, C, S>,

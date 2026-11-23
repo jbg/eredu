@@ -1,5 +1,17 @@
 //! Native pointwise and softmax arithmetic with explicit rounding.
 use safemlx::{error::Exception, Array, Stream};
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn metal_arithmetic_header() -> &'static str {
+    static HEADER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HEADER.get_or_init(|| {
+        [
+            eredu_nn::arithmetic::STABLE_EXP_SOURCE,
+            include_str!("bf16_softmax_inverse.metal"),
+        ]
+        .concat()
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Pointwise {
     Sigmoid = 1,
@@ -55,7 +67,7 @@ pub(crate) fn f32_pointwise(
                         output[i] = x / (1.0f + stable_exp_f32(-x));
                     }
                     "#,
-                    include_str!("exp_f32.metal"),
+                    metal_arithmetic_header(),
                     true,
                     false,
                 )?);
@@ -120,7 +132,7 @@ pub(crate) fn bf16_pointwise(
                             metal::fast::divide(1.0f, 1.0f + metal::fast::exp(-x)));
                     }
                     "#,
-                    include_str!("exp_f32.metal"),
+                    metal_arithmetic_header(),
                     true,
                     false,
                 )?);
@@ -178,7 +190,7 @@ pub(crate) fn softmax_last(
                     ["input", "dimensions"],
                     ["output"],
                     include_str!("softmax_f32.metal"),
-                    include_str!("exp_f32.metal"),
+                    metal_arithmetic_header(),
                     true,
                     false,
                 )?);
@@ -194,5 +206,143 @@ pub(crate) fn softmax_last(
     {
         let _ = (input, narrow_probabilities, stream);
         Ok(None)
+    }
+}
+
+/// One correctly rounded binary16 fused update using exact FP32 products and
+/// an error-free sum. An odd FP32 low bit retains the side of a half midpoint.
+pub(crate) fn fused_binary16_lane(
+    x: &Array,
+    y: &Array,
+    lane: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::{ops::r#where, Dtype};
+    let zero = Array::from_f32(0.0);
+    let one = Array::from_slice(&[1u32], &[]);
+    let two = Array::from_slice(&[2u32], &[]);
+    let zero_bits = Array::from_slice(&[0u32], &[]);
+
+    let product = x.multiply(y, stream)?;
+    let sum = product.add(lane, stream)?;
+    let part = sum.subtract(&product, stream)?;
+    let residual = product
+        .subtract(sum.subtract(&part, stream)?, stream)?
+        .add(lane.subtract(part, stream)?, stream)?;
+    let bits = sum.view_dtype(Dtype::Uint32, stream)?;
+    let even = bits.remainder(&two, stream)?.eq(&zero_bits, stream)?;
+    let increment = sum
+        .lt(&zero, stream)?
+        .eq(residual.lt(&zero, stream)?, stream)?;
+    let adjusted = r#where(
+        increment,
+        bits.add(&one, stream)?,
+        bits.subtract(&one, stream)?,
+        stream,
+    )?
+    .view_dtype(Dtype::Float32, stream)?;
+    let adjust = even.logical_and(
+        residual
+            .gt(&zero, stream)?
+            .logical_or(residual.lt(&zero, stream)?, stream)?,
+        stream,
+    )?;
+    r#where(adjust, adjusted, sum, stream)?
+        .as_dtype(Dtype::Float16, stream)?
+        .as_dtype(Dtype::Float32, stream)
+}
+
+/// Fused FP32 pointwise update. The multiplier may broadcast to the input.
+pub(crate) fn fused_f32(
+    input: &Array,
+    multiplier: &Array,
+    addend: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::{ops::broadcast_to, DeviceType, Dtype};
+
+    let shape = input.shape();
+    if input.size() == 0 {
+        return Ok(input.clone());
+    }
+    let multiplier = broadcast_to(multiplier, shape, stream)?;
+    if stream.get_device()?.get_type()? == DeviceType::Cpu {
+        let read = |array: &Array| array.contiguous(false, stream)?.into_evaluated();
+        let x = read(input)?;
+        let y = read(&multiplier)?;
+        let z = read(addend)?;
+        let values: Vec<_> = x
+            .as_slice::<f32>()
+            .iter()
+            .zip(y.as_slice::<f32>())
+            .zip(z.as_slice::<f32>())
+            .map(|((&x, &y), &z)| x.mul_add(y, z))
+            .collect();
+        return Ok(Array::from_slice(&values, shape));
+    }
+
+    let size = i32::try_from(input.size())
+        .map_err(|_| Exception::custom("fused FP32 output size exceeds i32"))?;
+    let config = safemlx::fast::CustomKernelConfig::new()
+        .with_template_arg_int("SIZE", size)
+        .with_grid([size, 1, 1])
+        .with_thread_group([256, 1, 1])
+        .with_output_arg(shape, Dtype::Float32);
+    let inputs = [input, &multiplier, addend];
+    #[cfg(any(feature = "metal", feature = "cuda"))]
+    {
+        use std::cell::RefCell;
+        #[cfg(feature = "cuda")]
+        fn kernel() -> Result<safemlx::fast::CudaKernel, Exception> {
+            safemlx::fast::CudaKernel::new(
+                "fused_f32",
+                ["x", "y", "z"],
+                ["out"],
+                "int i = blockIdx.x * blockDim.x + threadIdx.x;
+                 if (i < SIZE) out[i] = __fmaf_rn(x[i], y[i], z[i]);",
+                "",
+                true,
+                0,
+            )
+        }
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        fn kernel() -> Result<safemlx::fast::MetalKernel, Exception> {
+            safemlx::fast::MetalKernel::new(
+                "fused_f32",
+                ["x", "y", "z"],
+                ["out"],
+                "uint i = thread_position_in_grid.x;
+                 if (i < SIZE) out[i] = metal::fma(x[i], y[i], z[i]);",
+                "",
+                true,
+                false,
+            )
+        }
+        #[cfg(feature = "cuda")]
+        use safemlx::fast::CudaKernel as Kernel;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        use safemlx::fast::MetalKernel as Kernel;
+        thread_local! { static KERNEL: RefCell<Option<Kernel>> = const { RefCell::new(None) }; }
+        return KERNEL.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(kernel()?);
+            }
+            let output = cell
+                .borrow()
+                .as_ref()
+                .expect("fused FP32 kernel initialized")
+                .apply_device(inputs, &config, stream)?;
+            output
+                .into_iter()
+                .next()
+                .ok_or_else(|| Exception::custom("missing fused FP32 output"))
+        });
+    }
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    {
+        let _ = (inputs, config);
+        Err(Exception::custom(
+            "fused FP32 accelerator kernel unavailable",
+        ))
     }
 }

@@ -10,10 +10,10 @@ use std::ops::DerefMut;
 use super::erased_state::{state_support, supported_state, unavailable_state};
 use super::{ErasedTextState, InstalledTextState};
 
-impl<B, R, N, M> NativeTextStateSession<B> for TextSessionDriver<R, N>
+impl<B, R, N, M, G> NativeTextStateSession<B> for TextSessionDriver<R, N, G>
 where
     B: BackendProvider,
-    B::Error: From<BackendError> + From<BackendFailure>,
+    B::Error: From<BackendFailure>,
     N: TextSessionMechanisms<B, Resources = R, Model = M>
         + TextTransactionMechanisms<Error = B::Error>,
     R: DerefMut<Target = TextSessionResourcesFor<B, N>> + 'static,
@@ -75,7 +75,8 @@ where
     fn capture_native_text_state(
         runtime: &mut ModelRuntime<B, Self>,
     ) -> Result<ErasedTextState, B::Error> {
-        Self::estimate_native_text_state(runtime, None)?.ok_or_else(unavailable_estimate)?;
+        Self::estimate_native_text_state(runtime, None)?
+            .ok_or_else(|| BackendFailure::from_error(unavailable_estimate()))?;
         // The copy leaves installed state unchanged. Settle before returning a
         // recoverable copy error and fence the session if retirement fails.
         runtime.session_mut().with_model_transaction(|model| {
@@ -93,7 +94,8 @@ where
         saved: &ErasedTextState,
     ) -> Result<ErasedTextState, B::Error> {
         Self::validate_native_text_state(runtime, saved)?;
-        Self::estimate_native_text_state(runtime, Some(saved))?.ok_or_else(unavailable_estimate)?;
+        Self::estimate_native_text_state(runtime, Some(saved))?
+            .ok_or_else(|| BackendFailure::from_error(unavailable_estimate()))?;
         runtime.session_mut().with_model_transaction(|model| {
             Ok((|| {
                 supported_state(model)?.validate(saved)?;
@@ -116,11 +118,11 @@ where
             .submission_idle()
             .map_err(N::submission_authority_error)?;
         if let ControlSupport::Unsupported { reason } = state_support(&session.payload.model) {
-            return Err(BackendError::Execution {
+            return Err(BackendFailure::from_error(BackendError::Execution {
                 session: "text-generation".into(),
                 operation: "validate saved state".into(),
                 message: reason,
-            }
+            })
             .into());
         }
         Ok(supported_state(&session.payload.model)?.validate(saved)?)

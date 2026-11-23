@@ -193,7 +193,7 @@ impl SelectedTargetExecution {
     pub fn visit<B, S, V>(
         self,
         context: &<B::Tensor as Tensor>::Context,
-        mut visitor: V,
+        visitor: V,
     ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
     where
         B: eredu_core::SubmissionBackend<
@@ -206,7 +206,7 @@ impl SelectedTargetExecution {
         V: RoutedTextArchitectureVisitor<B, S, crate::SelectedRoutedBank>,
     {
         let (prepared, source) = self
-            .prepare_with::<B, S>(context, || visitor.construction_started())
+            .prepare::<B, S>(context)
             .map_err(|e| RoutedTextDispatchError::Architecture(e.to_string()))?;
         crate::routed_text::bind_selected_routed_text(prepared, source, visitor)
     }
@@ -215,26 +215,6 @@ impl SelectedTargetExecution {
     pub fn prepare<B, S>(
         self,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<
-        (
-            crate::routed_text::PreparedRoutedTextArchitecture<TargetModel<B>>,
-            SharedCheckpointSource,
-        ),
-        PreparationError,
-    >
-    where
-        B: GroupedNeuralBackend + DistributedNeuralBackend,
-        S: LayerRuntimeState<B>,
-        S::LayerState:
-            AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
-    {
-        self.prepare_with::<B, S>(context, || {})
-    }
-
-    fn prepare_with<B, S>(
-        self,
-        context: &<B::Tensor as Tensor>::Context,
-        construction_started: impl FnOnce(),
     ) -> Result<
         (
             crate::routed_text::PreparedRoutedTextArchitecture<TargetModel<B>>,
@@ -263,7 +243,6 @@ impl SelectedTargetExecution {
             .map_err(|e| PreparationError::Contract(e.to_string()))?;
         let spec = plan.target.bind_spec(spec)?;
         let identity = spec.state_fingerprint().to_owned();
-        construction_started();
         let source_architecture = selected
             .text()
             .uses_weight_transform()

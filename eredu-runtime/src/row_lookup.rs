@@ -225,14 +225,15 @@ pub fn acquire_row_bank<B: NeuralBackend, K: RowLookupBank<B>>(
         .order_after(context)
         .map_err(RowLookupError::bank)?;
     let (identities, demand) = demand.entries().iter().copied().unzip();
-    Ok(BankTransfer {
+    let acquisition = BankTransfer {
         identities,
         demand,
         scratch_bytes,
         access: request.access(),
         transfer,
-    }
-    .into())
+    };
+    bank.begin_consumption(acquisition, context)
+        .map_err(RowLookupError::bank)
 }
 
 /// Shared execution-provider surface; original integer IDs never pass through floats.

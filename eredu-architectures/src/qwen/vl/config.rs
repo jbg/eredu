@@ -33,6 +33,8 @@ pub struct ModelArgs {
     pub video_token_id: i32,
     /// Temporal/height/width interleaving sections.
     pub mrope_section: [i32; 3],
+    /// Whether frequencies outside their assigned section remain unrotated.
+    pub mrope_zero_overflow: bool,
     /// Declared outer family-wrapper model type.
     pub model_type: String,
     /// Nested text implementation identity preserved at admission.
@@ -40,6 +42,21 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
+    pub(super) fn rotary_spec(
+        &self,
+    ) -> Result<eredu_nn::multimodal::MultiAxisRotarySpec, eredu_nn::Error> {
+        let mut spec = super::positions::mrope_spec(
+            self.text.head_dim,
+            self.text.rope_theta,
+            &self.mrope_section,
+        )?;
+        if self.mrope_zero_overflow {
+            spec.layout =
+                eredu_nn::multimodal::MultiAxisRotaryLayout::RoundRobinSectionsWithZeroOverflow;
+        }
+        Ok(spec)
+    }
+
     /// Canonical architecture family published by the model registry.
     pub fn model_kind(&self) -> crate::ModelKind {
         match self.model_type.as_str() {
@@ -94,6 +111,7 @@ impl GgufModelArgs {
             image_token_id,
             video_token_id,
             mrope_section: self.mrope_section,
+            mrope_zero_overflow: true,
             effective_model_type: self.model_type.clone(),
             model_type: self.model_type,
         })
@@ -228,6 +246,7 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, VlConfig
         image_token_id,
         video_token_id,
         mrope_section,
+        mrope_zero_overflow: false,
         model_type: model_type.into(),
         effective_model_type,
     })
@@ -324,7 +343,12 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
             ("image_token", args.image_token_id.to_string()),
             ("video_token", args.video_token_id.to_string()),
             ("mrope_section", format!("{:?}", args.mrope_section)),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            args.mrope_zero_overflow
+                .then(|| ("mrope_overflow", "unrotated".into())),
+        ),
     )
 }
 

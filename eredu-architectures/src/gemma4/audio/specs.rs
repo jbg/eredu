@@ -22,8 +22,10 @@ fn linear(c: &AudioPolicy, name: &str, input: i32, output: i32) -> Result<Linear
     })
 }
 fn norm(c: &AudioPolicy, name: &str) -> Result<NormalizationConstructionSpec, Error> {
-    let spec =
-        NormalizationConstructionSpec::learned(c.hidden_size, c.rms_norm_eps, parameter(name)?);
+    let weight = parameter(name)?;
+    let mut spec =
+        NormalizationConstructionSpec::learned(c.hidden_size, c.rms_norm_eps, weight.clone());
+    spec.scale = eredu_nn::NormalizationScale::LearnedOffset { weight, offset: 0. };
     spec.validate()?;
     Ok(spec)
 }
@@ -40,7 +42,13 @@ pub(crate) struct SubsampleSpec {
     pub norm: LayerNormalizationConstructionSpec,
 }
 impl SubsampleSpec {
-    fn new(c: &AudioPolicy, root: &str, input: i32, output: i32) -> Result<Self, Error> {
+    fn new(
+        c: &AudioPolicy,
+        root: &str,
+        input: i32,
+        output: i32,
+        published_gguf: bool,
+    ) -> Result<Self, Error> {
         Ok(Self {
             weight: parameter(format!("{root}.conv.weight"))?,
             shape: [output, 3, 3, input],
@@ -49,7 +57,11 @@ impl SubsampleSpec {
                 epsilon: c.rms_norm_eps,
                 weight: Some(parameter(format!("{root}.norm.weight"))?),
                 bias: None,
-                arithmetic: eredu_nn::LayerNormalizationArithmetic::Native,
+                arithmetic: if published_gguf && output % 32 == 0 {
+                    eredu_nn::LayerNormalizationArithmetic::BlockedFloat32
+                } else {
+                    eredu_nn::LayerNormalizationArithmetic::Native
+                },
             },
         })
     }
@@ -76,7 +88,7 @@ pub(crate) struct StaticSpec {
     pub output_bias_enabled: bool,
 }
 impl StaticSpec {
-    pub(super) fn new(c: &AudioPolicy) -> Result<Self, Error> {
+    pub(super) fn new(c: &AudioPolicy, published_gguf: bool) -> Result<Self, Error> {
         c.validate().map_err(Error::backend_source)?;
         let [first, second] = c.subsampling_conv_channels.as_slice() else {
             return Err(Error::backend(
@@ -94,8 +106,14 @@ impl StaticSpec {
         let spec = Self {
             root: "model.audio_tower.static".into(),
             subsampling: [
-                SubsampleSpec::new(c, &format!("{root}.layer0"), 1, *first)?,
-                SubsampleSpec::new(c, &format!("{root}.layer1"), *first, *second)?,
+                SubsampleSpec::new(c, &format!("{root}.layer0"), 1, *first, published_gguf)?,
+                SubsampleSpec::new(
+                    c,
+                    &format!("{root}.layer1"),
+                    *first,
+                    *second,
+                    published_gguf,
+                )?,
             ],
             input: linear(
                 c,

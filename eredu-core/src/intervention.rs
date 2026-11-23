@@ -1366,6 +1366,63 @@ pub trait InterventionBackend: CaptureBackend {
     ) -> Result<Self::Tensor, Self::Error>;
 }
 
+/// Bounds native values, coordinate lowering and exact host payloads for a sparse edit.
+pub fn estimate_routed_unit_edit(
+    routes: u64,
+    units: u64,
+    action: &InterventionAction,
+) -> Result<CaptureUsage, CaptureError> {
+    use crate::capture::{add, mul};
+
+    let values = mul(routes, units)?;
+    let compact = match action {
+        InterventionAction::MaskComponents { indices, .. } => mul(indices.len() as u64, 64)?,
+        _ => 0,
+    };
+    Ok(CaptureUsage {
+        captures: 0,
+        // Full source, gather/selection, native exact upload, replacement,
+        // scatter and all lazy index/where temporaries across every chunk.
+        retained_bytes: add(4096, add(mul(values, 128)?, mul(routes, 96)?)?)?,
+        // Route copies/duplicate validation, flat indices/payload offsets,
+        // compact sets and gathered exact F32/F16/BF16 host payloads.
+        host_bytes: add(
+            4096,
+            add(compact, add(mul(values, 64)?, mul(routes, 256)?)?)?,
+        )?,
+        encoded_bytes: 0,
+    })
+}
+
+/// Bounds local sparse edit work for native mechanisms using signed 32-bit indices.
+pub fn estimate_local_routed_unit_edit(
+    geometry: RoutedUnitGeometry,
+    source: &[u64],
+    slice: &ResolvedCaptureSlice,
+    action: &InterventionAction,
+) -> Result<CaptureUsage, CaptureError> {
+    use crate::capture::mul;
+
+    if source.len() != 2 || source[1] != geometry.components()? {
+        return Err(CaptureError::Invalid(
+            "invalid sparse edit virtual shape".into(),
+        ));
+    }
+    let routes = mul(source[0], geometry.routes_per_token)?;
+    if mul(routes, geometry.units_per_expert)? > i32::MAX as u64 || source[0] > i32::MAX as u64 {
+        return Err(CaptureError::Unsupported(
+            "sparse edit indexing exceeds i32".into(),
+        ));
+    }
+    action.validate_activation_region(
+        action
+            .dtype()
+            .ok_or_else(|| CaptureError::Invalid("sparse routing action".into()))?,
+        &slice.shape,
+    )?;
+    estimate_routed_unit_edit(routes, geometry.units_per_expert, action)
+}
+
 /// Cold backend facts used by both admission and execution reservation. Unknown
 /// estimates must return an error; they must never be represented as zero cost.
 pub trait InterventionEstimator: Send + Sync {

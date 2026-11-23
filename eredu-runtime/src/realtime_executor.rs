@@ -801,8 +801,8 @@ pub enum RealtimeFrameCoordinatorError<H, F, E, B, K> {
     #[error("realtime ordered decision failed")]
     Decision(SequentialDecisionError<B>),
     /// Typed architecture execution failed.
-    #[error("realtime prepared model execution failed")]
-    Model(E),
+    #[error("realtime prepared model execution failed: {0}")]
+    Model(#[source] E),
     /// Exact completion creation or resource retention failed.
     #[error("realtime exact completion creation failed")]
     Completion(#[source] K),

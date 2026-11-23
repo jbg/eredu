@@ -1,15 +1,10 @@
 //! Whole-session MLX speculative generation capability.
 
 use eredu_core::speculative::embedded::EmbeddedPredictionOperators;
-use safemlx::{
-    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
-};
+use safemlx::{error::Exception, transforms::async_eval_with_event, Array, Stream};
 
 use super::{
-    speculative::{
-        scheduler::component_timing_enabled, MlxAssistantBinder, MlxDraftStorage,
-        MlxSpeculativeSamplingPrimitives,
-    },
+    speculative::{MlxAssistantBinder, MlxDraftStorage, MlxSpeculativeSamplingPrimitives},
     MlxBackend,
 };
 use crate::backend::nn::tensor::TokenValidationScope;
@@ -39,10 +34,6 @@ impl<'world, Dispatch>
     fn target_queue(backend: &MlxBackend<'world, Dispatch>) -> Stream {
         backend.stream().clone()
     }
-
-    fn collect_component_timings() -> bool {
-        component_timing_enabled()
-    }
 }
 
 #[doc(hidden)]
@@ -53,7 +44,6 @@ impl EmbeddedPredictionOperators for MlxEmbeddedPredictionMechanisms {
     type Logits = Array;
     type Completion = super::speculative::MlxSpeculativeCompletion;
     type Error = Exception;
-    type Telemetry = super::speculative::scheduler::SpeculativeComponentTimings;
     type Capture =
         crate::composition::mlx::session::bounded_capture::MlxSpeculativeCaptureMechanisms;
 
@@ -82,9 +72,6 @@ impl EmbeddedPredictionOperators for MlxEmbeddedPredictionMechanisms {
         Exception::from_source(error)
     }
 
-    fn take_telemetry() -> Result<Self::Telemetry, Exception> {
-        Ok(Self::Telemetry::default())
-    }
     fn logits_estimate(logits: &Array) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         super::speculative::state_snapshot::estimate_array(logits)
     }
@@ -100,72 +87,26 @@ impl EmbeddedPredictionOperators for MlxEmbeddedPredictionMechanisms {
             .map(MlxTensor::from_array)
     }
 
-    fn sequence_len(value: &Self::Tensor) -> Result<usize, Self::Error> {
-        usize::try_from(value.as_array().dim(1))
-            .map_err(|_| Exception::custom("prediction sequence length exceeds usize"))
-    }
-
     fn logits_row(
         value: &Self::Tensor,
         row: usize,
         queue: &Stream,
     ) -> Result<Self::Logits, Self::Error> {
-        let row =
-            i32::try_from(row).map_err(|_| Exception::custom("prediction row exceeds i32"))?;
-        value.as_array().try_index_device((.., row, ..), queue)
-    }
-
-    fn tensor_row(
-        value: &Self::Tensor,
-        row: usize,
-        queue: &Stream,
-    ) -> Result<Self::Tensor, Self::Error> {
-        let row =
-            i32::try_from(row).map_err(|_| Exception::custom("prediction row exceeds i32"))?;
-        value
-            .as_array()
-            .try_index_device((.., row..row + 1, ..), queue)
-            .map(MlxTensor::from_array)
-    }
-
-    fn tensor_prefix(
-        value: &Self::Tensor,
-        end: usize,
-        queue: &Stream,
-    ) -> Result<Self::Tensor, Self::Error> {
-        let end =
-            i32::try_from(end).map_err(|_| Exception::custom("prediction prefix exceeds i32"))?;
-        value
-            .as_array()
-            .try_index_device((.., ..end, ..), queue)
-            .map(MlxTensor::from_array)
-    }
-
-    fn token_range(
-        value: &Self::Tensor,
-        start: usize,
-        end: usize,
-        queue: &Stream,
-    ) -> Result<Self::Tensor, Self::Error> {
-        let start = i32::try_from(start)
-            .map_err(|_| Exception::custom("prediction token start exceeds i32"))?;
-        let end = i32::try_from(end)
-            .map_err(|_| Exception::custom("prediction token end exceeds i32"))?;
-        value
-            .as_array()
-            .try_index_device((.., start..end), queue)
-            .map(MlxTensor::from_array)
+        eredu_nn::sequence::row(value, row, false, queue)
+            .map(MlxTensor::into_array)
+            .map_err(Exception::from_source)
     }
 
     fn target_tokens(
         tokens: &[u32],
-        destination: Option<&Stream>,
+        destination: &Stream,
+        crosses_devices: bool,
     ) -> Result<Self::Tensor, Self::Error> {
         let width = i32::try_from(tokens.len())
             .map_err(|_| Exception::custom("prediction token count exceeds i32"))?;
         let mut value = Array::from_slice(tokens, &[1, width]);
-        if let Some(queue) = destination {
-            value = value.copy(queue)?;
+        if crosses_devices {
+            value = value.copy(destination)?;
         }
         Ok(MlxTensor::from_array(value))
     }

@@ -18,7 +18,7 @@ pub(crate) const GROUPED_OPERATION_CAPABILITIES: [GroupedOperationRequirement; 5
 pub(crate) struct MlxReplicatedTextSupport;
 
 impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
-    fn facts(&self, placement: StateComponentPlacement) -> BackendMechanismFacts {
+    fn facts(&self, _: StateComponentPlacement) -> BackendMechanismFacts {
         BackendMechanismFacts::new(
             MlxNeuralBackend::OPERATOR_CAPABILITIES,
             [
@@ -29,7 +29,7 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
             StateLifecycleCapabilities::new()
                 .with_transactions(true, true)
                 .with_reset(true)
-                .with_prompt_cache(placement == StateComponentPlacement::Paged)
+                .with_prompt_cache(true)
                 .with_observation_retention(true),
         )
         .with_session(eredu_core::SessionCapabilities::new(true, true, true))
@@ -38,8 +38,7 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
         .with_addressable_storage(
             eredu_core::preparation::rows::NativeRowLookupSupport::row_storage(
                 &crate::backend::runtime::residency::parameter_bank::MlxRowLookupSupport,
-            )
-            .expect("native addressable storage is implemented"),
+            ),
         )
         .with_prompt_cache(true)
         .with_exact_completion(true)
@@ -50,15 +49,28 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
         supports_direct(descriptor)
     }
 
+    fn prefers_original_encoding(&self, descriptor: &WeightLoweringDescriptor) -> bool {
+        !cfg!(feature = "cuda")
+            && descriptor.logical_shape().len() == 2
+            && matches!(
+                descriptor.executable(),
+                eredu_checkpoint::LinearFormat::GgufIQuant {
+                    ggml_type,
+                    endian: eredu_gguf::Endian::Little,
+                } if ggml_type != eredu_gguf::GgmlType::NvFp4
+                    && eredu_gguf::packed_dot::supports_packed_dot(ggml_type)
+            )
+    }
+
     fn supports_transform(&self, descriptor: &WeightLoweringDescriptor) -> bool {
-        supports_transform(descriptor)
+        cfg!(target_endian = "little") && descriptor.supports_word_transform()
     }
 
     fn floating_state_dtype(
         &self,
         source: &eredu_core::checkpoint::TensorDtype,
     ) -> Option<StateStorageDtype> {
-        floating_state_storage_dtype(source)
+        StateStorageDtype::from_floating_source(source, |_| true)
     }
 
     fn supports_state_component(
@@ -72,20 +84,4 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
             StateComponentPlacement::Device | StateComponentPlacement::Paged
         )
     }
-}
-
-pub(in crate::composition::mlx) fn floating_state_storage_dtype(
-    source: &eredu_core::checkpoint::TensorDtype,
-) -> Option<StateStorageDtype> {
-    use eredu_core::checkpoint::TensorDtype;
-    Some(match source {
-        TensorDtype::F16 => StateStorageDtype::F16,
-        TensorDtype::Bf16 => StateStorageDtype::Bf16,
-        TensorDtype::F32 => StateStorageDtype::F32,
-        TensorDtype::F64 => StateStorageDtype::F64,
-        TensorDtype::Complex64 => StateStorageDtype::Complex64,
-        // Supported packed embeddings materialize as Float32 activations.
-        TensorDtype::U32 | TensorDtype::Encoded(_) => StateStorageDtype::F32,
-        _ => return None,
-    })
 }

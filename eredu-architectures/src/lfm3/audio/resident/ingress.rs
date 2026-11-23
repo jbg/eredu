@@ -388,15 +388,23 @@ where
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<AudioIngressProgress, AudioIngressError> {
-        let _scope = H::open_input_recovery()?;
+        let _scope = self.open_input_recovery()?;
         self.advance(samples, sample_rate, false)?;
         Ok(self.progress())
     }
 
     /// Flushes the trailing input and appends the text suffix, then enters the ordinary response driver.
     pub fn finish(self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
-        let _scope = H::open_input_recovery()?;
+        let _scope = self.open_input_recovery()?;
         self.finish_input()
+    }
+
+    fn open_input_recovery(&self) -> Result<impl Sized + 'static + use<B, H>, AudioIngressError> {
+        let model = self
+            .transition
+            .try_borrow()
+            .map_err(|_| AudioIngressError::Busy)?;
+        Ok(H::open_input_recovery(model.0.binding.context())?)
     }
 
     fn finish_input(mut self) -> Result<AudioSession<ResidentAudio<B, H>>, AudioIngressError> {
@@ -442,7 +450,14 @@ where
         let _retention = self
             .fork
             .as_ref()
-            .map(|fork| H::hold_fork_retention(fork.growth.clone()))
+            .map(|fork| {
+                let model = self
+                    .transition
+                    .try_borrow()
+                    .map_err(|_| AudioIngressError::Busy)?;
+                H::hold_fork_retention(model.0.binding.context(), fork.growth.clone())
+                    .map_err(AudioIngressError::from)
+            })
             .transpose()?;
         self.advance_input(samples, sample_rate, final_chunk)
     }

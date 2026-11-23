@@ -157,9 +157,29 @@ impl ForwardCaptureBundle {
     }
 }
 
-struct ExactTargetObserver<'a, T> {
+pub(crate) struct ExactTargetObserver<'a, T> {
     paths: &'a [String],
     values: &'a RefCell<Vec<Option<T>>>,
+}
+
+impl<'a, T> ExactTargetObserver<'a, T> {
+    pub(crate) fn new(paths: &'a [String], values: &'a RefCell<Vec<Option<T>>>) -> Self {
+        Self { paths, values }
+    }
+}
+
+pub(crate) fn validate_target_capture_paths(paths: &[String]) -> Result<(), Error> {
+    if paths.is_empty() {
+        return Err(Error::backend(
+            "external-assistant capture declares no target paths",
+        ));
+    }
+    if paths.iter().collect::<BTreeSet<_>>().len() != paths.len() {
+        return Err(Error::backend(
+            "external-assistant capture paths are not unique",
+        ));
+    }
+    Ok(())
 }
 
 impl<T: Clone> ActivationObserver<T, Error> for ExactTargetObserver<'_, T> {
@@ -190,7 +210,7 @@ impl<T: Clone> ActivationObserver<T, Error> for ExactTargetObserver<'_, T> {
     }
 }
 
-fn collect_exact_target_capture<T: Tensor>(
+pub(crate) fn collect_exact_target_capture<T: Tensor>(
     observed: &RefCell<Vec<Option<T>>>,
     bundle: Option<&ForwardCaptureBundle>,
     rank: usize,
@@ -254,16 +274,7 @@ where
             let (bundle, rank) = placements
                 .capture(&paths, input.admitted().decoder_shape())
                 .map_err(Error::backend_source)?;
-            if paths.is_empty() {
-                return Err(Error::backend(
-                    "external-assistant capture declares no target paths",
-                ));
-            }
-            if paths.iter().collect::<BTreeSet<_>>().len() != paths.len() {
-                return Err(Error::backend(
-                    "external-assistant capture paths are not unique",
-                ));
-            }
+            validate_target_capture_paths(&paths)?;
             if bundle.as_ref().is_some_and(|plan| {
                 plan.slots().len() != paths.len()
                     || plan
@@ -283,10 +294,7 @@ where
             Err(error) => (Err(error), Vec::new(), None, 0),
         };
         let values = RefCell::new(vec![None; paths.len()]);
-        let mut observer = ExactTargetObserver {
-            paths: &paths,
-            values: &values,
-        };
+        let mut observer = ExactTargetObserver::new(&paths, &values);
         self.capture_input(
             input,
             pass,

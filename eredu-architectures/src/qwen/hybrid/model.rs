@@ -184,7 +184,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
     ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid",
-            crate::operator_requirements::QWEN_HYBRID,
+            crate::operator_requirements::qwen_hybrid(&config),
         )?;
         Self::materialize(config, None, definition, context)
     }
@@ -276,7 +276,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
     ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid",
-            crate::operator_requirements::QWEN_HYBRID,
+            crate::operator_requirements::qwen_hybrid(&config),
         )?;
         crate::operator_requirements::require::<B>(
             "Qwen hybrid tensor parallelism",
@@ -446,7 +446,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> QwenKernel<B>
     ) -> Result<LayeredModel<B>, Error> {
         crate::operator_requirements::require::<B>(
             "Qwen hybrid",
-            crate::operator_requirements::QWEN_HYBRID,
+            crate::operator_requirements::qwen_hybrid(&config),
         )?;
         crate::operator_requirements::require::<B>(
             "Qwen hybrid tensor parallelism",

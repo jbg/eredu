@@ -8,6 +8,24 @@ on:
 permissions:
   contents: read
 jobs:
+  candle-cpu:
+    name: Candle CPU facade and CLI
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install
+      - name: Check the Candle CPU facade
+        run: cargo check --locked -p eredu --no-default-features --features candle,image,audio,tensor-capture
+      - name: Test Candle CPU through the CLI and facade
+        run: cargo test --locked -p eredu-cli --no-default-features --features candle,vision,realtime --test decisions
+
   native:
     name: ${{ matrix.suite == 'portable' && 'Portable workspace' || format('Native {0}', matrix.suite) }}
     timeout-minutes: 45
@@ -69,9 +87,14 @@ jobs:
       - name: Check standalone native backend
         if: matrix.suite == 'backend'
         run: cargo check --locked -p eredu-backend-mlx --features metal,accelerate --all-targets
+      - name: Check Candle Metal facade and CLI
+        if: matrix.suite == 'backend'
+        run: |
+          cargo check --locked -p eredu -p eredu-cli --no-default-features \
+            --features eredu/candle-metal,eredu/tensor-capture,eredu-cli/candle-metal,eredu-cli/vision,eredu-cli/realtime
       - name: Test native CLI consumers
         if: ${{ !inputs.full && matrix.suite == 'backend' }}
-        run: cargo test --locked -p eredu-cli --no-default-features --features mlx,metal,eredu-backend-mlx/accelerate --timings
+        run: cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
       - name: Test native workspace consumers
         if: inputs.full && matrix.suite == 'consumers'
         run: |

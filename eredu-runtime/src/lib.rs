@@ -98,8 +98,6 @@ pub mod execution_topology;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
-/// Explicitly seeded host randomness with retained, clonable generator state.
-pub mod host_random;
 /// Backend-neutral ownership of prepared multimodal tensors.
 pub mod input;
 /// Explicit prepared-input copy admission.
@@ -233,8 +231,8 @@ pub mod run_preparation;
 /// Portable ownership and submission of a bound text executable.
 pub mod text_session_driver;
 pub use preparation_mechanisms::{
-    AutomaticModelFacts, BackendInspection, ExternalDraftFacts, ModelLoadFacts, PlanMechanismFacts,
-    PreparationMechanismProvider,
+    select_packed_gguf_tensors, AutomaticModelFacts, BackendInspection, ExternalDraftFacts,
+    ModelLoadFacts, PlanMechanismFacts, PreparationMechanismProvider,
 };
 /// Backend-neutral speculative request lifecycle and fair scheduling.
 pub mod speculative;
@@ -352,7 +350,6 @@ pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler,
     SamplingConfigurationError, SpeculativeSampler,
 };
-pub use host_random::HostRandomState;
 pub use input::{PreparedInputCacheIdentity, PreparedInputCacheIdentityError};
 pub use inspection::{
     observe_and_intervene, observe_model_logits, ActivationObserver, BorrowedActivationObserver,
@@ -664,8 +661,8 @@ pub use realtime_mechanisms::{
     BeginRealtimeSubmission, CategoricalFrameBranch, CategoricalRealtimeExecution,
     CategoricalRealtimeFrame, CategoricalRealtimeStateFor, RealtimeBackendFactory,
     RealtimeChannelObservationError, RealtimeChannelObserver, RealtimeHostFrame,
-    RealtimeSubmissionBranch, SpeechRealtimeMechanisms, SpeechRealtimeState,
-    SpeechRealtimeStateBranch,
+    SpeechRealtimeMechanisms, SpeechRealtimeState, SpeechRealtimeStateBranch,
+    SpeechRealtimeSubmissionBranch,
 };
 mod realtime_startup;
 pub use realtime_startup::{CategoricalRealtimeState, RealtimeGraphMechanisms};

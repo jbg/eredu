@@ -3,8 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    projection::ProjectionStorageFacts, AllocatorMemoryMetrics, ResidencyObservationBindings,
-    ResidentParameterConversion,
+    projection::ProjectionStorageFacts, ResidencyObservationBindings, ResidentParameterConversion,
 };
 use crate::resources::{
     detached::{DetachedResourceLimits, DetachedResourceObservation},
@@ -34,7 +33,10 @@ pub trait DenseResidencyMechanisms:
     /// Settles the exact native transfer.
     fn settle_transfer(transfer: &mut Self::Transfer) -> Result<(), Self::Error>;
     /// Samples physical allocator counters.
-    fn allocator_memory(&self) -> Result<AllocatorMemoryMetrics, Self::Error>;
+    fn allocator_memory(
+        &self,
+        storage: &Self::Storage,
+    ) -> Result<crate::AllocatorTelemetry, Self::Error>;
     /// Reads native physical facts for the exact retained owners.
     fn observe_residency(
         &self,

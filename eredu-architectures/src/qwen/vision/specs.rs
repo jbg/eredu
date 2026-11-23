@@ -32,6 +32,7 @@ pub(super) fn norm_spec(
 
 #[derive(Debug, Clone)]
 pub(super) struct PatchSpec {
+    pub split_temporal: bool,
     pub geometry: FlattenedPatchSpec,
     pub weight: ParameterSpec,
     pub bias: ParameterSpec,
@@ -49,6 +50,7 @@ impl PatchSpec {
 }
 pub(super) fn patch_spec(config: &VisionConfig, root: &str) -> Result<PatchSpec, Error> {
     Ok(PatchSpec {
+        split_temporal: config.split_temporal_patches,
         geometry: FlattenedPatchSpec {
             channels: config.in_channels,
             temporal: config.temporal_patch_size,
@@ -193,6 +195,7 @@ impl BlockSpec {
         ])?;
         let activation = match config.hidden_act.as_str() {
             "gelu" => UnaryActivation::Gelu,
+            "gelu_pytorch_tanh" if config.fp16_gelu => UnaryActivation::GeluApproximateF16,
             "gelu_pytorch_tanh" => UnaryActivation::GeluApproximate,
             "silu" => UnaryActivation::Silu,
             _ => return Err(Error::backend("unsupported Qwen vision activation")),
@@ -254,7 +257,10 @@ impl DeclareLogicalParameters for BlockSpec {
             || self.feed_forward.down.output != hidden
             || !matches!(
                 self.feed_forward.activation,
-                UnaryActivation::Gelu | UnaryActivation::GeluApproximate | UnaryActivation::Silu
+                UnaryActivation::Gelu
+                    | UnaryActivation::GeluApproximate
+                    | UnaryActivation::GeluApproximateF16
+                    | UnaryActivation::Silu
             )
         {
             return Err(Error::backend(

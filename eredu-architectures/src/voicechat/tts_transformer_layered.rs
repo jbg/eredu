@@ -335,10 +335,9 @@ impl<B: NeuralBackend, C: RuntimeLayerState<B>, D: DerefMut<Target = [C]>>
     eredu_nn::RetainedTensorRoots<B::Tensor> for TransformerRuntimeState<'_, B, C, D>
 {
     fn visit_retained_tensors<'a>(&'a self, visitor: &mut dyn FnMut(&'a B::Tensor)) {
-        self.caches
-            .iter()
-            .flat_map(RuntimeLayerState::<B>::retained_values)
-            .for_each(visitor);
+        for cache in self.caches.iter() {
+            cache.retained_values().for_each(&mut *visitor);
+        }
     }
 }
 

@@ -87,3 +87,28 @@ pub enum GroupedUnitError {
     #[error("grouped-unit replacement dtype differs from the original")]
     ReplacementDtype,
 }
+
+impl<T: Tensor> GroupedUnitBatch<'_, T> {
+    /// Sequences original evidence, immutable replacement, and effective evidence.
+    /// The native caller supplies its exact dtype comparison.
+    pub fn apply_observer(
+        &self,
+        observer: &mut dyn GroupedUnitObserver<T>,
+        same_dtype: impl FnOnce(&T, &T) -> bool,
+    ) -> Result<T, Error> {
+        observer.observe(self)?;
+        let replacement = observer.intervene(self)?;
+        let effective = replacement.as_ref().unwrap_or(self.values);
+        if effective.shape() != self.values.shape() {
+            return Err(Error::backend_source(GroupedUnitError::ReplacementShape {
+                expected: self.values.shape().to_vec(),
+                actual: effective.shape().to_vec(),
+            }));
+        }
+        if !same_dtype(self.values, effective) {
+            return Err(Error::backend_source(GroupedUnitError::ReplacementDtype));
+        }
+        observer.observe_effective(&self.with_values(effective))?;
+        Ok(replacement.unwrap_or_else(|| self.values.clone()))
+    }
+}

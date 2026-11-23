@@ -5,11 +5,13 @@
 //! completion object. Copy mechanisms finish through the backend's existing owner.
 
 use super::{SnapshotBudget, SnapshotReservation};
-use crate::capture::CaptureSession;
 #[cfg(feature = "tensor-capture")]
-use crate::capture::{CaptureCheckpoint, CaptureForkRequest, InterventionForkRequest};
+use crate::capture::{
+    CaptureCheckpoint, CaptureForkRequest, CaptureSession, InterventionForkRequest,
+};
+#[cfg(feature = "tensor-capture")]
+use eredu_core::capture::CaptureError;
 use eredu_core::{
-    capture::CaptureError,
     execution_control::{
         ExecutionControlError, NativeTextStateSession, SnapshotEstimate, SnapshotResourceKind,
     },
@@ -297,6 +299,11 @@ impl<
     > {
         driver.quiescent(&mut self.state)
     }
+    /// Whether a remaining input prefix or suffix still needs prefill.
+    pub fn is_prefill_pending(&self) -> bool {
+        self.state.is_prefill_pending()
+    }
+
     /// Completed physical-work and authoritative-output coordinates.
     pub fn position(&self) -> eredu_core::refinement::GenerationPosition {
         self.state.position()
@@ -619,10 +626,10 @@ impl<
         if boundary.identity() != self.identity {
             return Err(TextSnapshotError::IncompatibleRun);
         }
-        let (runtime, state, _) = boundary.parts();
+        let (runtime, _state, _) = boundary.parts();
         S::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
         #[cfg(feature = "tensor-capture")]
-        match (B::capture_run(state), &self.capture) {
+        match (B::capture_run(_state), &self.capture) {
             (Some(run), Some(saved)) => run.validate_restore(saved)?,
             (None, None) => {}
             _ => return Err(TextSnapshotError::InconsistentState),

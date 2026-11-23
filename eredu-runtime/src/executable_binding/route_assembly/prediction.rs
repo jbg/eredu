@@ -168,7 +168,7 @@ where
         Logits = <Embedded<N> as SpeculativeTensorMechanisms>::Logits,
         Completion = <Embedded<N> as SpeculativeTensorMechanisms>::Completion,
         Error = <Embedded<N> as SpeculativeTensorMechanisms>::Error,
-        Telemetry = <X as ReplicatedPredictionNative<B, S, Embedded<N>>>::Telemetry,
+        Telemetry = (),
     >,
 {
     type Output = InstalledTextExecutable<LocalTextTypes<N>>;
@@ -246,7 +246,7 @@ where
         Logits = <Embedded<N> as SpeculativeTensorMechanisms>::Logits,
         Completion = <Embedded<N> as SpeculativeTensorMechanisms>::Completion,
         Error = <Embedded<N> as SpeculativeTensorMechanisms>::Error,
-        Telemetry = <X as ReplicatedPredictionNative<B, S, Embedded<N>>>::Telemetry,
+        Telemetry = (),
     >,
     N: RoutedTextResources<B, RoutedResources = N::LocalResources, StorageError = Failure<N>>,
     Self: RoutedTextResources<B, RoutedResources = N::LocalResources, StorageError = Failure<N>,
@@ -317,7 +317,7 @@ where
         Logits = <Embedded<N> as SpeculativeTensorMechanisms>::Logits,
         Completion = <Embedded<N> as SpeculativeTensorMechanisms>::Completion,
         Error = <Embedded<N> as SpeculativeTensorMechanisms>::Error,
-        Telemetry = <X as ReplicatedPredictionNative<B, S, Embedded<N>>>::Telemetry,
+        Telemetry = (),
     >,
     N: RoutedTextResources<B, RoutedResources = N::LocalResources, StorageError = Failure<N>>,
     Self: RoutedTextResources<B, RoutedResources = N::LocalResources, StorageError = Failure<N>,
@@ -456,7 +456,7 @@ where
         Logits = <Embedded<N> as SpeculativeTensorMechanisms>::Logits,
         Completion = <Embedded<N> as SpeculativeTensorMechanisms>::Completion,
         Error = <Embedded<N> as SpeculativeTensorMechanisms>::Error,
-        Telemetry = <X as ReplicatedPredictionNative<B, S, Embedded<N>>>::Telemetry,
+        Telemetry = (),
     >,
     N: RetainedRoutedPredictionMechanisms<B, S, Materializer = X>
         + RoutedTextResources<B, RoutedResources = N::LocalResources, StorageError = Failure<N>>,
@@ -511,7 +511,7 @@ where
         Logits = <Embedded<N> as SpeculativeTensorMechanisms>::Logits,
         Completion = <Embedded<N> as SpeculativeTensorMechanisms>::Completion,
         Error = <Embedded<N> as SpeculativeTensorMechanisms>::Error,
-        Telemetry = <X as ReplicatedPredictionNative<B, S, Embedded<N>>>::Telemetry,
+        Telemetry = (),
     >,
     N: RetainedRoutedPredictionMechanisms<B, S, Materializer = X>
         + RoutedTextResources<B, RoutedResources = N::LocalResources, StorageError = Failure<N>>,

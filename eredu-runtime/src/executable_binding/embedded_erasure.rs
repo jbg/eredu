@@ -239,7 +239,7 @@ where
         Logits = <M::Mechanisms as SpeculativeTensorMechanisms>::Logits,
         Completion = <M::Mechanisms as SpeculativeTensorMechanisms>::Completion,
         Error = <M::Mechanisms as SpeculativeTensorMechanisms>::Error,
-        Telemetry = <X as ReplicatedPredictionNative<B, S, M::Mechanisms>>::Telemetry,
+        Telemetry = (),
     >,
 {
     fn bind_prediction(

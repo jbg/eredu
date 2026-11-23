@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use eredu_core::residency::{CompactGroupBindings, NativeBankMechanisms};
+use eredu_core::residency::{CompactGroupBindings, NativeBankMechanisms, ParameterLoan};
 use eredu_core::{residency::ResidencyTransferOrdering, BackendFailure};
 use eredu_nn::{GroupedNeuralBackend, Tensor};
 
@@ -66,8 +66,8 @@ where
             .collect();
         Ok((bank.residency_manager().clone(), replacements))
     }
-    fn begin_loan(transfer: N::Transfer) -> Result<Self::Loan, N::BankError> {
-        N::begin_loan(transfer)
+    fn begin_loan(transfer: N::Transfer, context: &Context<B>) -> Result<Self::Loan, N::BankError> {
+        N::begin_loan(transfer, context)
     }
     fn assemble_members(
         copies: Vec<B::Tensor>,
@@ -79,7 +79,7 @@ where
 
 fn bind_groups<B, N, G>(
     bank: &AddressableParameterBank<N, B::Tensor>,
-    acquisition: &BankTransfer<N::Transfer>,
+    acquisition: &mut BankTransfer<N::Loan>,
     mut groups: G,
     context: &Context<B>,
     started: Instant,
@@ -101,12 +101,18 @@ where
         let values = keys
             .iter()
             .enumerate()
-            .map(|(index, key)| match bank.replacement_row(*key, &name) {
-                Some((row, value)) => N::replacement(value, row, context),
-                None => N::member(&acquisition.transfer, index, &name),
+            .map(|(index, key)| {
+                let value = match bank.replacement_row(*key, &name) {
+                    Some((row, value)) => N::replacement(value, row, context)?,
+                    None => N::member(&acquisition.transfer, index, &name)?,
+                };
+                acquisition.transfer.retain(&value);
+                Ok::<_, N::BankError>(value)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        bindings.insert(name, N::concatenate(&values, context)?);
+        let compact = N::concatenate(&values, context)?;
+        acquisition.transfer.retain(&compact);
+        bindings.insert(name, compact);
     }
     groups.bind_compact(bindings)?;
     bank.record_compact_bank(
@@ -126,23 +132,27 @@ where
     N::Transfer: ResidencyTransferOrdering<Context<B>, Error = N::Error>,
 {
     type Residency = ResidencyDriver<N>;
-    type Acquisition = BankTransfer<N::Transfer>;
+    type Acquisition = BankTransfer<N::Loan>;
     type Report = ParameterBankResidencyReport;
     type Error = N::BankError;
 
     fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
         self.effective_member_bytes().get(&key).copied()
     }
+    fn begin_consumption(
+        &self,
+        acquisition: BankTransfer<N::Transfer>,
+        context: &Context<B>,
+    ) -> Result<Self::Acquisition, Self::Error> {
+        acquisition.begin_loan(|transfer| N::begin_loan(transfer, context))
+    }
+
     fn complete(
         &mut self,
         acquisition: Self::Acquisition,
         output: &B::Tensor,
-        _: &Context<B>,
     ) -> Result<(), Self::Error> {
-        {
-            use eredu_core::residency::ParameterLoan;
-            N::begin_loan(acquisition.transfer)?.finish(output)
-        }
+        acquisition.transfer.finish(output)
     }
     fn report(&self) -> Result<Self::Report, Self::Error> {
         self.report()
@@ -173,7 +183,7 @@ where
 
     fn gated_product_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedGatedProductSpec,
         context: &Context<B>,
     ) -> Result<B::GatedProductGroups, Self::Error> {
@@ -185,7 +195,7 @@ where
 
     fn linear_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedLinearSpec,
         context: &Context<B>,
     ) -> Result<B::LinearGroups, Self::Error> {
@@ -197,7 +207,7 @@ where
 
     fn relu2_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedRelu2Spec,
         context: &Context<B>,
     ) -> Result<B::Relu2Groups, Self::Error> {
@@ -215,7 +225,7 @@ where
     N::Transfer: ResidencyTransferOrdering<Context<B>, Error = N::Error>,
 {
     type Residency = ResidencyDriver<N>;
-    type Acquisition = BankTransfer<N::Transfer>;
+    type Acquisition = BankTransfer<N::Loan>;
     type Report = ParameterBankResidencyReport;
     type Error = N::BankError;
 
@@ -229,16 +239,20 @@ where
             .get(&key)
             .copied()
     }
+    fn begin_consumption(
+        &self,
+        acquisition: BankTransfer<N::Transfer>,
+        context: &Context<B>,
+    ) -> Result<Self::Acquisition, Self::Error> {
+        acquisition.begin_loan(|transfer| N::begin_loan(transfer, context))
+    }
+
     fn complete(
         &mut self,
         acquisition: Self::Acquisition,
         output: &B::Tensor,
-        _: &Context<B>,
     ) -> Result<(), Self::Error> {
-        {
-            use eredu_core::residency::ParameterLoan;
-            N::begin_loan(acquisition.transfer)?.finish(output)
-        }
+        acquisition.transfer.finish(output)
     }
     fn report(&self) -> Result<Self::Report, Self::Error> {
         self.report()
@@ -269,7 +283,7 @@ where
 
     fn gated_product_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedGatedProductSpec,
         context: &Context<B>,
     ) -> Result<B::GatedProductGroups, Self::Error> {
@@ -281,7 +295,7 @@ where
 
     fn linear_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedLinearSpec,
         context: &Context<B>,
     ) -> Result<B::LinearGroups, Self::Error> {
@@ -293,7 +307,7 @@ where
 
     fn relu2_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedRelu2Spec,
         context: &Context<B>,
     ) -> Result<B::Relu2Groups, Self::Error> {

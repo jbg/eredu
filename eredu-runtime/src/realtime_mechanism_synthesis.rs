@@ -30,7 +30,7 @@ pub fn synthesize_realtime_capabilities(
                 descriptor.has_valid_direct_geometry()
             }
             WeightLoweringKind::Transform | WeightLoweringKind::DerivedTransform => {
-                descriptor.has_valid_transform_geometry()
+                descriptor.supports_word_transform()
             }
         };
         if valid && support.supports_lowering(descriptor, lowering.kind().transforms_payload()) {

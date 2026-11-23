@@ -84,6 +84,15 @@ pub struct HybridLayerState<M: HybridCacheStorage> {
 }
 
 impl<M: HybridCacheStorage> HybridLayerState<M> {
+    pub(crate) fn resident_key_value(
+        &mut self,
+    ) -> Option<&mut crate::cache::ResidentKeyValueCache<M>> {
+        match &mut self.attention {
+            Some(HybridAttentionState::KeyValue(KeyValueLayerState::Device(cache))) => Some(cache),
+            _ => None,
+        }
+    }
+
     /// Borrows two selected streams in one lane.
     pub fn append_stream_pair(
         &mut self,

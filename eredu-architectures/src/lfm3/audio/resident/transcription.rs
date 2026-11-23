@@ -394,8 +394,18 @@ where
         final_chunk: bool,
         restart: bool,
     ) -> Result<AudioTranscriptionBlock, AudioTranscriptionError> {
-        let _scope = H::open_input_recovery()?;
+        let _scope = self.open_input_recovery()?;
         self.advance_with_retention(features, final_chunk, restart)
+    }
+
+    fn open_input_recovery(
+        &self,
+    ) -> Result<impl Sized + 'static + use<B, H, I>, AudioTranscriptionError> {
+        let model = self
+            .model
+            .try_borrow()
+            .map_err(|_| AudioTranscriptionError::Busy)?;
+        Ok(H::open_input_recovery(model.binding.context())?)
     }
 
     fn advance_with_retention(
@@ -407,7 +417,14 @@ where
         let _retention = self
             .fork
             .as_ref()
-            .map(|fork| H::hold_fork_retention(fork.model.clone()))
+            .map(|fork| {
+                let model = self
+                    .model
+                    .try_borrow()
+                    .map_err(|_| AudioTranscriptionError::Busy)?;
+                H::hold_fork_retention(model.binding.context(), fork.model.clone())
+                    .map_err(AudioTranscriptionError::from)
+            })
             .transpose()?;
         self.advance_block(features, final_chunk, restart)
     }

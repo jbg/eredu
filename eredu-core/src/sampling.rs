@@ -1,4 +1,11 @@
-//! Exact native operations for portable token-sampling policies.
+//! Exact numerical operations for portable token-sampling policies.
+
+/// Portable host sampling arithmetic.
+pub mod host;
+/// Explicit seeded host random streams.
+pub mod host_random;
+/// Tensor adapter for host sampling.
+pub mod host_tensor;
 
 use crate::TokenFilter;
 
@@ -35,8 +42,9 @@ impl TokenDomain {
 /// Backend primitives required by generic token-sampling policies.
 ///
 /// The runtime owns ordering, history, adaptive state, and constraint rollback.
-/// Implementations operate directly on native logits and random state without
-/// copying values through a neutral tensor representation.
+/// Implementations operate on the score row and random stream supplied by the
+/// selected sampling route. A device implementation retains native storage,
+/// while a host implementation consumes an explicitly acquired host row.
 pub trait SamplingBackend {
     /// Describes sampling storage without tensors, random draws or state changes.
     /// Backends without implementation facts preserve explicit incomplete coverage.

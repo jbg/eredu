@@ -1,15 +1,20 @@
 use super::*;
 use eredu_core::capture::*;
+#[cfg(feature = "tensor-capture")]
 use eredu_core::intervention::*;
 
+#[cfg(feature = "tensor-capture")]
 thread_local! { static CONTENT_DISCOVERY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(feature = "tensor-capture")]
 pub(super) fn content_discovery() -> CaptureDiscovery {
     CONTENT_DISCOVERY_CALLS.with(|calls| calls.set(calls.get() + 1));
     discovery()
 }
+#[cfg(feature = "tensor-capture")]
 pub(super) fn reset_content_discovery_calls() {
     CONTENT_DISCOVERY_CALLS.with(|calls| calls.set(0));
 }
+#[cfg(feature = "tensor-capture")]
 pub(super) fn content_discovery_calls() -> usize {
     CONTENT_DISCOVERY_CALLS.with(std::cell::Cell::get)
 }
@@ -35,6 +40,7 @@ pub(super) struct Sampling {
     pub prediction: u64,
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) fn discovery() -> CaptureDiscovery {
     let path = eredu_core::MODEL_LOGITS_OBSERVATION_PATH.to_owned();
     let capabilities = CaptureCapabilities {
@@ -92,6 +98,7 @@ pub(super) fn discovery() -> CaptureDiscovery {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) fn cost(shape: &[u64]) -> Result<CaptureUsage, CaptureError> {
     Ok(CaptureUsage {
         captures: 1,
@@ -411,6 +418,7 @@ impl InterventionEstimator for Estimates {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 pub(super) fn intervention_discovery(session: &str) -> InterventionDiscovery {
     let capture = discovery();
     InterventionDiscovery {

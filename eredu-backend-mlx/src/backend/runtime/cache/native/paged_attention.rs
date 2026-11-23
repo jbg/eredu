@@ -7,7 +7,7 @@ use crate::{
 };
 use eredu_core::{
     cache::mechanisms::{
-        CacheAttentionAccumulator, PagedAttentionGeometry, PagedAttentionOperands,
+        AttentionScan, CacheAttentionAccumulator, PagedAttentionGeometry, PagedAttentionOperands,
         PagedKeyValueStorage,
     },
     BackendFailure,
@@ -21,10 +21,14 @@ struct MlxCacheAttention {
 }
 
 impl eredu_core::cache::mechanisms::CacheAttentionAccumulator<Array, Stream> for MlxCacheAttention {
-    fn begin_value_pass(&mut self) -> Result<(), eredu_core::BackendFailure> {
+    fn scan(&self) -> AttentionScan {
+        self.accumulator.scan()
+    }
+
+    fn begin_pass(&mut self, pass: usize, stream: &Stream) -> Result<(), BackendFailure> {
         self.accumulator
-            .begin_value_pass()
-            .map_err(eredu_core::BackendFailure::from_error)
+            .begin_pass(pass, stream)
+            .map_err(BackendFailure::from_error)
     }
 
     fn accumulate(
@@ -42,7 +46,8 @@ impl eredu_core::cache::mechanisms::CacheAttentionAccumulator<Array, Stream> for
             keys.clone(),
             values.clone(),
         );
-        let mut scratch = self.score_bytes_per_position * (positions.end - positions.start) as u64;
+        let score_bytes = self.score_bytes_per_position * (positions.end - positions.start) as u64;
+        let mut scratch = score_bytes;
         let mut accumulate = || {
             let bias = match (source, self.relative.as_ref()) {
                 (CacheAttentionInput::Transient, _) | (_, None) => None,
@@ -60,11 +65,11 @@ impl eredu_core::cache::mechanisms::CacheAttentionAccumulator<Array, Stream> for
             Ok(())
         };
         if source == CacheAttentionInput::SealedPage {
-            super::with_cache_read(retention, accumulate)?;
+            super::with_cache_read(stream, retention, accumulate)?;
         } else {
             accumulate().map_err(eredu_core::BackendFailure::from_error)?;
         }
-        Ok(scratch)
+        Ok(scratch.saturating_add(self.accumulator.ordered_workspace_bytes(score_bytes)))
     }
 
     fn finish(self, stream: &Stream) -> Result<Array, eredu_core::BackendFailure> {
@@ -99,7 +104,7 @@ impl MlxCacheAttention {
             accumulator.use_retained_context(start)?;
         }
         accumulator.set_softcap(operands.softcap)?;
-        accumulator.set_arithmetic(operands.arithmetic)?;
+        accumulator.set_arithmetic(operands.arithmetic, stream)?;
         Ok(Self {
             accumulator,
             relative: None,

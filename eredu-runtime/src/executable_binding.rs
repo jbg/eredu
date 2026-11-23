@@ -63,7 +63,7 @@ pub use route_inputs::{
 mod portable_types;
 pub use portable_types::{PortableTextTypes, TextPredictionPrimitives};
 
-mod route_assembly;
+pub mod route_assembly;
 pub use route_assembly::{BoundExecutionRoutes, TextRankRoutes};
 
 mod routes;
@@ -347,15 +347,15 @@ where
             Discovery = D,
         >,
 {
+    let routes = route_assembly::bind_text_routes(backend);
     let capabilities = sources.session_capabilities();
     let communication =
         bind_model_communication(backend, sources.communication_manifest(), &placement)?;
     crate::automatic_support::initialize_allocator_defaults(backend.allocator_cache_defaults())
         .map_err(PreparedExecutionError::Binding)?;
     let target = backend
-        .open_binding_target(communication.as_ref())
+        .open_binding_target(&placement, communication.as_ref())
         .map_err(PreparedExecutionError::Backend)?;
-    let routes = route_assembly::bind_text_routes(backend);
     let model = construct_prepared_executable(backend, sources, routes, communication, target)?;
     Ok(eredu_core::PreparedModel::new(model, capabilities))
 }
@@ -655,9 +655,6 @@ where
         A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
         A::StaticModules: Clone;
 
-    /// Records that validated dispatch is about to invoke architecture constructors.
-    fn construction_started(&mut self);
-
     /// Borrows the queue for this construction.
     fn context(&self) -> &B::Executor;
 
@@ -682,6 +679,46 @@ where
 
     /// Converts a binding failure from portable construction.
     fn construction_failure(error: String) -> Self::Error;
+}
+
+/// Consumes a checked ordinary text handoff using selected portable construction.
+pub trait PreparedReplicatedTextVisitor<B: SubmissionBackend, S: RuntimeState<B>> {
+    /// Installed or prepared result.
+    type Output;
+    /// Failure preparing the selected execution.
+    type Error;
+
+    /// Binds the checked architecture and its exact checkpoint source.
+    fn build<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        source: SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::StaticModules: Clone;
+}
+
+impl<B, S, V> PreparedReplicatedTextVisitor<B, S> for V
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
+    S: RuntimeState<B>,
+    V: ReplicatedTextArchitectureVisitor<B, S>,
+{
+    type Output = V::Output;
+    type Error = V::Error;
+
+    fn build<A>(
+        self,
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        source: SharedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
+        A::StaticModules: Clone,
+    {
+        construct_replicated_text::<B, S, A, Self>(self, prepared, source)
+    }
 }
 
 /// Constructs and erases an ordinary session with the selected native resources.

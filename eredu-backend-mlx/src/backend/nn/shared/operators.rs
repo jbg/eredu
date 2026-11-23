@@ -588,6 +588,13 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
                     None => compute_tensor(self.native.forward(rope_input, context)),
                 }
             }
+            RotaryPosition::Embeddings { .. }
+                if self.arithmetic == eredu_nn::RotaryArithmetic::RecurrentFloat32 =>
+            {
+                Err(ComputeError::backend(Exception::custom(
+                    "recurrent rotary requires an absolute offset",
+                )))
+            }
             RotaryPosition::Embeddings { cosine, sine } => {
                 compute_tensor(common::attention::apply_rotary_embeddings_with_arithmetic(
                     input.as_array(),
@@ -615,136 +622,6 @@ impl Parameterized<MlxTensor> for MlxRotary {
     {
     }
     fn set_trainable(&mut self, _trainable: bool) {}
-}
-
-/// MLX implementation of neutral multi-stream residual mixing.
-#[derive(Debug, Clone)]
-pub struct MlxHyperConnection {
-    pub(super) module: common::hyper_connections::HyperConnection,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
-}
-
-impl HyperConnectionOperator<MlxTensor> for MlxHyperConnection {
-    fn collapse(
-        &mut self,
-        residual: &MlxTensor,
-        norm_epsilon: f32,
-        context: &Stream,
-    ) -> Result<HyperConnectionState<MlxTensor>, ComputeError> {
-        let (collapsed, split) = compute(self.module.collapse_split(
-            residual.as_array(),
-            norm_epsilon,
-            context,
-        ))?;
-        Ok(HyperConnectionState {
-            collapsed: MlxTensor::from_array(collapsed),
-            pre: MlxTensor::from_array(split.pre),
-            post: MlxTensor::from_array(split.post),
-            combination: MlxTensor::from_array(split.combination),
-        })
-    }
-
-    fn expand(
-        &mut self,
-        sublayer: &MlxTensor,
-        residual: &MlxTensor,
-        state: &HyperConnectionState<MlxTensor>,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(common::hyper_connections::expand(
-            sublayer.as_array(),
-            residual.as_array(),
-            state.post.as_array(),
-            state.combination.as_array(),
-            context,
-        ))
-    }
-}
-
-impl Parameterized<MlxTensor> for MlxHyperConnection {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        visit_module_parameters(&self.module, &self.topology, visitor);
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, MlxTensor>,
-    {
-        visit_module_parameters_mut(&mut self.module, &self.topology, visitor);
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        set_module_trainable(&mut self.module, trainable);
-    }
-}
-
-/// MLX implementation of the neutral final hyper-head collapse.
-#[derive(Debug, Clone)]
-pub struct MlxHyperHead {
-    pub(super) module: common::hyper_connections::HyperHead,
-    pub(super) topology: BTreeMap<String, ParameterSpec>,
-}
-
-impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
-    fn forward(
-        &mut self,
-        residual: &MlxTensor,
-        context: &Stream,
-    ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(self.module.forward(residual.as_array(), context))
-    }
-
-    fn forward_with_coefficients_observer(
-        &mut self,
-        residual: &MlxTensor,
-        context: &Stream,
-        observer: Option<&mut dyn eredu_nn::TensorValueObserver<MlxTensor>>,
-    ) -> Result<MlxTensor, ComputeError> {
-        let Some(observer) = observer else {
-            return self.forward(residual, context);
-        };
-        let mut failure = None;
-        let result = self.module.forward_with_coefficients_observer(
-            residual.as_array(),
-            context,
-            Some(&mut |coefficients| {
-                observer
-                    .observe(MlxTensor::ref_cast(coefficients))
-                    .map_err(|error| {
-                        let native = Exception::custom(error.to_string());
-                        failure = Some(error);
-                        native
-                    })
-            }),
-        );
-        match failure {
-            Some(error) => Err(error),
-            None => compute_tensor(result),
-        }
-    }
-}
-
-impl Parameterized<MlxTensor> for MlxHyperHead {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, MlxTensor>,
-    {
-        visit_module_parameters(&self.module, &self.topology, visitor);
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, MlxTensor>,
-    {
-        visit_module_parameters_mut(&mut self.module, &self.topology, visitor);
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        set_module_trainable(&mut self.module, trainable);
-    }
 }
 
 /// MLX implementation of the backend-neutral learned top-k selector.

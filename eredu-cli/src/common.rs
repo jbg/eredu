@@ -17,7 +17,7 @@ pub struct CommonOptions {
     #[arg(long, value_name = "REVISION", requires = "model")]
     pub revision: Option<String>,
 
-    /// Main model execution device: `cpu` or `gpu:N`.
+    /// Main model execution device: `cpu`, `gpu:N`, `metal:N`, or `cuda:N`.
     #[arg(long, value_name = "DEVICE")]
     pub device: Option<CliDevice>,
 
@@ -143,6 +143,7 @@ impl CommonOptions {
             Some(_) => unreachable!("CLI declares only affine and MXFP4 transformations"),
         })
     }
+    #[cfg(feature = "realtime")]
     pub fn weight_quantization(&self) -> Result<Option<eredu_checkpoint::WeightQuantization>> {
         let request = eredu_runtime::execution_plan_quantization(self.weight_transformation()?)?;
         request
@@ -216,6 +217,7 @@ impl PreparedCacheArgs {
         }
     }
 
+    #[cfg(feature = "realtime")]
     pub(crate) fn is_explicit(&self) -> bool {
         self.prepared_cache_dir.is_some()
     }

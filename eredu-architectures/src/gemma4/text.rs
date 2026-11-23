@@ -340,6 +340,14 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         })
     }
 
+    fn activate(
+        &self,
+        gate: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.policy.activation().apply::<B>(gate, context)
+    }
+
     fn forward_instrumented(
         &mut self,
         input: &B::Tensor,
@@ -348,12 +356,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
-        let gate = if self.policy.activation() == eredu_nn::GatedProductActivation::GeluApproximate
-        {
-            B::gelu_approximate(gate, context)?
-        } else {
-            B::Tensor::gelu(&gate, context)?
-        };
+        let gate = self.activate(gate, context)?;
         let up = self.up.forward(input, context)?;
         let hidden = gate.multiply(&up, context)?;
         let hidden = instrumentation.apply("dense_feed_forward.units", hidden)?;
@@ -931,7 +934,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
                 None,
                 context,
             )?;
-            let gate = B::Tensor::gelu(&gate, context)?;
+            let gate = self.mlp.activate(gate, context)?;
             instrumentation.observe("per_layer.prepared", media)?;
             let media = gate.multiply(media, context)?;
             let media = instrumentation.apply("per_layer.units", media)?;

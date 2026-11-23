@@ -3,7 +3,6 @@
 use eredu_core::refinement::{PositionScoreClass, RefinementFinalizationBackend};
 use eredu_core::sampling::TokenDomain;
 use eredu_core::{refinement::PredictionScoreKind, TokenFilter};
-use eredu_nn::{Index, Tensor};
 
 /// Selected masked tokens and the identity reserved for unresolved positions.
 pub struct RefinementSelection<'a, T> {
@@ -51,37 +50,27 @@ pub enum FinalizationError<E> {
 /// Each commitment queries the evolving controller separately; refinement never
 /// applies output constraints or consumes finalization randomness.
 pub fn finalize_refinement_position<B>(
-    scores: &B::Logits,
+    scores: &B::CanvasScores,
     position: usize,
-    selected: Option<RefinementSelection<'_, B::Token>>,
+    selected: Option<RefinementSelection<'_, B::CanvasTokens>>,
     domain: TokenDomain,
     filter: &TokenFilter,
-    context: &B::Context,
-) -> Result<FinalizedPosition<B::Token, B::Logits>, FinalizationError<B::Error>>
+    context: &B::FinalizationContext,
+) -> Result<
+    FinalizedPosition<B::CanvasTokens, B::PositionScores>,
+    FinalizationError<B::FinalizationError>,
+>
 where
     B: RefinementFinalizationBackend,
-    B::Logits: Tensor<Context = B::Context>,
 {
-    let shape = scores.shape();
-    if shape.len() != 2
-        || shape[0] <= 0
-        || position >= shape[0] as usize
-        || domain.cardinality() == 0
-        || shape[1] as usize != domain.cardinality()
-    {
+    let [rows, width] = B::canvas_score_shape(scores).ok_or(FinalizationError::Geometry)?;
+    if position >= rows || width == 0 || width != domain.cardinality() {
         return Err(FinalizationError::Geometry);
     }
-    let scores = scores
-        .index(
-            &[
-                Index::Range(position as i32, position as i32 + 1),
-                Index::Full,
-            ],
-            context,
-        )
-        .map_err(|error| FinalizationError::Backend(B::error(error.to_string())))?;
+    let scores =
+        B::position_scores(scores, position, context).map_err(FinalizationError::Backend)?;
     let mut scores =
-        B::apply_token_filter(&scores, filter, context).map_err(FinalizationError::Backend)?;
+        B::filter_position_scores(&scores, filter, context).map_err(FinalizationError::Backend)?;
     if let Some(selection) = &selected {
         if selection.mask_token_id as usize >= domain.cardinality() {
             return Err(FinalizationError::Geometry);
@@ -91,7 +80,7 @@ where
         }
         let mut allowed = vec![true; domain.cardinality()];
         allowed[selection.mask_token_id as usize] = false;
-        scores = B::apply_token_filter(&scores, &TokenFilter::Allowed(allowed), context)
+        scores = B::filter_position_scores(&scores, &TokenFilter::Allowed(allowed), context)
             .map_err(FinalizationError::Backend)?;
     }
     match B::classify_position_scores(&scores, context).map_err(FinalizationError::Backend)? {
@@ -113,9 +102,10 @@ where
     let token = if admissible {
         candidate.expect("admitted candidate")
     } else {
-        B::sample_processed(&scores, 0.0, None, context).map_err(FinalizationError::Backend)?
+        B::greedy_position(&scores, context).map_err(FinalizationError::Backend)?
     };
-    let token = B::validate_token(&token, domain, context).map_err(FinalizationError::Backend)?;
+    let token =
+        B::validate_candidate(&token, domain, context).map_err(FinalizationError::Backend)?;
     Ok(FinalizedPosition {
         token,
         scores,

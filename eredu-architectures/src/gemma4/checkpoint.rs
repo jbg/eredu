@@ -56,11 +56,31 @@ pub fn with_checkpoint_formats(
     config: &FamilyConfig,
     formats: HashMap<String, WeightQuantization>,
 ) -> Result<FamilyConfig, String> {
+    with_matrix_formats(
+        config,
+        formats
+            .into_iter()
+            .map(|(name, format)| (name, format.into()))
+            .collect(),
+    )
+}
+
+pub(crate) fn with_matrix_formats(
+    config: &FamilyConfig,
+    formats: HashMap<String, eredu_checkpoint::LinearFormat>,
+) -> Result<FamilyConfig, String> {
     let mut target = config.policy().clone();
     let mut text = HashMap::new();
     let mut vision = HashMap::new();
     let mut audio = HashMap::new();
-    for (name, format) in formats {
+    let mut packed = HashMap::new();
+    for (name, encoding) in formats {
+        let Some(format) = encoding.weight_quantization() else {
+            if matches!(encoding, eredu_checkpoint::LinearFormat::GgufIQuant { .. }) {
+                packed.insert(name, encoding);
+            }
+            continue;
+        };
         if name.starts_with("model.vision_tower.") || name.starts_with("model.embed_vision.") {
             vision.insert(name.clone(), format);
             if name.starts_with("model.embed_vision.") {
@@ -78,6 +98,7 @@ pub fn with_checkpoint_formats(
     target.text.weight_quantization = None;
     target.text.quantized_weights = None;
     target.text.quantized_weight_configs = (!text.is_empty()).then_some(text);
+    target.text.packed_linear_formats = packed;
     if let Some(config) = target.vision.as_mut() {
         *config = config
             .with_formats(None, None, (!vision.is_empty()).then_some(vision))
@@ -401,6 +422,20 @@ pub(crate) fn shared_safetensors_plan(
         }
     }
     let mut policy = CatalogPolicy::strict();
+    // Shared consumers use their publisher's history even when the released
+    // file retains otherwise unused key/value projection parameters.
+    for (layer, attention) in attention_scopes.iter().enumerate() {
+        if attention.key.is_none() {
+            for suffix in ["k_proj.weight", "v_proj.weight", "k_norm.weight"] {
+                let name = format!("{}.self_attn.{suffix}", released_layer_path(layer));
+                policy
+                    .explicitly_allowed_keys
+                    .extend(mlx_vlm_physical_name(&name));
+                policy.explicitly_allowed_keys.insert(name);
+            }
+        }
+    }
+
     policy.allowed_prefixes.extend([
         "multi_modal_projector.".into(),
         "model.multi_modal_projector.".into(),
@@ -463,11 +498,12 @@ fn audio_output_projection_bias_in(
     let canonical = "model.audio_tower.output_proj.bias";
     tensors.get(canonical).is_some()
         || mlx_vlm_physical_name(canonical).is_some_and(|physical| tensors.get(&physical).is_some())
-        || projector_physical_name(canonical).is_some_and(|physical| {
-            projector.is_some_and(|projector| {
-                projector
-                    .tensors()
-                    .any(|tensor| tensor.descriptor().name == physical)
+        || projector.is_some_and(|projector| {
+            let legacy = projector_physical_name(canonical);
+            let published = legacy.as_deref().and_then(published_projector_name);
+            projector.tensors().any(|tensor| {
+                let name = tensor.descriptor().name.as_str();
+                legacy.as_deref() == Some(name) || published.as_deref() == Some(name)
             })
         })
 }
@@ -487,16 +523,25 @@ pub(crate) fn add_mlx_vlm_aliases(constraint: &mut SafetensorsTensorConstraint) 
     }
 }
 
-/// Builds the strict released sibling-projector GGUF catalog.
+/// Builds the strict sibling-projector GGUF catalog for canonical source names.
 ///
 /// The media geometry is derived from the same neutral parameter plan used by
 /// SafeTensors; only the released physical prefixes and GGUF encoding policy
 /// differ.
 pub fn mmproj_gguf_plan(family: &FamilyConfig) -> Result<GgufCheckpointPlan, String> {
+    mmproj_gguf_layout(family, false, false).map(|(plan, _)| plan)
+}
+
+pub(crate) fn mmproj_gguf_layout(
+    family: &FamilyConfig,
+    published_vision: bool,
+    published_audio: bool,
+) -> Result<(GgufCheckpointPlan, BTreeMap<String, String>), String> {
     let safe = safetensors_plan(family)?;
     let mut tensors = Vec::new();
+    let mut names = BTreeMap::new();
     for tensor in safe.common_tensors {
-        let Some(key) = projector_physical_name(&tensor.key) else {
+        let Some(mut key) = projector_physical_name(&tensor.key) else {
             continue;
         };
         if tensor.role != eredu_checkpoint::schema::TensorRole::Tensor {
@@ -505,12 +550,41 @@ pub fn mmproj_gguf_plan(family: &FamilyConfig) -> Result<GgufCheckpointPlan, Str
                 tensor.key
             ));
         }
+        let published = match key.as_str() {
+            name if name.starts_with("vision_tower.") || name.starts_with("embed_vision.") => {
+                published_vision
+            }
+            _ => published_audio,
+        };
+        let mut shape = tensor.shape;
+        let mut alternate_shapes = tensor.alternate_shapes;
+        if published {
+            key = published_projector_name(&key).ok_or_else(|| {
+                format!("missing published Gemma 4 projector slot {:?}", tensor.key)
+            })?;
+            if shape.is_empty() {
+                shape = vec![1];
+            } else if key == "v.patch_embd.weight" {
+                let patch = family
+                    .vision
+                    .as_ref()
+                    .ok_or("missing Gemma 4 vision configuration")?
+                    .patch_size as usize;
+                shape = vec![shape[0], 3, patch, patch];
+            } else if key.ends_with(".conv_dw.weight") {
+                shape.pop();
+            } else if key.starts_with("a.conv1d.") && shape.len() == 4 {
+                shape = audio_physical_convolution_shape(&shape, &[0, 2, 3, 1]);
+            }
+            alternate_shapes.clear();
+        }
+        names.insert(key.clone(), tensor.key);
         let mut constraint = GgufTensorConstraint::required(
             key,
-            tensor.shape,
+            shape,
             GgufTypeConstraint::OperationClass(TensorOperation::Dense),
         )
-        .with_alternate_shapes(tensor.alternate_shapes);
+        .with_alternate_shapes(alternate_shapes);
         constraint.element_count = tensor.element_count;
         if tensor.requirement == TensorRequirement::Optional {
             constraint.requirement = TensorRequirement::Optional;
@@ -526,7 +600,112 @@ pub fn mmproj_gguf_plan(family: &FamilyConfig) -> Result<GgufCheckpointPlan, Str
         Vec::new(),
         CatalogPolicy::strict(),
     )
+    .map(|plan| (plan, names))
     .map_err(|error| error.to_string())
+}
+
+fn published_projector_name(name: &str) -> Option<String> {
+    let direct = match name {
+        "audio_tower.output_proj.weight" => "a.pre_encode.out.weight",
+        "audio_tower.output_proj.bias" => "a.pre_encode.out.bias",
+        "audio_tower.subsample_conv_projection.input_proj_linear.weight" => {
+            "a.input_projection.weight"
+        }
+        "embed_audio.embedding_projection.weight" => "mm.a.input_projection.weight",
+        "embed_vision.embedding_projection.weight" => "mm.input_projection.weight",
+        "vision_tower.patch_embedder.input_proj.weight" => "v.patch_embd.weight",
+        "vision_tower.patch_embedder.position_embedding_table" => "v.position_embd.weight",
+        "vision_tower.std_bias" => "v.std_bias",
+        "vision_tower.std_scale" => "v.std_scale",
+        _ => "",
+    };
+    if !direct.is_empty() {
+        return Some(direct.into());
+    }
+    if let Some(rest) = name.strip_prefix("audio_tower.subsample_conv_projection.layer") {
+        let (index, slot) = rest.split_once('.')?;
+        let slot = match slot {
+            "conv.weight" => "weight",
+            "norm.weight" => "norm.weight",
+            _ => return None,
+        };
+        return Some(format!("a.conv1d.{index}.{slot}"));
+    }
+    if let Some(rest) = name.strip_prefix("audio_tower.layers.") {
+        let (index, slot) = rest.split_once('.')?;
+        return published_block_name(
+            "a",
+            index,
+            slot,
+            &[
+                ("feed_forward1.ffw_layer_1", "ffn_up"),
+                ("feed_forward1.ffw_layer_2", "ffn_down"),
+                ("feed_forward2.ffw_layer_1", "ffn_up_1"),
+                ("feed_forward2.ffw_layer_2", "ffn_down_1"),
+                ("feed_forward1.pre_layer_norm", "ffn_norm"),
+                ("feed_forward1.post_layer_norm", "ffn_post_norm"),
+                ("feed_forward2.pre_layer_norm", "ffn_norm_1"),
+                ("feed_forward2.post_layer_norm", "ffn_post_norm_1"),
+                // The published layout assigns these two normalization names in reverse.
+                ("lconv1d.pre_layer_norm", "conv_norm"),
+                ("lconv1d.depthwise_conv1d", "conv_dw"),
+                ("lconv1d.linear_start", "conv_pw1"),
+                ("lconv1d.conv_norm", "norm_conv"),
+                ("lconv1d.linear_end", "conv_pw2"),
+                ("norm_out", "ln2"),
+                ("norm_post_attn", "attn_post_norm"),
+                ("norm_pre_attn", "attn_pre_norm"),
+                ("self_attn.k_proj", "attn_k"),
+                ("self_attn.q_proj", "attn_q"),
+                ("self_attn.v_proj", "attn_v"),
+                ("self_attn.post", "attn_out"),
+                ("self_attn.relative_k_proj", "attn_k_rel"),
+                ("self_attn.per_dim_scale", "per_dim_scale"),
+            ],
+        );
+    }
+    let (index, slot) = name
+        .strip_prefix("vision_tower.encoder.layers.")?
+        .split_once('.')?;
+    published_block_name(
+        "v",
+        index,
+        slot,
+        &[
+            ("input_layernorm", "ln1"),
+            ("post_attention_layernorm", "attn_post_norm"),
+            ("pre_feedforward_layernorm", "ln2"),
+            ("post_feedforward_layernorm", "ffn_post_norm"),
+            ("mlp.up_proj", "ffn_up"),
+            ("mlp.down_proj", "ffn_down"),
+            ("mlp.gate_proj", "ffn_gate"),
+            ("self_attn.k_proj", "attn_k"),
+            ("self_attn.q_proj", "attn_q"),
+            ("self_attn.v_proj", "attn_v"),
+            ("self_attn.o_proj", "attn_out"),
+            ("self_attn.k_norm", "attn_k_norm"),
+            ("self_attn.q_norm", "attn_q_norm"),
+        ],
+    )
+}
+
+fn published_block_name(
+    modality: &str,
+    index: &str,
+    slot: &str,
+    names: &[(&str, &str)],
+) -> Option<String> {
+    names.iter().find_map(|(canonical, physical)| {
+        let tail = slot.strip_prefix(canonical)?;
+        let suffix = match tail {
+            "" => "weight",
+            _ => {
+                let suffix = tail.strip_prefix('.')?;
+                suffix.strip_prefix("linear.").unwrap_or(suffix)
+            }
+        };
+        Some(format!("{modality}.blk.{index}.{physical}.{suffix}"))
+    })
 }
 
 fn projector_physical_name(canonical: &str) -> Option<String> {
@@ -813,7 +992,146 @@ fn add_safetensors_audio(
             Some(relative),
         )?;
     }
+    for (name, shape, axes) in audio_convolution_layouts(config) {
+        let source_shape = audio_physical_convolution_shape(&shape, axes);
+        if source_shape != shape {
+            let constraint = output
+                .iter_mut()
+                .find(|tensor| tensor.key == name)
+                .ok_or_else(|| format!("missing Gemma audio convolution slot {name:?}"))?;
+            constraint.alternate_shapes.push(source_shape);
+        }
+    }
     Ok(())
+}
+
+fn audio_convolution_layouts(
+    config: &super::AudioConfig,
+) -> impl Iterator<Item = (&str, Vec<usize>, &'static [usize])> {
+    config
+        .pinned()
+        .subsampling
+        .iter()
+        .map(|spec| {
+            (
+                spec.weight.id.as_str(),
+                spec.shape.iter().map(|&dim| dim as usize).collect(),
+                &[0, 2, 3, 1][..],
+            )
+        })
+        .chain(config.layers().iter().map(|spec| {
+            let depthwise = &spec.convolution.depthwise;
+            (
+                depthwise.weight.id.as_str(),
+                depthwise.shape().iter().map(|&dim| dim as usize).collect(),
+                &[0, 2, 1][..],
+            )
+        }))
+}
+
+fn audio_physical_convolution_shape(shape: &[usize], axes: &[usize]) -> Vec<usize> {
+    let mut source = vec![0; shape.len()];
+    for (logical, &physical) in axes.iter().enumerate() {
+        source[physical] = shape[logical];
+    }
+    source
+}
+
+/// Normalizes published channel-first audio kernels to the neutral convolution layout.
+pub(crate) fn audio_convolution_recipes<C: RecipeCatalog + ?Sized>(
+    config: &super::AudioConfig,
+    catalog: &C,
+) -> BTreeMap<String, DerivedWeightRecipe> {
+    use eredu_checkpoint::store::TensorSelection;
+    audio_convolution_layouts(config)
+        .filter_map(|(name, shape, axes)| {
+            if axes.len() == 3
+                && shape[2] == 1
+                && catalog
+                    .tensor_metadata(name)
+                    .is_ok_and(|tensor| tensor.logical_shape == shape[..2])
+            {
+                return Some((
+                    name.to_owned(),
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+                        shape,
+                    },
+                ));
+            }
+            let physical_shape = audio_physical_convolution_shape(&shape, axes);
+            if physical_shape == shape {
+                return None;
+            }
+            let source = std::iter::once(name.to_owned())
+                .chain(mlx_vlm_physical_name(name))
+                .find(|source| {
+                    catalog
+                        .tensor_metadata(source)
+                        .is_ok_and(|tensor| tensor.logical_shape == physical_shape)
+                })?;
+            Some((
+                name.to_owned(),
+                DerivedWeightRecipe::Transpose {
+                    input: Box::new(DerivedWeightRecipe::source(source, TensorSelection::Full)),
+                    axes: axes.to_vec(),
+                },
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn projector_shape_recipes<C: RecipeCatalog + ?Sized>(
+    family: &FamilyConfig,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    use eredu_checkpoint::store::TensorSelection;
+    let mut recipes = BTreeMap::new();
+    if family.vision.is_none() && family.audio.is_none() {
+        return Ok(recipes);
+    }
+    for tensor in safetensors_plan(family)?.common_tensors {
+        if projector_physical_name(&tensor.key).is_none() {
+            continue;
+        }
+        let Ok(source) = catalog.tensor_metadata(&tensor.key) else {
+            continue;
+        };
+        let input = || {
+            Box::new(DerivedWeightRecipe::source(
+                &tensor.key,
+                TensorSelection::Full,
+            ))
+        };
+        if tensor.shape.is_empty() && source.logical_shape == [1] {
+            recipes.insert(
+                tensor.key.clone(),
+                DerivedWeightRecipe::Reshape {
+                    input: input(),
+                    shape: vec![],
+                },
+            );
+        } else if tensor.key == "model.vision_tower.patch_embedder.input_proj.weight" {
+            let patch = family
+                .vision
+                .as_ref()
+                .ok_or("missing Gemma 4 vision configuration")?
+                .patch_size as usize;
+            if source.logical_shape == [tensor.shape[0], 3, patch, patch] {
+                recipes.insert(
+                    tensor.key.clone(),
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(DerivedWeightRecipe::Transpose {
+                            input: input(),
+                            axes: vec![0, 2, 3, 1],
+                        }),
+                        shape: tensor.shape,
+                    },
+                );
+            }
+        }
+    }
+    Ok(recipes)
 }
 
 fn add_audio_parameters(
@@ -891,6 +1209,68 @@ pub fn gguf_plan(family: &FamilyConfig) -> Result<GgufCheckpointPlan, String> {
     )
 }
 
+fn validate_gguf_rotary_factors(
+    checkpoint: &eredu_gguf::Checkpoint,
+    args: &ModelArgs,
+) -> Result<(), String> {
+    const NAME: &str = "rope_freqs.weight";
+    if !checkpoint.has_payload_access()
+        || !checkpoint
+            .tensors()
+            .any(|tensor| tensor.descriptor().name == NAME)
+    {
+        return Ok(());
+    }
+    let algorithm = crate::rotary::normalize_algorithm(
+        args.rope_scaling_for(eredu_core::AttentionPolicy::Full),
+    )?;
+    let eredu_nn::RotaryAlgorithm::Proportional {
+        rotary_fraction, ..
+    } = algorithm
+    else {
+        return Err("Gemma 4 GGUF rotary factors require proportional full attention".into());
+    };
+    let payload = checkpoint
+        .materializer()
+        .raw_tensor(NAME)
+        .map_err(|e| e.to_string())?;
+    let active = (payload.data().len() as f32 / 4.0 * rotary_fraction) as usize;
+    for (index, bytes) in payload.data().as_chunks::<4>().0.iter().enumerate() {
+        let factor = match payload.endian() {
+            eredu_gguf::Endian::Little => f32::from_le_bytes(*bytes),
+            eredu_gguf::Endian::Big => f32::from_be_bytes(*bytes),
+        };
+        let expected = if index < active { 1.0 } else { 1e30 };
+        if factor != expected {
+            return Err(format!(
+                "Gemma 4 GGUF rotary pair {index} has unsupported factor {factor}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepared_gguf_payload(
+    checkpoint: &eredu_gguf::Checkpoint,
+    args: &ModelArgs,
+) -> Result<eredu_gguf::Checkpoint, String> {
+    validate_gguf_rotary_factors(checkpoint, args)?;
+    let default = eredu_gguf::Limits::default().max_allocation_bytes;
+    // The admitted per-layer vocabulary is one physical table. Resident
+    // materialization reads that exact table instead of splitting its rows.
+    let bytes = checkpoint
+        .tensors()
+        .find(|tensor| tensor.descriptor().name == "per_layer_token_embd.weight")
+        .map_or(0, |tensor| tensor.descriptor().byte_len);
+    if bytes <= default {
+        return Ok(checkpoint.clone());
+    }
+    checkpoint
+        .clone()
+        .into_allocation_limit(bytes)
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) fn shared_gguf_plan(
     args: &ModelArgs,
     declaration: &super::text::pinned::Declaration,
@@ -920,8 +1300,21 @@ pub(crate) fn shared_gguf_plan(
         })
         .collect::<Vec<_>>();
     let mut groups = Vec::new();
-    let mut catalog = CatalogPolicy::strict();
-    catalog.allowed_prefixes.push("rope_freqs.".into());
+    let catalog = CatalogPolicy::strict();
+    if let Some(width) = (0..layers)
+        .filter_map(|layer| args.layer_policy(layer))
+        .find(|layer| matches!(layer.attention, eredu_core::AttentionPolicy::Full))
+        .map(|layer| layer.head_dim.get() as usize / 2)
+    {
+        let mut rotary = GgufTensorConstraint::required(
+            "rope_freqs.weight",
+            vec![width],
+            GgufTypeConstraint::Exact(eredu_gguf::GgmlType::F32),
+        );
+        rotary.requirement = TensorRequirement::Optional;
+        rotary.role = eredu_checkpoint::schema::TensorRole::ArtifactMetadata;
+        common.push(rotary);
+    }
     let blocks = (0..layers)
         .map(|layer| {
             super::text::specs::DecoderBlockSpec::from_scopes(
@@ -949,7 +1342,7 @@ pub(crate) fn shared_gguf_plan(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    add_gguf_blocks(&blocks, &mut common, &mut groups, &mut catalog)?;
+    add_gguf_blocks(&blocks, &mut common, &mut groups)?;
     GgufCheckpointPlan::new("Gemma 4 GGUF", common, groups, catalog)
         .map_err(|error| error.to_string())
 }
@@ -958,7 +1351,6 @@ pub(crate) fn add_gguf_blocks(
     blocks: &[super::text::specs::DecoderBlockSpec],
     common: &mut Vec<GgufTensorConstraint>,
     groups: &mut Vec<AlternativeLayoutGroup<GgufTensorConstraint>>,
-    catalog: &mut CatalogPolicy,
 ) -> Result<(), String> {
     for (layer, spec) in blocks.iter().enumerate() {
         let root = format!("blk.{layer}");
@@ -988,11 +1380,26 @@ pub(crate) fn add_gguf_blocks(
             ));
         }
         if attention.key.is_none() {
-            catalog.allowed_prefixes.extend(
-                shared_kv_gguf_exclusions(layer)
-                    .into_iter()
-                    .map(|(source, _)| format!("{source}.")),
-            );
+            let head = attention.geometry.key_dimensions() as usize;
+            let kv = head * attention.geometry.key_value_heads() as usize;
+            let input = attention.query.input as usize;
+            let mut slots = vec![
+                ("attn_k.weight", vec![kv, input], TensorOperation::Matrix),
+                ("attn_v.weight", vec![kv, input], TensorOperation::Matrix),
+                ("attn_k_norm.weight", vec![head], TensorOperation::Vector),
+            ];
+            if attention.query.bias.is_some() {
+                slots.extend([
+                    ("attn_k.bias", vec![kv], TensorOperation::Vector),
+                    ("attn_v.bias", vec![kv], TensorOperation::Vector),
+                ]);
+            }
+            for (name, shape, operation) in slots {
+                let mut tensor = gguf(format!("{root}.{name}"), shape, operation);
+                tensor.requirement = TensorRequirement::Optional;
+                tensor.role = eredu_checkpoint::schema::TensorRole::ArtifactMetadata;
+                common.push(tensor);
+            }
         }
         if let Some(declaration) = &spec.routed {
             let source = declaration

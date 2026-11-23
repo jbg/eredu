@@ -105,7 +105,7 @@ where
     N::Transfer: ResidencyTransferOrdering<<B::Tensor as Tensor>::Context, Error = N::Error>,
 {
     type Residency = ResidencyDriver<N>;
-    type Acquisition = BankTransfer<N::Transfer>;
+    type Acquisition = BankTransfer<D::Loan>;
     type Report = ResidencyReport;
     type Error = D::Error;
 
@@ -113,13 +113,20 @@ where
         self.descriptor.member_bytes(key)
     }
 
+    fn begin_consumption(
+        &self,
+        acquisition: BankTransfer<N::Transfer>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Acquisition, D::Error> {
+        acquisition.begin_loan(|transfer| D::begin_loan(transfer, context))
+    }
+
     fn complete(
         &mut self,
-        acquisition: BankTransfer<N::Transfer>,
+        acquisition: Self::Acquisition,
         output: &B::Tensor,
-        _: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), D::Error> {
-        D::begin_loan(acquisition.transfer)?.finish(output)
+        acquisition.transfer.finish(output)
     }
 
     fn report(&self) -> Result<ResidencyReport, D::Error> {
@@ -156,7 +163,7 @@ where
 
     fn rows(
         &mut self,
-        acquisition: BankTransfer<N::Transfer>,
+        acquisition: Self::Acquisition,
         spec: &RowLookupSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, D::Error> {
@@ -166,7 +173,7 @@ where
             ))
             .into());
         }
-        let mut loan = D::begin_loan(acquisition.transfer)?;
+        let mut loan = acquisition.transfer;
         let rows = self.decoder.decode(
             &mut loan,
             self.range.binding(),

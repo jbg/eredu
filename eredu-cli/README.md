@@ -27,9 +27,8 @@ the CLI uses the system temporary directory. The loader creates the cache
 directory when it first needs a prepared file. Set both
 `--prepared-cache-dir` and `--prepared-cache-bytes` to override the policy.
 
-The default device is `gpu:0` when the executable is built with CUDA or Apple
-MLX, and `cpu` for CPU-only MLX builds on Linux and Windows. Pin a device and
-select a sampling policy with command-line options:
+MLX defaults to a discovered GPU, then CPU. Candle defaults to CPU. Pin a
+device and select a sampling policy with command-line options:
 
 ```sh
 eredu --model /path/to/model --device cpu \
@@ -48,10 +47,27 @@ On supported CUDA hosts, disabling the default features and enabling `cuda`
 replaces the default Metal/Accelerate backend selection instead of combining
 native backends.
 
-The `mlx` feature makes the executable available. The `metal` and `cuda`
-features both imply `mlx`, while `nccl` implies `cuda`. A bare
-`--no-default-features` package check is supported but intentionally does not
-build or install an `eredu` executable.
+The executable requires the `mlx` or `candle` feature. For a Candle CPU build,
+use:
+
+```sh
+cargo run -p eredu-cli --no-default-features --features candle -- \
+  --backend candle --device cpu --model /path/to/model.gguf "Tell me about the ocean."
+```
+
+Add `candle-metal` or `candle-cuda` to use `--device metal:0` or `--device cuda:0`
+on a supported host. With both backends enabled, the text CLI defaults to MLX.
+Candle external drafts use the target context by default. With `candle-metal`,
+`--device metal:0 --speculative-draft-device cpu` keeps the draft on CPU, and
+`--device cpu --speculative-draft-device metal:0` puts the draft on Metal.
+An explicit device creates a separate context even when both devices match.
+Use `--features candle,realtime` for the Candle audio subcommands. Add `candle-metal` and pass `--device metal:0`
+to select Metal for finite audio tasks and duplex realtime speech.
+In a build with both backends, use `eredu audio --backend candle …` to select
+Candle. The `--decisions` command supports Candle and MLX.
+
+The `metal` and `cuda` features select MLX accelerators, and `nccl` implies
+`cuda`. A bare `--no-default-features` build omits the executable.
 
 Converted checkpoints can select independently admitted tower sources with
 `--vision-companion DIRECTORY` and `--audio-companion DIRECTORY`. For example,
@@ -338,7 +354,9 @@ Build with `realtime,system-audio` for microphone/speaker conversations; both
 features are enabled by default. `system-audio` uses CPAL's native platform host.
 Linux builds require the host audio development libraries used by CPAL (normally
 ALSA). A WAV-only build uses `--no-default-features --features mlx,metal,realtime`
-on Apple silicon. CUDA hosts use `--no-default-features --features cuda,realtime,system-audio`.
+on Apple silicon. Use `candle-metal,realtime` with
+`--backend candle --device metal:0` for Candle WAV replay. CUDA hosts using
+MLX use `--no-default-features --features cuda,realtime,system-audio`.
 
 System-audio builds include WebRTC echo cancellation and require Meson, Ninja,
 a C/C++ toolchain and `rustup component add llvm-tools-preview`. On macOS,

@@ -413,6 +413,7 @@ pub struct ControlledGenerationSession<
     cursor: CommittedGenerationCursor,
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     lifecycle: GenerationLifecycle,
+    prompt_cache: Option<(String, super::prompt_cache::PromptCacheRun<'a, B, S>)>,
     delivery: Delivery,
 }
 
@@ -497,6 +498,37 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
     pub fn emitted_bytes(&self) -> u64 {
         self.delivery.budget.emitted_bytes()
     }
+    /// Automatic cache activity for the active root run, when eligible.
+    pub fn prompt_cache_stats(&self) -> Option<&super::PromptCacheStats> {
+        self.prompt_cache
+            .as_ref()
+            .filter(|(run_id, _)| *run_id == self.delivery.template.run_id)
+            .map(|(_, cache)| &cache.stats)
+    }
+
+    fn publish_prompt_cache(&mut self) -> Result<(), ControlledGenerationError> {
+        if self.cancellation_requested()
+            || self.state.position().committed_tokens != 0
+            || !self.state.is_prefill_pending()
+        {
+            return Ok(());
+        }
+        let Some((run_id, cache)) = &mut self.prompt_cache else {
+            return Ok(());
+        };
+        if self.delivery.template.run_id == *run_id
+            && cache.publication_due(
+                self.state.position().execution_step,
+                &self.delivery.cancellation,
+            )
+        {
+            let mut boundary = self.state.boundary(&mut self.driver)?;
+            let (runtime, _, _) = boundary.mechanism_parts();
+            cache.publish(runtime, &self.delivery.cancellation)?;
+        }
+        Ok(())
+    }
+
     /// Known logical mutable semantic/decoding/history storage at this boundary.
     /// Excludes native state, constraints, and shared immutable tokenizer data.
     /// Unknown custom parser/decoder costs remain explicit.
@@ -762,6 +794,11 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
             Ok(())
         })();
         self.finish_record_delivery(local)?;
+        if let Err(error) = self.publish_prompt_cache() {
+            self.lifecycle.fail();
+            self.state.finish_decoding();
+            return Err(error);
+        }
         Ok(self.status())
     }
 
@@ -960,9 +997,6 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>> LoadedMod
         let preparation_started = Instant::now();
         use eredu_core::run_preparation::TextPreparationStage as Stage;
         let host = (|| {
-            if self.prompt_cache_store.is_some() {
-                return Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store before starting a controlled run".into()).into());
-            }
             if prepared.session_identity != self.session_identity {
                 return Err(CaptureError::Invalid(
                     "prepared request belongs to another loaded session".into(),
@@ -1109,9 +1143,35 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>> LoadedMod
                 .finish_text_preparation(Stage::Request, host, |error| {
                     PreparedChatError::Backend(error).into()
                 })?;
+        let cache_eligible =
+            prepared.prompt.is_none() && delivery.template.parameter_overlay_id.is_none();
+        #[cfg(feature = "tensor-capture")]
+        let cache_eligible =
+            cache_eligible && prepared.plan.is_empty() && prepared.intervention.is_none();
+        let prompt_cache = match &self.prompt_cache_store {
+            Some(cache) if cache_eligible => cache
+                .prepare(
+                    &mut self.runtime,
+                    &config,
+                    &prepared.prompt_token_ids,
+                    &delivery.cancellation,
+                )?
+                .map(|cache| (delivery.template.run_id.clone(), cache)),
+            _ => None,
+        };
+        let reused = prompt_cache
+            .as_ref()
+            .map_or(0, |(_, cache)| cache.stats.reused_tokens);
         let prompt = match prepared.prompt {
             Some(prompt) => Ok(prompt),
-            None => S::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids),
+            None => S::prepare_text_prompt(
+                self.runtime.backend(),
+                if reused == 0 {
+                    prepared.prompt_token_ids
+                } else {
+                    prepared.prompt_token_ids[reused..].to_vec()
+                },
+            ),
         }
         .map_err(|error| PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error)));
         let prompt = self.runtime.finish_text_preparation(
@@ -1168,6 +1228,7 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>> LoadedMod
             cursor,
             pipeline,
             lifecycle: GenerationLifecycle::default(),
+            prompt_cache,
             delivery,
         })
     }

@@ -3,10 +3,9 @@
 use crate::text_session_driver::TextSessionResourcesFor;
 use eredu_core::refinement::RefinementBackend;
 
-use std::{
-    num::{NonZeroU32, NonZeroUsize},
-    sync::Arc,
-};
+use std::num::{NonZeroU32, NonZeroUsize};
+#[cfg(feature = "tensor-capture")]
+use std::sync::Arc;
 
 mod block;
 use block::BlockTextDriver;
@@ -22,16 +21,21 @@ use super::{
     causal::{CausalPrefillDriver, CausalTextMechanisms},
     TextAdvanceRoute, TextExecutable, TextModeState, TextSessionDriver,
 };
-use crate::{capture::CaptureSession, speculative::shared_backbone::SharedBackboneMechanisms};
+#[cfg(feature = "tensor-capture")]
+use crate::capture::CaptureSession;
+use crate::speculative::shared_backbone::SharedBackboneMechanisms;
 use eredu_core::{
     backend::TextOperationDriver,
+    decoding::{DecodingCoordination, DecodingMode, DecodingModeError},
+    BackendFailure, ExpertCacheTelemetry, GenerationError, ResidencyTelemetry, TextOperationKind,
+};
+#[cfg(feature = "tensor-capture")]
+use eredu_core::{
     capture::{
         AdmittedCapturePlan, CaptureDeclarations, CaptureDiscovery, CaptureError,
         CaptureInvocationBounds, CaptureRequestShape, CapturedStep,
     },
-    decoding::{DecodingCoordination, DecodingMode, DecodingModeError},
     intervention::{AdmittedInterventionPlan, InterventionDiscovery},
-    BackendFailure, ExpertCacheTelemetry, GenerationError, ResidencyTelemetry, TextOperationKind,
 };
 
 type Input<B> = PendingTextInput<
@@ -187,18 +191,7 @@ where
             .as_ref()
             .block_refinement_geometry()
             .ok_or(RefinementReadoutError::Unsupported)?;
-        if selections.is_empty()
-            || selections.iter().any(|selection| {
-                selection.position >= geometry.canvas_length.get()
-                    || selection.token_ids.is_empty()
-                    || selection
-                        .token_ids
-                        .iter()
-                        .any(|&id| id >= geometry.vocabulary_size.get())
-            })
-        {
-            return Err(RefinementReadoutError::Geometry);
-        }
+        geometry.validate_readout(&selections)?;
         state.readout_selection = Some(selections);
         state.readout_rows = None;
         Ok(())
@@ -298,11 +291,7 @@ where
     }
 
     fn expert_cache_telemetry(&self) -> Result<Option<ExpertCacheTelemetry>, BackendFailure> {
-        self.parameter_bank_report()
-            .map(|report| report.map(super::operations::expert_cache_telemetry))
-            .map_err(|error| {
-                BackendFailure::from_error(error).with_operation("expert-cache telemetry")
-            })
+        self.text_expert_cache_telemetry()
     }
 
     #[cfg(feature = "tensor-capture")]
@@ -405,14 +394,6 @@ where
         state: &mut State<B>,
     ) -> Result<bool, B::Error> {
         <Self as CausalPrefillDriver<B>>::prefill_prefix(runtime, prompt, max_tokens, state)
-    }
-
-    fn complete_text_prefill(
-        runtime: &mut ModelRuntime<B, Self>,
-        prompt: crate::text_session_driver::TextPromptFor<B>,
-        state: &mut State<B>,
-    ) -> Result<bool, B::Error> {
-        <Self as CausalPrefillDriver<B>>::complete_prefill(runtime, prompt, state)
     }
 
     fn coordinate_decoding_control(

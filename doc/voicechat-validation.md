@@ -218,47 +218,15 @@ execution.
 
 ### Released-checkpoint single-device execution
 
-The resident F32 measurement dated 2026-10-05 uses the resident WAV driver on
-Apple M3 Ultra with 256 GiB unified memory, macOS 26.6.2 and Metal. The official checkpoint is
-44,382,749,892 bytes, SHA-256
-`d553750c29434a6bb524377e17634c6cafdbf621892e643a77f406e51570354b`, at the pinned
-revision above. Auxiliary asset digests pass ordinary preparation. Input is
-`examples/speechlm2/sample_audio/sample_general.wav` from Speech revision
-`097dfe9e2f55baf653b83035868bdc89849f1b47`, SHA-256
-`481f422a961fb160ddeba9824d55cb7c190c57acb7dc1730a2d595fd078dcb04`:
-249,734 mono PCM16 samples at 16 kHz.
-
-The configuration above uses `device="gpu"`, `max_frames=512`,
-`max_model_steps=1024`, `max_total_copy_bytes=1099511627776`, seed zero, resident
-parameters and the same system prompt. The cumulative copy ceiling is an admission
-budget, not simultaneously allocated memory. Artifacts and run outputs reside in
-`/private/tmp/eredu-voicechat-reference` outside the repository.
-
-```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
-/usr/bin/time -l target/debug/eredu audio realtime --offline --no-playback \
-  --config /private/tmp/eredu-voicechat-reference/voicechat.json \
-  --input /private/tmp/eredu-voicechat-reference/input-general.wav \
-  --output /private/tmp/eredu-voicechat-reference/speech-2.wav \
-  --events /private/tmp/eredu-voicechat-reference/events-2.jsonl \
-  --chunk-samples 640 --tail-frames 200 --max-steps 2000
-```
-
-The run commits eight prompt positions, 396 audio frames (including 200 declared
-silence frames), 404 total backbone positions, and terminal drain. It publishes
-24 agent-text fragments, 396 transcription events, four turn events and one
-finished event. Agent text is “Hi! How can I help you today?” followed by
-“Yes, the sky appears blue due to a phenomenon called Rayleigh scattering.”
-The observed transcription is `o do you know what color the sky is`; transcript
-accuracy has no independent comparison here.
-
-The WAV contains 698,552 contiguous float32 samples at 22.05 kHz, including an
-eight-sample codec tail: 31.68036 seconds, all finite, absolute peak 0.18182363,
-RMS 0.0078710742 and no samples outside [-1,1]. Its SHA-256 is
-`79a27903f6875dd642c57f6dcaf4c7238f9f6ce3d02923e89d81772a9fe6a4ac`.
-The retained fixture records output checks in `run-summary.json` and
-`run-2.log`. It establishes released-checkpoint execution through the public
-session, not independent complete-model reference parity or perceptual quality.
+The official F32 checkpoint at the pinned revision above has 44,382,749,892
+bytes and SHA-256
+`d553750c29434a6bb524377e17634c6cafdbf621892e643a77f406e51570354b`.
+The recorded-input fixtures use `examples/speechlm2/sample_audio/sample_general.wav`
+from NVIDIA Speech revision `097dfe9e2f55baf653b83035868bdc89849f1b47`.
+The source WAV contains 249,734 mono PCM16 samples at 16 kHz and has SHA-256
+`481f422a961fb160ddeba9824d55cb7c190c57acb7dc1730a2d595fd078dcb04`.
+See [local cross-backend controlled execution](#local-cross-backend-controlled-execution)
+for released-checkpoint frame, replay, and drain results with the shared sampler.
 
 ### Speech precision and cache contracts
 
@@ -276,34 +244,6 @@ and conversion workspace before materialization.
 
 Speech lifecycle and output accounting use the shared execution contracts.
 Independent complete-model speech precision comparisons remain a validation gap.
-
-## Conversational quality limits
-
-Correct transcription does not guarantee a relevant agent response. A clean
-Samantha-synthesized recording of "Get out from under the table, please." produces
-a sexual-content refusal under both resident Q8/F16 speech execution and
-unquantized F32 execution. Both runs recognize `get out from under the table
-please`, start agent text at 3,920 ms, and produce the same 391-character response,
-beginning `I cannot fulfill this request.` The fixed mono PCM16 fixture contains
-341,119 samples at 16 kHz, including one second of leading silence and 18 seconds
-of trailing silence. Its WAV SHA-256 is
-`b25db6092a611fae32c7626241f3f0c95fb765ebbb930b78f3ddad2fc10f6a0c`.
-
-These measurements use the pinned official checkpoint and base assets above,
-seed zero, the system prompt `You are a helpful assistant.`, Metal on M3 Ultra,
-`MLX_MAX_OPS_PER_BUFFER=25`, `MLX_MAX_MB_PER_BUFFER=256`, offline WAV input and
-`--tail-frames 0`. Q8 uses `--quantize 8 --speech-weights f16 --speech-compute f16`;
-the floating control omits quantization and uses
-`--speech-weights f32 --speech-compute f32`.
-
-Quantization and narrow speech precision are not necessary to trigger this
-fixture's false refusal. Both controls use Eredu's execution mechanisms; they
-do not establish independent complete-model parity with NVIDIA's runtime.
-[NVIDIA's known limitations](https://github.com/NVIDIA-NeMo/Speech/tree/nemotron-labs-voicechat#known-limitations)
-include irrelevant canned replies, refusal loops, agent continuations without
-new input and missing transcription even on clear audio. These published
-limitations match the observed class of behavior without proving the cause of
-every incorrect response.
 
 ## MLX Community SafeTensors validation
 
@@ -323,58 +263,34 @@ a declaration whose bit width disagrees with the physical catalog. Quantization
 covers 9,473,228,800 logical backbone/embedding/output-head parameters; speech and
 perception source weights remain BF16. No load-time quantization is applied.
 
-The retained compatibility fixtures use the M3 Ultra 80-core GPU with 256 GiB
-unified memory and the pinned mono 16 kHz input (249,734 samples, SHA-256
-`481f422a961fb160ddeba9824d55cb7c190c57acb7dc1730a2d595fd078dcb04`), followed by
-800 response-tail frames. Each timeline contains 996 live frames (79.68 seconds).
-Resident execution uses seed zero, the helpful-assistant prompt, no tools,
-640-sample input chunks and the ordinary prepared cache. Eligible speech weights
-and arithmetic use F32/F32, F16/F32, F16/F16 or BF16/BF16 policies; backbone
-recurrent and normalization arithmetic remain F32. These fixtures establish
-admission, execution and output repeatability for the retained formats and
-precision policies.
+To run a community checkpoint through the realtime CLI, set `source.path` to
+the pinned downloaded directory and choose a `speech_weights` and
+`speech_compute` policy as described above.
 
-Q8 F16/F32 produces byte-identical waveform and committed events to the Q8
-F32/F32 run. Both transcribe `o do you know what color the sky is` and answer
-`Hi! How can I help you today?Yes, the sky appears blue due to Rayleigh scattering.`
-F16/F16 preserves that assistant text but transcribes `o the sky is`; its repeated
-runs have identical waveform and events. Q4 repeats are also identical, but include
-unrelated and malformed assistant text before answering the question. Every run
-produces 1,756,952 finite float samples without clipping. These checks establish
-repeatability and the observed fixture behavior, not broad perceptual or language
-quality. Independent complete-model reference parity remains unvalidated.
+## Local cross-backend controlled execution
 
-The official NVIDIA F32 source retains exact regression parity through the same
-loader: the 396-frame fixture produces 698,552 samples with WAV SHA256
-`79a27903f6875dd642c57f6dcaf4c7238f9f6ce3d02923e89d81772a9fe6a4ac` and identical
-committed events. Focused neutral tests reject malformed affine packing and missing
-companions, and reject changed component equations. Affine function-head tests use
-independent nonzero expected logits through resident, host and disk execution and
-preserve companions during TP2 partitioning. Existing GGUF backbone admission tests
-pass with F32 sensitive-vector recipes. Native test consumers and the backend without
-native features compile; a native distributed Q4/Q8 execution run is not part of
-this evidence.
+The community 4-bit checkpoint at revision
+`dffd203fef7a380081da89479c55848e50b98413` runs with resident weights,
+device-state residency, F16 speech weights, F32 speech computation, and
+seed 7. These fixtures use the shared host sampler.
 
-Reproduction uses the ordinary configuration above with `source.path` set to the
-downloaded repository directory and `speech_weights` / `speech_compute` set to the
-selected policy. The `"f16"` / `"f32"` policy preserves the Q8 F32/F32 fixture's
-waveform and committed events.
+| Input fixture | Placements | Result |
+| --- | --- | --- |
+| One silent 1,280-sample input frame | Candle CPU, Candle Metal, MLX Metal | 31/31 codec IDs agree. Maximum pairwise PCM difference is `1.01e-9`. |
+| Frame 23 of the pinned 16 kHz NVIDIA `sample_general.wav`, empty system prompt | Candle CPU, Candle Metal, MLX Metal | Candle Metal restore and fork reproduce all 31 codec IDs and 1,764 PCM samples bit for bit. Candle CPU and MLX Metal agree on all 31 codec IDs with a maximum PCM difference of `8.01e-10`. |
+| Sustained recorded speech | Candle CPU, MLX Metal | Both commit 81 live frames and drain an eight-sample codec tail. Turn events, delivered text, frame attribution, and consumed input agree. The 142,892 output samples differ by at most `4.89e-6` with relative L2 `1.35e-5`. |
+| Recorded speech with overlap | Candle CPU, MLX Metal | Both commit an interruption at live frame 21 and drain the codec. Maximum absolute PCM difference is `2.89e-6`. |
 
-```sh
-hf download mlx-community/NemotronLabs-VoiceChat-11B-8bit \
-  --revision 446fc83f6cde720e7fd9ad7e29d7acb3adbb8967 \
-  --local-dir /models/voicechat-community-8bit
-cargo build --release -p eredu-cli --no-default-features --features mlx,realtime,metal
-MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
-  target/release/eredu audio realtime --offline --no-playback --config voicechat-community.json \
-  --input input-general.wav --output speech.wav --events events.jsonl \
-  --chunk-samples 640 --tail-frames 800 --max-steps 2000
-```
+Use zero-based 80 ms frames 10–26 and 101–148 from the recording for the
+sustained case, followed by 16 continuation frames. The end-of-utterance
+thresholds are eight frames and the interruption threshold is three frames.
+Snapshot with four input frames queued, advance four commits without delivery,
+and compare restored execution with an isolated fork. Both backends replay
+the four publications bit for bit within their own placement.
 
-Pinned catalogs, full shard hashes, configuration files, audio, committed event
-records and binary digests are retained in `/private/tmp/eredu-mlx-compat` on the
-validation host.
-
+For the overlap fixture, start the second excerpt at source frame 103 just
+as the agent begins, with six frames of lookback and a one-frame interruption
+threshold.
 
 ## Numerical acceptance
 

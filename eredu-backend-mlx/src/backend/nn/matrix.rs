@@ -1,4 +1,5 @@
 //! Reduced-precision row projections with a complete FP32 reduction.
+use eredu_nn::arithmetic::{bf16_row_block_ends, Bf16DotGeometry};
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 use safemlx::Dtype;
 use safemlx::{error::Exception, Array, Stream};
@@ -14,27 +15,29 @@ pub(crate) enum BatchedDotReduction {
     Sequential,
 }
 
-pub(crate) fn batched_dot_reduction(
-    rows: u64,
-    width: u64,
-    columns: u64,
-    large: BatchedDotReduction,
-) -> BatchedDotReduction {
-    if rows > 0
-        && width > 0
-        && columns > 0
-        && rows.saturating_mul(width).saturating_mul(columns) < 400
-    {
-        BatchedDotReduction::Sequential
-    } else {
-        large
+impl BatchedDotReduction {
+    pub(crate) fn for_scores(geometry: Bf16DotGeometry) -> Self {
+        if geometry.uses_sequential() {
+            Self::Sequential
+        } else {
+            Self::Row32
+        }
+    }
+
+    pub(crate) fn for_native_values(geometry: Bf16DotGeometry) -> Self {
+        if geometry.uses_sequential() {
+            Self::Sequential
+        } else {
+            Self::Native
+        }
     }
 }
 
 fn row_dot(width: usize, product: impl Fn(usize) -> f32) -> f32 {
+    let [block_end, tail_end] = bf16_row_block_ends(width);
     let mut k = 0;
     let mut lanes = [0.0_f32; 32];
-    while k + 32 <= width {
+    while k < block_end {
         for lane in 0..32 {
             lanes[lane] += product(k + lane);
         }
@@ -47,7 +50,7 @@ fn row_dot(width: usize, product: impl Fn(usize) -> f32) -> f32 {
     }
     let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
     let mut tail = [0.0_f32; 4];
-    while k + 8 <= width {
+    while k < tail_end {
         for lane in 0..4 {
             tail[lane] += product(k + lane);
             tail[lane] += product(k + lane + 4);
@@ -252,24 +255,11 @@ fn ordered_bf16_affine(
         for column in 0..columns {
             let product =
                 |k: usize| left[row * width + k].to_f32() * right[column * width + k].to_f32();
-            let mut k = 0;
-            let mut sum;
-            if columns_order {
-                let mut sums = [0.0_f32; 4];
-                while k + 4 <= width {
-                    for lane in 0..4 {
-                        sums[lane] += product(k + lane);
-                    }
-                    k += 4;
-                }
-                while k < width {
-                    sums[0] += product(k);
-                    k += 1;
-                }
-                sum = ((sums[0] + sums[1]) + sums[2]) + sums[3];
+            let mut sum = if columns_order {
+                eredu_nn::arithmetic::bf16_channel_dot(width, product)
             } else {
-                sum = row_dot(width, product);
-            }
+                row_dot(width, product)
+            };
             if let Some(bias) = bias {
                 sum += bias[column];
             }

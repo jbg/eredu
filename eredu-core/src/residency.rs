@@ -858,8 +858,8 @@ impl AllocatorMemoryMetrics {
 /// Optional process-level memory and page-fault observations.
 ///
 /// Individual values are absent when they cannot be obtained safely on the
-/// current platform. The built-in sampler currently reads Linux `/proc`; it
-/// makes no availability guarantee on Apple or Windows targets.
+/// current platform. The process RSS probe is portable; page faults are
+/// read from Linux `/proc` when available.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcessMetrics {
     rss_bytes: Option<u64>,
@@ -904,16 +904,7 @@ pub fn sample_process_metrics() -> ProcessMetrics {
 
 #[cfg(target_os = "linux")]
 fn platform_process_metrics() -> ProcessMetrics {
-    let rss_bytes = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status.lines().find_map(|line| {
-                let value = line.strip_prefix("VmRSS:")?.trim();
-                let kibibytes = value.strip_suffix("kB")?.trim().parse::<u64>().ok()?;
-                kibibytes.checked_mul(1024)
-            })
-        });
-
+    let rss_bytes = crate::host_memory::process_rss_bytes();
     let faults = std::fs::read_to_string("/proc/self/stat")
         .ok()
         .and_then(|stat| {
@@ -933,7 +924,7 @@ fn platform_process_metrics() -> ProcessMetrics {
 
 #[cfg(not(target_os = "linux"))]
 fn platform_process_metrics() -> ProcessMetrics {
-    ProcessMetrics::default()
+    ProcessMetrics::new(crate::host_memory::process_rss_bytes(), None, None)
 }
 
 /// Mutable, single-threaded offload telemetry collector.
@@ -954,7 +945,7 @@ pub struct OffloadTelemetry {
     tier_prefetch: [PrefetchMetrics; 3],
     evictions: EvictionMetrics,
     tier_evictions: [EvictionMetrics; 3],
-    allocator_memory: Option<AllocatorMemoryMetrics>,
+    allocator_memory: Option<crate::AllocatorTelemetry>,
     process: ProcessMetrics,
     process_sampled: bool,
 }
@@ -1044,7 +1035,7 @@ impl OffloadTelemetry {
     }
 
     /// Records an allocator sample supplied by the selected backend.
-    pub fn record_allocator_memory(&mut self, metrics: AllocatorMemoryMetrics) {
+    pub fn record_allocator_memory(&mut self, metrics: crate::AllocatorTelemetry) {
         self.allocator_memory = Some(metrics);
     }
 
@@ -1073,7 +1064,7 @@ impl OffloadTelemetry {
             tier_prefetch: self.tier_prefetch,
             evictions: self.evictions,
             tier_evictions: self.tier_evictions,
-            allocator_memory: self.allocator_memory,
+            allocator_memory: self.allocator_memory.clone(),
             process: self.process,
             process_sampled: self.process_sampled,
             parameter_conversion_retention: unreported_conversion_retention(),
@@ -1099,7 +1090,7 @@ pub struct OffloadReport {
     tier_prefetch: [PrefetchMetrics; 3],
     evictions: EvictionMetrics,
     tier_evictions: [EvictionMetrics; 3],
-    allocator_memory: Option<AllocatorMemoryMetrics>,
+    allocator_memory: Option<crate::AllocatorTelemetry>,
     process: ProcessMetrics,
     process_sampled: bool,
     #[serde(default = "unreported_conversion_retention")]
@@ -1181,8 +1172,8 @@ impl OffloadReport {
     }
 
     /// Returns the latest backend allocator sample, if one was recorded.
-    pub const fn allocator_memory(&self) -> Option<AllocatorMemoryMetrics> {
-        self.allocator_memory
+    pub fn allocator_memory(&self) -> Option<&crate::AllocatorTelemetry> {
+        self.allocator_memory.as_ref()
     }
 
     /// Returns the latest optional process sample.
@@ -1927,7 +1918,7 @@ impl ResidencyLedger {
     }
 
     /// Records a backend allocator observation.
-    pub fn record_allocator_memory(&mut self, metrics: AllocatorMemoryMetrics) {
+    pub fn record_allocator_memory(&mut self, metrics: crate::AllocatorTelemetry) {
         self.telemetry.record_allocator_memory(metrics);
     }
 
@@ -2415,7 +2406,7 @@ mod tests {
         telemetry.record_prefetch_stall(Duration::from_millis(4));
         telemetry.record_tier_eviction(MemoryTier::Device, 3);
         telemetry.record_tier_eviction(MemoryTier::Host, 4);
-        telemetry.record_allocator_memory(AllocatorMemoryMetrics::new(11, 12, 13));
+        telemetry.record_allocator_memory(AllocatorMemoryMetrics::new(11, 12, 13).into());
         telemetry.record_process_metrics(ProcessMetrics::new(Some(14), Some(15), Some(16)));
 
         let report = telemetry.snapshot();
@@ -2441,7 +2432,7 @@ mod tests {
         assert_eq!(report.tier_prefetch(MemoryTier::Host).misses(), 1);
         assert_eq!(report.tier_evictions(MemoryTier::Device).bytes(), 3);
         assert_eq!(report.tier_evictions(MemoryTier::Host).bytes(), 4);
-        assert_eq!(report.allocator_memory().unwrap().peak_bytes(), 13);
+        assert_eq!(report.allocator_memory().unwrap().peak_bytes, Some(13));
         assert_eq!(report.process_metrics().rss_bytes(), Some(14));
         assert!(report.process_sampled());
     }
@@ -2910,6 +2901,9 @@ pub trait ParameterLoan<T, C: ?Sized> {
     /// Gives the caller a handle to the supplied binding on its selected queue.
     fn copy_binding(&mut self, binding: &str, context: &C) -> Result<T, Self::Error>;
 
+    /// Pins a native tensor used by this loan's consumer.
+    fn retain(&mut self, tensor: &T);
+
     /// Settles exact consumption of the loan and then releases its native pins.
     fn finish(self, output: &T) -> Result<(), Self::Error>;
 }
@@ -2956,7 +2950,7 @@ pub trait NativeBankMechanisms:
     fn host_capacity_exhausted(error: &Self::Error) -> bool;
     /// Retains a handle to one exact source slot protected by this acquisition.
     fn member(
-        transfer: &Self::Transfer,
+        loan: &Self::Loan,
         index: usize,
         name: &str,
     ) -> Result<<Self::Backend as eredu_nn::NeuralBackend>::Tensor, Self::BankError>;
@@ -2972,7 +2966,10 @@ pub trait NativeBankMechanisms:
         context: &<<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<<Self::Backend as eredu_nn::NeuralBackend>::Tensor, Self::BankError>;
     /// Opens native retention for the acquired and ordered transfer.
-    fn begin_loan(transfer: Self::Transfer) -> Result<Self::Loan, Self::BankError>;
+    fn begin_loan(
+        transfer: Self::Transfer,
+        context: &<<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self::Loan, Self::BankError>;
     /// Combines completed read copies into a caller-owned tensor.
     fn assemble_members(
         copies: Vec<<Self::Backend as eredu_nn::NeuralBackend>::Tensor>,

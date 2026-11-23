@@ -3,8 +3,10 @@ use super::*;
 
 mod origins;
 mod partition;
+mod readout;
 pub use origins::{RoutedUnitOrigin, RoutedUnitOrigins};
 pub use partition::{PartitionRoutedUnitCaptureRequest, PartitionRoutedUnitCaptureSource};
+pub use readout::{capture_routed_units, routed_unit_locations, RoutedReadout};
 
 /// Retained placement for one sparse producer. These host facts describe
 /// ownership; creating or deserializing them grants no execution authority.

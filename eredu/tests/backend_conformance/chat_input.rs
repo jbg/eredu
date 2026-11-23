@@ -1,12 +1,15 @@
 use super::*;
+#[cfg(feature = "tensor-capture")]
+use eredu::api::TraceLimits;
 use eredu::api::{
     ChatContentFormat, ChatInputPreparationError, ChatInputRequest, ChatMessage, ChatPart,
-    ChatPreparationOptions, ChatToolArgumentFormat, ChatToolCall, TraceLimits,
+    ChatPreparationOptions, ChatToolArgumentFormat, ChatToolCall,
 };
 #[cfg(feature = "tensor-capture")]
 use eredu_core::capture::CapturePlan;
 use eredu_core::MediaRequestError;
 use serde_json::json;
+#[cfg(feature = "tensor-capture")]
 use std::ops::ControlFlow;
 
 const CONTENT: &str = "{% for message in messages %}{{ message.content }}{% endfor %}";
@@ -38,6 +41,7 @@ fn settings() -> PreparedChatGenerationSettings {
     }
 }
 
+#[cfg(feature = "tensor-capture")]
 fn limits() -> TraceLimits {
     TraceLimits {
         per_record_bytes: 65536,

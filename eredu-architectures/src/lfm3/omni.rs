@@ -8,9 +8,12 @@ use eredu_nn::{Error, Tensor};
 use serde_json::Value;
 
 #[cfg(feature = "audio")]
-use super::vision::{PreparedVisionExecution, VisionPromptAdmission};
 use super::{
-    audio::{AdmittedAudioGguf, ArtifactError, BindingSource, PreparedAudio, ProcessorConfig},
+    audio::BindingSource,
+    vision::{PreparedVisionExecution, VisionPromptAdmission},
+};
+use super::{
+    audio::{AdmittedAudioGguf, ArtifactError, PreparedAudio, ProcessorConfig},
     projected_prompt::ProjectedPrompt,
     vision::{Declaration, MediaTokens, ProjectorConfig},
 };
@@ -85,9 +88,13 @@ pub(super) fn vision_tokens(
 /// Retained Omni checkpoint with shared language, speech and vision sources.
 pub struct PreparedOmni {
     speech: PreparedAudio,
+    #[cfg(feature = "audio")]
     vision: Declaration,
+    #[cfg(feature = "audio")]
     vision_weights: BindingSource,
+    #[cfg(feature = "audio")]
     gguf: bool,
+    #[cfg(feature = "audio")]
     processor: QwenProcessorPlan,
     tokens: MediaTokens,
     placeholders: [String; 3],
@@ -145,7 +152,7 @@ impl PreparedOmni {
             &source["feature_extractor"],
             "Lfm3OmniFeatureExtractor",
         )?;
-        let (speech, vision_weights) = match gguf {
+        let (speech, _vision_weights) = match gguf {
             Some((backbone, projector, prepared_cache)) => {
                 let admitted =
                     AdmittedAudioGguf::open_multimodal(backbone, projector, Some(&vision))?;
@@ -226,9 +233,13 @@ impl PreparedOmni {
         ];
         Ok(Self {
             speech,
+            #[cfg(feature = "audio")]
             vision,
-            vision_weights: vision_weights.expect("vision plan was supplied"),
+            #[cfg(feature = "audio")]
+            vision_weights: _vision_weights.expect("vision plan was supplied"),
+            #[cfg(feature = "audio")]
             gguf: gguf.is_some(),
+            #[cfg(feature = "audio")]
             processor,
             tokens,
             placeholders,
@@ -305,6 +316,7 @@ impl PreparedOmni {
 /// Portable Omni video framing and soundtrack alignment.
 #[cfg(feature = "audio")]
 struct OmniVideoPrompt {
+    #[cfg(feature = "audio")]
     processor: QwenProcessorPlan,
     tokens: MediaTokens,
     audio_token: i32,

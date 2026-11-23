@@ -49,7 +49,30 @@ pub(super) fn transfer_prompt_block<M: LiveCacheBackend>(
     })
 }
 
-fn transfer_prompt_state<M: LiveCacheBackend>(
+pub(crate) fn import_prompt_block<M: LiveCacheBackend>(
+    block: &PromptCacheBlock,
+    source: &dyn PromptCacheShardPayload,
+    stream: &Queue<M>,
+) -> Result<[M::Tensor; 2], CacheResidencyError> {
+    let host = transfer_prompt_block::<M>(block, source)?;
+    let [(first, a), (second, b)] = M::copy_to_device(host.buffers(), stream)?;
+    let first_ready = M::synchronize(a);
+    let second_ready = M::synchronize(b);
+    first_ready?;
+    second_ready?;
+    Ok([first, second])
+}
+
+pub(crate) fn native_prompt_layout<M: LiveCacheBackend>(
+    array: &M::Tensor,
+) -> Result<PromptCacheTensorLayout, CacheResidencyError> {
+    Ok(PromptCacheTensorLayout::new(
+        M::shape(array).to_vec(),
+        dtype_name(M::dtype(array))?.to_owned(),
+    )?)
+}
+
+pub(crate) fn transfer_prompt_state<M: LiveCacheBackend>(
     state: &PromptCacheStateTensor,
     source: &dyn PromptCacheShardPayload,
     stream: &Queue<M>,
@@ -240,6 +263,27 @@ enum CacheBuffers<M: LiveCacheBackend> {
 /// Completed host-transfer buffers in portable inventory order.
 pub struct CachePayload<M: LiveCacheBackend>(CacheBuffers<M>);
 
+impl<M: LiveCacheBackend> CachePayload<M> {
+    pub(crate) fn transfer_block(
+        arrays: [&M::Tensor; 2],
+        queue: &Queue<M>,
+    ) -> Result<Self, BackendFailure> {
+        let buffers = M::copy_to_host(arrays, queue)?;
+        Ok(Self(CacheBuffers::Block(HostCacheBlock {
+            representation: CacheRepresentation::KeyValue,
+            buffers,
+        })))
+    }
+
+    pub(crate) fn transfer_state(
+        tensor: &M::Tensor,
+        queue: &Queue<M>,
+    ) -> Result<Self, BackendFailure> {
+        let [host] = M::copy_to_host([tensor], queue)?;
+        Ok(Self(CacheBuffers::State(host)))
+    }
+}
+
 impl<M: LiveCacheBackend> PromptCachePayload for CachePayload<M> {
     fn bytes(&self) -> Result<Vec<&[u8]>, BackendFailure> {
         match &self.0 {
@@ -291,8 +335,7 @@ impl<M: LiveCacheBackend> PromptCacheExport for CacheExport<M> {
         .map_err(BackendFailure::from_error)
     }
     fn transfer_state(&self, index: usize) -> Result<CachePayload<M>, BackendFailure> {
-        let [host] = M::copy_to_host([&self.states[index].array], &self.stream)?;
-        Ok(CachePayload(CacheBuffers::State(host)))
+        CachePayload::transfer_state(&self.states[index].array, &self.stream)
     }
     fn record_publication(&self, logical_bytes: u64) {
         if let Ok(mut state) = self.manager.lock() {
@@ -349,10 +392,7 @@ impl<M: LiveCacheBackend> CacheResidencyManager<M> {
                 Ok(PromptCacheExportState {
                     owner: state.owner,
                     role: state.role,
-                    tensor: PromptCacheTensorLayout::new(
-                        M::shape(&state.array).to_vec(),
-                        dtype_name(M::dtype(&state.array))?.to_owned(),
-                    )?,
+                    tensor: native_prompt_layout::<M>(&state.array)?,
                 })
             })
             .collect::<Result<Vec<_>, CacheResidencyError>>()?;

@@ -10,6 +10,8 @@
 
 #![forbid(unsafe_code)]
 
+/// Activation quantization for packed dot products.
+pub mod activation;
 mod block_decode;
 mod catalog;
 mod codebook;
@@ -18,10 +20,11 @@ mod error;
 mod format;
 mod iquant;
 mod iquant_tables;
+pub mod packed_dot;
 mod reader;
 mod writer;
 
-pub use block_decode::BlockDecoder;
+pub use block_decode::{unpack_k_scale_min, BlockDecoder, PackedRows};
 pub use catalog::{
     CatalogShard, CatalogTensor, Checkpoint, CheckpointHeader, ConvertedCheckpointTensor,
     ConvertedTensorIter, LinearCompanion, LinearCompanionKind, LogicalDtype, LogicalTensorLayout,
@@ -29,8 +32,8 @@ pub use catalog::{
 };
 pub use codebook::IQuantCodebook;
 pub use convert::{
-    convert_affine, AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor,
-    MxFp4Tensor,
+    affine_layout, convert_affine, AffineTensor, ConvertedTensor, DenseDtype, DenseTensor,
+    IQuantTensor, MxFp4Tensor,
 };
 pub use error::{Error, Result};
 pub use format::{
@@ -41,3 +44,6 @@ pub use reader::{
     TensorSelection, TensorSelectionPlan,
 };
 pub use writer::{TensorInput, Writer, WriterOptions};
+
+/// Canonical bit fields and microscaling values for packed word layouts.
+pub mod packed_words;

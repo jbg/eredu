@@ -324,21 +324,66 @@ where
                 prompt,
                 fragment_identity,
             } => {
-                let (input, identity) = Self::composite_invocation_input(match prompt {
-                    Ok(ref prompt) => Ok(prompt),
-                    Err(error) => Err(error),
+                let prompt = prompt.and_then(|mut prompt| {
+                    let boundaries = self
+                        .session
+                        .resident_composite_prefill_boundaries(&self.ingress.admission, &prompt)?;
+                    if let Some(identity) = fragment_identity {
+                        prompt.2 = identity;
+                    }
+                    Ok((prompt, boundaries))
                 });
-                self.session.prefill_input_final_position_with_identity(
-                    input,
-                    fragment_identity.unwrap_or_else(|| identity.cloned()),
-                    context,
-                )
+                match prompt {
+                    Ok((prompt, boundaries)) if !boundaries.is_empty() => self
+                        .session
+                        .prefill_composite_spans(prompt, boundaries, true, context, observer),
+                    Ok((prompt, _)) => {
+                        let (input, identity) = Self::composite_invocation_input(Ok(&prompt));
+                        self.session.prefill_input_final_position_with_identity(
+                            input,
+                            identity.cloned(),
+                            context,
+                        )
+                    }
+                    Err(error) => self.session.prefill_input_final_position_with_identity(
+                        Err(error),
+                        None,
+                        context,
+                    ),
+                }
             }
             CompositeTextInvocation::Prefill {
                 prompt,
                 capture,
                 prediction,
             } => {
+                let prompt = prompt.and_then(|prompt| {
+                    let boundaries = self
+                        .session
+                        .resident_composite_prefill_boundaries(&self.ingress.admission, &prompt)?;
+                    if !boundaries.is_empty() {
+                        if prediction {
+                            return Err(eredu_nn::Error::backend_source(
+                                ChunkedPrefillContextError::Prediction,
+                            ));
+                        }
+                        if capture.is_some() {
+                            return Err(eredu_nn::Error::backend_source(
+                                ChunkedPrefillContextError::CaptureGeometry,
+                            ));
+                        }
+                    }
+                    Ok((prompt, boundaries))
+                });
+                let prompt = match prompt {
+                    Ok((prompt, boundaries)) if !boundaries.is_empty() => {
+                        return self
+                            .session
+                            .prefill_composite_spans(prompt, boundaries, false, context, observer);
+                    }
+                    Ok((prompt, _)) => Ok(prompt),
+                    Err(error) => Err(error),
+                };
                 let planned = prompt.and_then(|prompt| {
                     let admitted = &prompt.1;
                     if let Some(request) = capture {

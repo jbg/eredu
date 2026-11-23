@@ -1,3 +1,4 @@
+use super::super::arithmetic::metal_arithmetic_header;
 use safemlx::{
     error::Exception,
     fast::{CustomKernelConfig, MetalKernel},
@@ -70,7 +71,7 @@ pub(super) fn apply(
                 ["scores", "mask", "dimensions", "scale"],
                 ["probabilities"],
                 include_str!("score_softmax.metal"),
-                include_str!("../exp_f32.metal"),
+                metal_arithmetic_header(),
                 false,
                 false,
             )?);

@@ -1,14 +1,15 @@
 //! Portable continuation reporting from installed owners and allocator facts.
 
 use eredu_core::{
-    capability::NativeAllocatorObservations, speculative::SpeculativeModelMemoryObservation,
+    capability::ParameterMemoryFacts, speculative::SpeculativeModelMemoryObservation,
     BackendFailure,
 };
 
-pub(super) fn model<M: NativeAllocatorObservations>(
+pub(crate) fn model(
     (current_positions, current_state_bytes, peak_state_bytes): (u64, Option<u64>, Option<u64>),
     residency: Option<crate::ResidencyReport>,
     banks: Option<crate::expert::ParameterBanksResidencyReport>,
+    native: ParameterMemoryFacts,
 ) -> Result<SpeculativeModelMemoryObservation, BackendFailure> {
     use crate::text_session_driver::capability::{
         bank_memory_facts, static_memory_from_residency_and_components,
@@ -21,7 +22,7 @@ pub(super) fn model<M: NativeAllocatorObservations>(
         residency,
         std::iter::empty(),
         bank_memory_facts(banks),
-        M::native_memory_facts(),
+        native.native,
     )
     .map_err(BackendFailure::from_error)?;
     Ok(SpeculativeModelMemoryObservation {
@@ -30,7 +31,7 @@ pub(super) fn model<M: NativeAllocatorObservations>(
         peak_state_bytes,
         parameters,
         parameter_conversions,
-        available: M::available_memory()?,
-        allocator_cache_limit: M::allocator_cache_limit(),
+        available: native.available,
+        allocator_cache_limit: native.allocator_cache_limit,
     })
 }

@@ -229,7 +229,18 @@ fn parameter_width(dtype: Option<InterventionDtype>) -> Option<std::num::NonZero
     })
 }
 
-impl<R, N> TextSessionDriver<R, N> {
+impl<R, N, G> TextSessionDriver<R, N, G> {
+    /// Upper bound for floating state precision including promotion by edited parameters.
+    pub fn effective_floating_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
+        let baseline = self.layout.floating_state_dtype_bytes();
+        self.parameter_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.precision)
+            .map_or(baseline, |edited| edited.max(baseline))
+    }
+}
+
+impl<R, N, G> TextSessionDriver<R, N, G> {
     /// Identity of the currently installed overlay for capture and intervention admission.
     pub fn parameter_overlay_identity(&self) -> Option<&str> {
         self.parameter_overlay
@@ -248,16 +259,9 @@ impl<R, N> TextSessionDriver<R, N> {
         }
         Ok(())
     }
+}
 
-    /// Upper bound for floating state precision including promotion by edited parameters.
-    pub fn effective_floating_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
-        let baseline = self.layout.floating_state_dtype_bytes();
-        self.parameter_overlay
-            .as_ref()
-            .and_then(|overlay| overlay.precision)
-            .map_or(baseline, |edited| edited.max(baseline))
-    }
-
+impl<R, N> TextSessionDriver<R, N> {
     fn commit_parameter_overlay(
         &mut self,
         discovery: &mut ParameterDiscovery,

@@ -1,7 +1,73 @@
 # Execution control
 
+## Automatic prompt-cache reuse
+
+Ordinary, controlled, and observed generation share automatic prompt-cache
+reuse for admitted resident or paged state with local plain text and bounded
+autoregressive prefill. Startup
+validates and restores the same pinned generation before executing the
+remaining suffix. Traces and snapshots retain the full input IDs, and
+restored state counts toward the ordinary snapshot budget.
+
+On a miss, publication begins after the last nonfinal prefill chunk has
+settled and its records have been delivered. The store reserves staging
+against its own allowance and replaces the current entry only on commit.
+Directory stores admit one staging generation against their allowance.
+Memory stores also account for existing bytes, including generations pinned
+by readers. Budget rejection, ineligible input, and cancellation before
+commit leave the current entry intact. A fork never publishes, and restore
+does not repeat an attempted publication. Media, activation capture and
+intervention, active overlays, and partitioned execution bypass automatic
+reuse. Resident restoration assembles one layer's pages at a time.
+
+## Candle local execution
+
+Candle CPU and Metal support ordinary and controlled text generation with
+resident or paged KV and resident, host-layerwise, or disk-streamed weights
+when admitted by the selected plan. Snapshots retain the live model state,
+pending inputs, and sampler history and RNG. Prompt-cache-enabled sessions
+also retain the committed prefix digest.
+
+On an admitted refinement route, a step completes context encoding, one
+refinement iteration, or commitment. Restore preserves the tentative canvas,
+scores, schedule, and random stream. Shared-backbone drafting admits scheduled
+mode changes through the draft session. The ordinary controller selects its
+mode at request start.
+
+Independent drafts can share the target context or bind a separate CPU or
+Metal context. Ordinary and controlled execution use the same verification,
+cancellation, snapshot, and commitment scheduler.
+
+With `tensor-capture`, the local route supports bounded read-only capture at
+the selected architecture's ordinary activation and logits points. For an admitted
+grouped gated-product bank it also captures the original and effective units of
+participating experts. A supported router accepts exclusion, contribution
+zeroing, score bias, and forced selections. Sparse activation edits address the
+units of participating experts before their down projection. Ordinary and
+controlled generation use the same capture budgets, execution hooks and receipts.
+Local capture requires a complete, single-sequence prefill invocation. Controlled
+speculation attributes raw score records to the target or draft at an
+absolute prediction position.
+
+An embedded drafting plan uses the selected target architecture's predictor
+and the same scheduler as independent drafting.
+An external drafting plan can also admit a conditioned assistant on the
+target placement. The plan verifies its capture and parameter contracts
+before loading. The paired assistant and ordinary target share the
+prepared session's target weights.
+
+For an embedded executor with internal hooks, use
+`speculative_activation_discovery` and `prepare_speculative_activations` to
+admit phase-scoped evidence and floating-point edits. Discovery exposes the
+exact invocation and editable points retained by that execution.
+Capture and copy charges remain cumulative across restore and fork.
+
+
 Use `LoadedModel::prepare_controlled_chat` followed by `start_controlled` for
-plain controlled generation. With `tensor-capture`, use
+plain controlled generation. For an admitted media prompt, use
+`LoadedModel::prepare_controlled_input` before `start_controlled`. It obtains
+the ordered decoder IDs from the selected session and checks their length
+against the prepared position count. With `tensor-capture`, use
 `prepare_observed_chat` or `prepare_intervened_chat` to admit a bounded plan
 before starting the same controlled driver. Pinned-canvas decisions use a
 selected-score readout on the requested refinement step in either build.
@@ -33,8 +99,8 @@ interventions, and then uses `start_controlled`.
 The request retains the exact text IDs or native prepared media prompt;
 controlled startup does not render or encode it again. Media alignment includes
 architecture-declared placeholder IDs and must cover every counted decoder
-position. MLX obtains these IDs through the architecture's existing semantic
-token construction. An adapter without `prepared_input_token_ids` observation
+position. The portable session obtains these IDs through the architecture's
+semantic token construction. An adapter without `prepared_input_token_ids` observation
 rejects typed media capture/control admission with
 `BackendFailureKind::Unsupported`; ordinary and speculative execution can still
 consume its counted payload. Missing alignment is an adapter observation gap,
@@ -264,6 +330,12 @@ Cancellation is checked between completed chunks and can leave a partial prompt
 cache with no committed output. Reset the model before starting a different request.
 `Unchunked` removes the caller-imposed chunk limit but still honors an architecture's
 required invocation limit.
+
+Resident Qwen3-VL video with FP16 patch projection retains the architecture's
+ordered text and media spans in both generation modes. The shared session
+treats this prefill as one commit boundary for the whole prompt. Requests for
+capture or prediction that require a single complete prefill invocation receive
+a typed rejection because their activation geometry spans multiple invocations.
 
 A retained cursor can also schedule input preparation before decoder prefill.
 One completed preparation step yields context progress with no sampled token or
@@ -652,9 +724,8 @@ replays and sibling branches. Admission is rechecked against the exact loaded
 source/session; unsupported layer/routing hooks are absent from discovery rather
 than pretending to support speculative attribution.
 
-Initial speculative snapshots still need a portable copy contract for backend-owned
-prefill input. Embedded prediction forks remain unavailable wherever their complete
-snapshot costs or isolation contracts are unavailable.
+Speculative snapshot and fork support require an admitted copy contract,
+complete snapshot costs, and isolation for the selected executable.
 
 ## Feature development rule
 
@@ -1679,9 +1750,8 @@ alone does not establish successful rollback. Partitioned advancement agrees req
 preparation, extent and each step's position before execution. Local preparation
 failures rendezvous with peers through the same agreement protocol.
 
-`prepare_observed_input` accepts a prepared backend prompt and its explicit original
-decoder IDs, including media placeholders. Callers preserve that correspondence. It
-feeds ordinary observed generation and controlled text/chat entry points. Capture
+`prepare_observed_input` derives decoder IDs, including media placeholders, from the
+prepared prompt through the same admission path used by controlled generation. Capture
 records retain an absolute `prefill_span`; sequence slices intersect and rebase for
 each physical chunk. Final prediction scores are captured only on the final chunk.
 Restore preserves cumulative capture and copy usage. Low-level token iterators that
@@ -2561,6 +2631,12 @@ canonical branch. This prevents a late character/codec failure from retaining
 earlier perception, backbone or sampling progress in a local retry. Native
 submission lifetime remains the enclosing owner's responsibility on every path.
 
+Candle CPU and Metal use the same controlled PCM session and snapshot
+accounting as MLX. Candle settles each frame before publication. Cancellation
+discards queued work and preserves committed output at the scheduler boundary. Snapshot restore
+and fork copy mutable cache tensors and retain the complete seeded host
+random stream.
+
 The released-checkpoint Metal WAV run uses public `BoundVoiceChatSession`
 advancement through this same driver: eight prompt positions, 396 audio frames,
 404 backbone positions and terminal drain. Committed waveform offsets cover
@@ -2941,14 +3017,12 @@ AR and speculative modes before changing request state.
 
 ### Automatic prompt-cache stores
 
-A store configured on `LoadedModel` applies to normal independent chat requests.
-Starting controlled, speculative or observed execution with that configuration
-returns a typed
-unsupported error before work: cache publication/eviction is an external side
-effect outside the controlled snapshot, capture and cumulative-copy ledger.
-Remove the automatic store configuration before such a run. The existing
-prompt-cache import/export path accepts memory and directory stores at completed
-native boundaries; this is the same state mechanism, not another cache API.
+An attached store participates in eligible ordinary, controlled, and observed
+requests as described in [Automatic prompt-cache reuse](#automatic-prompt-cache-reuse).
+Speculative execution requires removing the attached store because its commit
+protocol does not admit automatic prompt-cache publication. The explicit
+import and export operations accept memory and directory stores at completed
+native boundaries for admitted resident and paged state.
 
 ### Rejected tool calls
 

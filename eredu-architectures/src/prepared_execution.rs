@@ -77,7 +77,6 @@ pub struct PreparedConstructionBranch<S, C> {
     prediction: Option<PreparedPredictionSelection>,
     retained_prediction: Option<RetainedPredictionBinding>,
     retained_construction: Option<RetainedArchitectureConstruction>,
-    retained_composite_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
 }
 
 impl<S, C> PreparedConstructionBranch<S, C> {
@@ -128,8 +127,8 @@ impl PreparedExecutableDiscovery for PreparedModelDiscovery {
     }
 }
 
-impl<C, R, T, X, PD, PT, PX, E, F>
-    PreparedExecutableConstruction<C, E, F, PreparedExecutionRoutes<R, T, X, PD, PT, PX>>
+impl<C, R, T, X, PD, PT, PX, RX, E, F>
+    PreparedExecutableConstruction<C, E, F, PreparedExecutionRoutes<R, T, X, PD, PT, PX, RX>>
     for PreparedModelSources
 where
     R: PreparedExecutionRoute<eredu_runtime::SelectedReplicatedTextRealization, C, E, F>,
@@ -138,13 +137,14 @@ where
     PD: PreparedExecutionRoute<SelectedDensePartitionedExecution, C, E, F>,
     PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, E, F>,
     PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, E, F>,
+    RX: PreparedExecutionRoute<crate::lfm3::vision::PreparedVlRankGraph, C, E, F>,
 {
     type Processor = PreparedProcessor;
     type Discovery = PreparedModelDiscovery;
 
     fn prepare(
         self,
-        routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX>,
+        routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX, RX>,
         observation: eredu_core::ObservationMechanisms,
         capture: eredu_core::capture::CaptureCapabilities,
     ) -> Result<
@@ -152,7 +152,7 @@ where
             Self::Processor,
             Self::Discovery,
             impl FnOnce(Option<C>) -> Result<E, PreparedExecutionError<F>>
-                + use<C, R, T, X, PD, PT, PX, E, F>,
+                + use<C, R, T, X, PD, PT, PX, RX, E, F>,
         >,
         PreparedExecutionError<F>,
     > {
@@ -347,6 +347,7 @@ struct BranchContext<C> {
     prediction: Option<PreparedPredictionSelection>,
     retained_prediction: Option<RetainedPredictionBinding>,
     retained_construction: Option<RetainedArchitectureConstruction>,
+
     retained_composite_rank: Option<crate::lfm3::vision::PreparedVlRankGraph>,
 }
 impl<C> BranchContext<C> {
@@ -360,19 +361,18 @@ impl<C> BranchContext<C> {
             prediction: self.prediction,
             retained_prediction: self.retained_prediction,
             retained_construction: self.retained_construction,
-            retained_composite_rank: self.retained_composite_rank,
         }
     }
 }
 
-struct ConstructionDispatcher<R, T, X, PD, PT, PX, C, E, F> {
-    routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX>,
+struct ConstructionDispatcher<R, T, X, PD, PT, PX, RX, C, E, F> {
+    routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX, RX>,
     context: BranchContext<C>,
     marker: std::marker::PhantomData<fn() -> (E, F)>,
 }
 
-impl<R, T, X, PD, PT, PX, C, E, F> SelectedExecutionDispatcher
-    for ConstructionDispatcher<R, T, X, PD, PT, PX, C, E, F>
+impl<R, T, X, PD, PT, PX, RX, C, E, F> SelectedExecutionDispatcher
+    for ConstructionDispatcher<R, T, X, PD, PT, PX, RX, C, E, F>
 where
     R: PreparedExecutionRoute<eredu_runtime::SelectedReplicatedTextRealization, C, E, F>,
     T: PreparedExecutionRoute<crate::SelectedRoutedTextRealization, C, E, F>,
@@ -380,6 +380,7 @@ where
     PD: PreparedExecutionRoute<SelectedDensePartitionedExecution, C, E, F>,
     PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, E, F>,
     PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, E, F>,
+    RX: PreparedExecutionRoute<crate::lfm3::vision::PreparedVlRankGraph, C, E, F>,
 {
     type Output = E;
     type Error = PreparedExecutionError<F>;
@@ -395,9 +396,15 @@ where
         self.routes.routed.construct(self.context.branch(selected))
     }
     fn composite(
-        self,
+        mut self,
         selected: crate::replicated_text::SelectedCompositeTextRealization,
     ) -> Result<E, Self::Error> {
+        if let Some(rank) = self.context.retained_composite_rank.take() {
+            return self
+                .routes
+                .retained_composite_rank
+                .construct(self.context.branch(rank));
+        }
         self.routes
             .composite
             .construct(self.context.branch(selected))

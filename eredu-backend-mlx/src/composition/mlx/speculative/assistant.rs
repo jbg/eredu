@@ -1,4 +1,3 @@
-use crate::composition::mlx::capability::MlxAllocatorObservations;
 use eredu_core::session_authority::{RetainedExecutionPayload, RetainedPayloadOperation};
 use eredu_core::speculative::assistant::ExternalAssistantBinder;
 
@@ -6,9 +5,7 @@ use super::*;
 use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
 use crate::{
-    backend::runtime::checkpoint::{
-        recipe::native_recipe_workspace, store::MlxParameterMaterializationContext,
-    },
+    backend::runtime::checkpoint::store::MlxParameterMaterializationContext,
     native::MlxComponentBinder,
 };
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
@@ -72,7 +69,10 @@ impl ExternalAssistantBinder for MlxAssistantBinder {
         recipe: &DerivedWeightRecipe,
         source: &dyn CheckpointSource,
     ) -> Result<u64, Error> {
-        native_recipe_workspace(recipe, source).map_err(Error::ArchitectureModel)
+        eredu_core::checkpoint_mechanisms::recipe_execution::conservative_workspace_bytes(
+            recipe, source,
+        )
+        .map_err(Error::ArchitectureModel)
     }
 
     type ParameterReads = MlxParameterMaterializationContext;
@@ -220,15 +220,10 @@ impl<P: 'static> RetainedExecutionPayload for MlxDraftStorage<P> {
 }
 
 impl<P: 'static> eredu_core::capability::NativePlacementMemory for MlxDraftStorage<P> {
-    type Memory = MlxAllocatorObservations;
-
-    fn host_execution(&self) -> Result<bool, eredu_core::BackendFailure> {
-        self.payload
-            .stream
-            .get_device()
-            .and_then(|device| device.get_type())
-            .map(|kind| kind == safemlx::DeviceType::Cpu)
-            .map_err(eredu_core::BackendFailure::from_error)
+    fn placement_memory(
+        &self,
+    ) -> Result<eredu_core::capability::ParameterMemoryFacts, eredu_core::BackendFailure> {
+        crate::composition::mlx::capability::placement_memory(&self.payload.stream)
     }
 
     fn scratch_memory_upper_bound(&self) -> Option<u64> {
@@ -269,6 +264,7 @@ impl<Dispatch: 'static, P: 'static> MlxDraftBinding<Dispatch, P> {
 impl<Dispatch: 'static, P: 'static> eredu_core::automatic::DraftBindingResources
     for MlxDraftBinding<Dispatch, P>
 {
+    type Generation = eredu_core::backend::AdvancedTextGeneration;
     type Backend = crate::backend::MlxBackend<'static, Dispatch>;
     type AssistantBinder = MlxAssistantBinder;
     type Payload = P;

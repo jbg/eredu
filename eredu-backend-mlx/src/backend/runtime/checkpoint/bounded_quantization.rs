@@ -95,10 +95,7 @@ impl BoundedQuantizationBackend for MlxBoundedQuantizer<'_> {
     }
 
     fn limits(&self) -> QuantizationTileLimits {
-        QuantizationTileLimits {
-            slots: NonZeroUsize::new(2).unwrap(),
-            elements: NonZeroUsize::new(i32::MAX as usize).unwrap(),
-        }
+        QuantizationTileLimits::signed_indexed(NonZeroUsize::new(2).unwrap())
     }
 
     fn begin(&mut self, slots: usize, working_set_bytes: u64) -> Result<(), BackendFailure> {

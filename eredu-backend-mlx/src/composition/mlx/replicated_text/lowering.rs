@@ -85,51 +85,9 @@ pub(crate) fn supports_direct(descriptor: &WeightLoweringDescriptor) -> bool {
     supported && descriptor.has_valid_direct_geometry()
 }
 
-pub(crate) fn supports_transform(descriptor: &WeightLoweringDescriptor) -> bool {
-    let source = descriptor.source();
-    let executable = descriptor.executable();
-    let decodable = match source {
-        SourceTensorEncoding::Safetensors(dtype) => matches!(
-            dtype,
-            StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32 | StoredDtype::F64
-        ),
-        SourceTensorEncoding::RecipeOutput(dtype) => matches!(
-            dtype,
-            StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32 | StoredDtype::F64
-        ),
-        SourceTensorEncoding::Gguf { ggml_type, .. } => matches!(
-            ggml_type,
-            eredu_gguf::GgmlType::F16 | eredu_gguf::GgmlType::F32 | eredu_gguf::GgmlType::Bf16
-        ),
-        _ => false,
-    };
-    decodable
-        && descriptor.has_valid_transform_geometry()
-        && match executable {
-            LinearFormat::Affine(format) => format.validate().is_ok(),
-            LinearFormat::MxFp4 => true,
-            LinearFormat::Dense
-            | LinearFormat::NvFp4
-            | LinearFormat::GgufIQuant { .. }
-            | LinearFormat::E4M3BlockFp8(_) => false,
-        }
-}
-
 pub(super) fn gguf_affine(
     ggml_type: eredu_gguf::GgmlType,
 ) -> Option<eredu_checkpoint::AffineQuantization> {
-    let (bits, group_size) = match ggml_type {
-        eredu_gguf::GgmlType::Q2K => (2, 16),
-        eredu_gguf::GgmlType::Q3K => (3, 16),
-        eredu_gguf::GgmlType::Q4_0 | eredu_gguf::GgmlType::Q4_1 | eredu_gguf::GgmlType::Q4K => {
-            (4, 32)
-        }
-        eredu_gguf::GgmlType::Q5_0 | eredu_gguf::GgmlType::Q5_1 | eredu_gguf::GgmlType::Q5K => {
-            (5, 32)
-        }
-        eredu_gguf::GgmlType::Q6K => (6, 16),
-        eredu_gguf::GgmlType::Q8_0 => (8, 32),
-        _ => return None,
-    };
-    eredu_checkpoint::AffineQuantization::new(group_size, bits).ok()
+    let (bits, group_size) = eredu_gguf::affine_layout(ggml_type)?;
+    eredu_checkpoint::AffineQuantization::new(group_size as i32, i32::from(bits)).ok()
 }

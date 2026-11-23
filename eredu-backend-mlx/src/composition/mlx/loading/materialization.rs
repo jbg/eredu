@@ -59,6 +59,7 @@ impl<Dispatch> eredu_core::checkpoint_mechanisms::ModelBindingResources
 
     fn open_binding_target(
         &self,
+        _: &Self::Placement,
         communication: Option<&MlxDistributedSession>,
     ) -> Result<Self::Target, Error> {
         crate::backend::MlxPreparedTarget::new(self.stream(), communication)
@@ -68,7 +69,7 @@ impl<Dispatch> eredu_core::checkpoint_mechanisms::ModelBindingResources
         &self,
         dtype: &eredu_core::checkpoint::TensorDtype,
     ) -> Option<eredu_nn::TensorElementType> {
-        super::super::replicated_text::floating_state_storage_dtype(dtype)
+        eredu_core::preparation::StateStorageDtype::from_floating_source(dtype, |_| true)
             .map(eredu_core::preparation::StateStorageDtype::element_type)
     }
 

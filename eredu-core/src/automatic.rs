@@ -493,15 +493,40 @@ impl TimingTelemetry {
     }
 }
 
-/// Backend allocator observations for one execution.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+/// Independently observable allocator and device counters for one execution.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AllocatorTelemetry {
-    /// Peak active backend-managed allocation bytes.
-    pub peak_bytes: u64,
-    /// Active backend-managed allocation bytes at collection time.
-    pub active_bytes: u64,
-    /// Bytes retained by the backend allocator cache at collection time.
-    pub cache_bytes: u64,
+    /// Peak active backend-managed bytes, when the allocator tracks a high-water mark.
+    pub peak_bytes: Option<u64>,
+    /// Active backend-managed bytes, excluding cached blocks.
+    pub active_bytes: Option<u64>,
+    /// Bytes retained by the backend allocator cache.
+    pub cache_bytes: Option<u64>,
+    /// Device-level allocated bytes, including cached buffers and other device allocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_allocated_bytes: Option<u64>,
+    /// Current process RSS, including allocations outside the selected backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_rss_bytes: Option<u64>,
+}
+
+impl From<crate::residency::AllocatorMemoryMetrics> for AllocatorTelemetry {
+    fn from(memory: crate::residency::AllocatorMemoryMetrics) -> Self {
+        Self {
+            peak_bytes: Some(memory.peak_bytes()),
+            active_bytes: Some(memory.active_bytes()),
+            cache_bytes: Some(memory.cached_bytes()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Cache policy and current telemetry, which may be available independently.
+pub struct AllocatorObservation {
+    /// Retained native policy when the backend can establish a cache limit.
+    pub cache_policy: Option<crate::AllocatorCachePolicyReport>,
+    /// Backend or operating-system memory counters.
+    pub telemetry: AllocatorTelemetry,
 }
 
 /// Logical bytes and transfers reported by bounded parameter residency.
@@ -957,6 +982,14 @@ pub trait ExecutionPlanTargetAdmission<P> {
     /// Portable preparation retained from the inspection.
     type Preparation;
 
+    /// Projects the selected checkpoint representation before retaining admission.
+    fn project_inspection(
+        &self,
+        inspection: ArtifactInspection<P>,
+    ) -> Result<ArtifactInspection<P>, crate::artifact::ArtifactError> {
+        Ok(inspection)
+    }
+
     /// Selects and reports one exact preparation without realizing resources.
     fn select(
         self,
@@ -1201,6 +1234,8 @@ impl<D> RealizedDrafting<D> {
 
 /// Native placement and retirement for an already selected secondary execution payload.
 pub trait DraftBindingResources: Sized {
+    /// Selects the portable execution adapter appropriate for these native resources.
+    type Generation;
     /// Provider that materializes independent decoder resources.
     type Backend: ModelLoadingBackend;
     /// Native parameter and queue context used by conditioned assistants.
@@ -1334,7 +1369,10 @@ pub trait ExecutionPlanBackendFactory<P: Clone + std::fmt::Debug>: BackendHardwa
     type DraftBinding;
 
     /// Supplies native mechanism facts for portable external draft selection.
-    fn draft_inputs(&self) -> <Self::DraftFacts as AdmissionFacts>::Inputs;
+    fn draft_inputs(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<<Self::DraftFacts as AdmissionFacts>::Inputs, AutomaticPlanningError>;
 
     /// Backend hook which owns device/queue construction for an established selection.
     ///
@@ -1364,6 +1402,50 @@ pub trait ColdPlanPlacement: BackendHardware {
         device: &DevicePlan,
         rank: Option<(usize, usize)>,
     ) -> Result<Self::Placement, AutomaticPlanningError>;
+}
+
+/// Parses a canonical `family:index` identifier for an adapter that uses indexed devices.
+/// Family support, index limits, and physical discovery are adapter facts.
+pub fn parse_indexed_device<'a>(
+    device: &'a DevicePlan,
+    backend: &str,
+) -> Result<(&'a str, usize), AutomaticPlanningError> {
+    let invalid = AutomaticPlanningError::Invalid;
+    if device.backend().as_str() != backend {
+        return Err(invalid(format!(
+            "{backend} cannot bind backend {}",
+            device.backend()
+        )));
+    }
+    let id = device.device();
+    let (family, index) = id
+        .split_once(':')
+        .filter(|(family, _)| !family.is_empty())
+        .ok_or_else(|| invalid(format!("device identifier {id:?} must be family:index")))?;
+    let index = index
+        .parse::<usize>()
+        .map_err(|error| invalid(format!("invalid device index: {error}")))?;
+    let canonical = format!("{family}:{index}");
+    if id != canonical {
+        return Err(invalid(format!(
+            "device identifier {id:?} is not canonical; use {canonical:?}"
+        )));
+    }
+    Ok((family, index))
+}
+
+/// Compares the observed native world to the selected size and global rank.
+pub fn validate_realized_world(
+    selected: (usize, usize),
+    realized: (usize, usize),
+) -> Result<(), AutomaticPlanningError> {
+    if selected != realized {
+        return Err(AutomaticPlanningError::Invalid(format!(
+            "native world size/rank {}/{} differs from retained selection {}/{}",
+            realized.0, realized.1, selected.0, selected.1
+        )));
+    }
+    Ok(())
 }
 
 /// Opens exact native resources for a portable execution plan.
@@ -1427,7 +1509,10 @@ pub trait ExecutionPlanComposition<F: ExecutionPlanNativeFactory>: Clone + std::
         support: Result<(), AutomaticPlanningError>,
     ) -> <Self::TargetFacts as AdmissionFacts>::Inputs;
     /// Projects exact mechanism inputs into the portable secondary-model policy.
-    fn draft_inputs(factory: &F) -> <Self::DraftFacts as AdmissionFacts>::Inputs;
+    fn draft_inputs(
+        factory: &F,
+        plan: &ExecutionPlan,
+    ) -> Result<<Self::DraftFacts as AdmissionFacts>::Inputs, AutomaticPlanningError>;
 }
 
 impl<F, P> ExecutionPlanBackendFactory<P> for F
@@ -1468,8 +1553,11 @@ where
         placement
     }
 
-    fn draft_inputs(&self) -> <Self::DraftFacts as AdmissionFacts>::Inputs {
-        P::draft_inputs(self)
+    fn draft_inputs(
+        &self,
+        plan: &ExecutionPlan,
+    ) -> Result<<Self::DraftFacts as AdmissionFacts>::Inputs, AutomaticPlanningError> {
+        P::draft_inputs(self, plan)
     }
 
     fn realize_target(
@@ -1533,7 +1621,11 @@ pub fn select_execution_plan_target<
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
 
     let (inputs, binding) = factory.target_inputs(plan, options)?;
-    let selection = F::TargetFacts::from_inputs(inputs).select(&inspection, plan)?;
+    let facts = F::TargetFacts::from_inputs(inputs);
+    let inspection = facts
+        .project_inspection(inspection)
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+    let selection = facts.select(&inspection, plan)?;
     selection
         .policy
         .validate_session_capabilities(&selection.capabilities)
@@ -1682,7 +1774,7 @@ pub fn select_execution_plan_drafting<
         }
         _ => {}
     }
-    let external_artifact = F::DraftFacts::from_inputs(factory.draft_inputs()).select(
+    let external_artifact = F::DraftFacts::from_inputs(factory.draft_inputs(plan)?).select(
         plan,
         target,
         external_artifact,

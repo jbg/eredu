@@ -2,7 +2,7 @@
 use crate::{prepared_sources::PreparedModelSources, processor_plan::ArtifactArchitecturePlan};
 use eredu_core::{
     artifact::ArtifactError, ArtifactInspection, AutomaticPlanningError, DraftingPlan,
-    ExecutionPlan, ExternalDraftArtifact, ModelPreparationPlan,
+    ExecutionPlan, ExternalDraftArtifact, ModelLoadAdmission, ModelPreparationPlan,
 };
 use eredu_runtime::*;
 
@@ -18,7 +18,7 @@ pub enum ExternalDraftPreparation {
 /// Ownership of the tokenizer used to interpret an external draft's global token IDs.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExternalDraftTokenizerSource {
-    /// The assistant is trained in the proven target's vocabulary and borrows its tokenizer.
+    /// Borrows the target tokenizer and verifies any vocabulary supplied by the assistant.
     Target,
     /// An independent tokenizer is reconstructed from the selected draft artifact.
     Artifact {
@@ -35,13 +35,6 @@ impl ExternalDraftPreparation {
             Self::Autoregressive(p) => ExternalDraftTokenizerSource::Artifact {
                 model_type: p.architecture_plan().model_kind().canonical_name(),
             },
-        }
-    }
-    /// Tokenizer policy for the exact admitted artifact.
-    pub fn tokenizer_model_type(&self) -> &str {
-        match self {
-            Self::Assistant(p) => p.tokenizer_model_type(),
-            Self::Autoregressive(p) => p.architecture_plan().model_kind().canonical_name(),
         }
     }
 }
@@ -133,8 +126,17 @@ where
 
     fn draft_inputs(
         factory: &F,
-    ) -> <Self::DraftFacts as eredu_core::backend::AdmissionFacts>::Inputs {
-        factory.preparation_mechanisms()
+        plan: &ExecutionPlan,
+    ) -> Result<
+        <Self::DraftFacts as eredu_core::backend::AdmissionFacts>::Inputs,
+        AutomaticPlanningError,
+    > {
+        match plan.drafting() {
+            DraftingPlan::External { placement, .. } => {
+                factory.draft_preparation_mechanisms(placement.execution_device(plan.device()))
+            }
+            _ => Ok(factory.preparation_mechanisms()),
+        }
     }
 }
 
@@ -197,7 +199,7 @@ where
                     target.inspection(),
                     target.selected_preparation().as_ref(),
                     artifact,
-                    &self.mechanisms,
+                    self.mechanisms,
                 )
             })
             .transpose()
@@ -226,15 +228,29 @@ where
         N::Backend,
         Model: speculative::IndependentDraftModel<E> + 'static,
     >,
+    N::Generation: speculative::DraftSessionInstallation<B, N::AssistantBinder, N::Resources>,
 {
-    type Drafter = speculative::InstalledDraftSession<N::AssistantBinder, N::Resources>;
+    type Drafter = <N::Generation as speculative::DraftSessionInstallation<
+        B,
+        N::AssistantBinder,
+        N::Resources,
+    >>::Draft;
 
     fn construct_external_draft(
         artifact: ExternalDraftArtifact<PreparedExternalDraft>,
         mechanisms: N,
         target_identity: &str,
     ) -> Result<Self::Drafter, AutomaticPlanningError> {
-        artifact.preparation.construct(mechanisms, target_identity)
+        artifact
+            .preparation
+            .construct(mechanisms, target_identity)
+            .and_then(
+                <N::Generation as speculative::DraftSessionInstallation<
+                    B,
+                    N::AssistantBinder,
+                    N::Resources,
+                >>::install,
+            )
     }
 }
 
@@ -244,7 +260,7 @@ pub fn prepare_execution_plan_draft(
     target: &ArtifactInspection<ArtifactArchitecturePlan>,
     target_selection: &crate::SelectedPreparation,
     artifact: ExternalDraftArtifact<ExternalDraftPreparation>,
-    mechanisms: &impl crate::PreparationMechanismProvider,
+    mechanisms: impl crate::PreparationMechanismProvider,
 ) -> Result<ExternalDraftArtifact<PreparedExternalDraft>, AutomaticPlanningError> {
     let invalid = |e: &dyn std::fmt::Display| AutomaticPlanningError::Invalid(e.to_string());
     let target_rank = external_draft_target_rank(plan, target, target_selection)?;
@@ -307,6 +323,7 @@ pub fn prepare_execution_plan_draft(
     };
     let mut draft_plan = plan
         .clone()
+        .with_device(placement.execution_device(plan.device()).clone())
         .with_drafting(DraftingPlan::Disabled)
         .with_residency(residency.clone());
     if !draft_capabilities.independently_addressable_experts() {
@@ -318,8 +335,15 @@ pub fn prepare_execution_plan_draft(
         None,
     )
     .map_err(|e| invalid(&e))?;
-    let selection =
-        crate::select_preparation(&inspection, &request, mechanisms).map_err(|e| invalid(&e))?;
+    let facts = ModelLoadFacts {
+        request,
+        mechanisms,
+    };
+    let inspection = facts
+        .project_inspection(inspection)
+        .map_err(|e| invalid(&e))?;
+    let selection = crate::select_preparation(&inspection, &facts.request, &facts.mechanisms)
+        .map_err(|e| invalid(&e))?;
     // Cold identities describe admitted equations and tensor encodings. Content
     // hashes remain deferred on the prepared sources, as for conditioned drafts.
     // Never format the deferred identity itself: its debug state changes after
@@ -375,7 +399,10 @@ pub fn prepare_execution_plan_draft(
             tokenizer.fingerprint(),
         ),
         capture.clone(),
-        SpeculativeMechanismRequirements::new([]),
+        SpeculativeMechanismRequirements::new([
+            eredu_core::speculative::SpeculativeMechanism::ExactCompletion,
+            eredu_core::speculative::SpeculativeMechanism::QueueBinding,
+        ]),
         cache,
     )
     .map_err(|e| invalid(&e))?;
@@ -394,7 +421,7 @@ pub fn prepare_execution_plan_draft(
     let selected = select_speculative_realization(
         &requirements,
         &selection,
-        &mechanisms.speculative_capabilities(),
+        &facts.mechanisms.speculative_capabilities(),
     )
     .map_err(|e| invalid(&e))?;
     Ok(ExternalDraftArtifact {

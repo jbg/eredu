@@ -512,6 +512,35 @@ fn budgets_and_specialized_requests_do_not_hide_uncertainty() {
     assert!(forecast.request.domains[0].staging.upper_bytes.is_none());
 }
 
+#[test]
+fn loaded_forecast_keeps_host_and_accelerator_headroom_separate() {
+    let mut profile = fixture_profile();
+    profile.parameters.physical_semantics = PhysicalMemorySemantics::SeparateTiers;
+    profile.available.physical_semantics = PhysicalMemorySemantics::SeparateTiers;
+    profile.available.device = Some(eredu_core::capability::DeviceMemoryCapacity {
+        total_bytes: Observed::exact(1 << 29, "accelerator capacity"),
+        available_bytes: Observed::exact(0, "accelerator is full"),
+    });
+    let (request, _) = eredu_runtime::memory_forecast::loaded_generation_request(
+        profile,
+        InputTokenCount::text(17),
+        4,
+        eredu_core::PrefillChunkPolicy::Unchunked,
+        ForecastExecutionContract {
+            input_retention: eredu_runtime::memory_forecast::PrefillInputRetention::TokenIds,
+            full_pass_reason: None,
+            logits: LogitsWorkspace::FinalPosition,
+        },
+        &GenerationForecastOptions::default(),
+    )
+    .unwrap();
+    let [host, accelerator] = request.domains.as_slice() else {
+        panic!("expected separate host and accelerator budgets");
+    };
+    assert_eq!(host.budget.available_bytes, Some(1 << 29));
+    assert_eq!(accelerator.budget.available_bytes, Some(0));
+}
+
 #[cfg(feature = "tensor-capture")]
 #[test]
 fn controlled_preparation_forecast_matches_ordinary_and_capture_uses_every_row() {
@@ -1115,16 +1144,24 @@ pub(super) fn fixture_profile() -> LoadedMemoryProfile {
                 "unrelated process allocations",
             ),
             backend_allocator_cache_bytes: Observed::exact(0, "fixture"),
+            backend_device_allocated_bytes: eredu_core::Observed::unavailable(
+                "device total was not measured",
+            ),
             physical_semantics: PhysicalMemorySemantics::Unified,
             currently_cached_shards: Observed::exact(0, "fixture"),
         },
         available: AvailableMemory {
             physical_memory_bytes: Observed::exact(1 << 30, "fixture"),
             available_memory_bytes: Observed::exact(1 << 29, "fixture"),
+            device: None,
             physical_semantics: PhysicalMemorySemantics::Unified,
         },
         allocator_cache_limit: Observed::exact(0, "fixture"),
-        host_execution: false,
+        placement: eredu_core::capability::ExecutionMemoryPlacement {
+            device: eredu_core::DevicePlan::new("mock", "gpu:0").unwrap(),
+            host_execution: false,
+            allocator: None,
+        },
     }
 }
 

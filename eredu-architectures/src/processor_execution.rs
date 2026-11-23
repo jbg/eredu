@@ -6,16 +6,19 @@ use eredu_core::{
     RgbImage, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
 };
 use eredu_core::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
-use eredu_media::audio::{AudioWaveform, LeadingSlaneyLogMelConfig, LogMelConfig};
-use eredu_media::{audio::LogMelFeatures, image::NormalizedImage};
+use eredu_media::audio::{
+    extract_audio_features, AudioFeatureRequest, AudioWaveform, LeadingSlaneyLogMelConfig,
+    LogMelConfig,
+};
+use eredu_media::image::{transform_rgb8, NormalizedImage, RgbImageView, RgbTransformPlan};
+use eredu_media::MediaError;
 use eredu_runtime::ActivationObserver;
 
-use crate::processor_plan::RgbResample;
 use crate::processor_plan::{
     ArtifactArchitecturePlan, Gemma4AudioPlan, Gemma4ImagePlan, Gemma4ProcessorPlan,
     Gemma4VideoPlan, InklingAudioPlan, InklingImagePlan, InklingProcessorPlan, MusePatchPlan,
     MuseProcessorPlan, MuseVideoPlan, ProcessorPlanError, QwenImagePlan, QwenPatchPlan,
-    QwenProcessorPlan, RgbTransformPlan,
+    QwenProcessorPlan,
 };
 
 mod nemotron_request;
@@ -56,70 +59,13 @@ impl<T> std::ops::Deref for BudgetedProcessorInput<T> {
     }
 }
 
-/// Fully specified model-independent log-mel operation.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AudioFeatureRequest {
-    /// Centered periodic-Hann magnitude features with HTK filters and natural logarithm.
-    SemicausalHtk {
-        /// Required sampling rate.
-        sample_rate: u32,
-        /// Analysis window length.
-        frame_length: usize,
-        /// Frame stride.
-        hop_length: usize,
-        /// Transform length.
-        fft_length: usize,
-        /// Mel filter count.
-        mel_bins: usize,
-        /// Lowest filter frequency.
-        min_frequency: f32,
-        /// Highest filter frequency.
-        max_frequency: f32,
-        /// Additive floor before natural logarithm.
-        mel_floor: f32,
-        /// Maximum retained input samples.
-        max_samples: usize,
-        /// Input padding multiple.
-        pad_to_multiple: usize,
-    },
-    /// Leading-zero periodic-Hann magnitude features with area-normalized Slaney filters.
-    LeadingSlaney {
-        /// Required sampling rate.
-        sample_rate: u32,
-        /// Transform and window length.
-        fft_length: usize,
-        /// Frame stride.
-        hop_length: usize,
-        /// Leading zero count.
-        leading_zeros: usize,
-        /// Mel filter count.
-        mel_bins: usize,
-        /// Lowest filter frequency.
-        min_frequency: f32,
-        /// Highest filter frequency.
-        max_frequency: f32,
-        /// Energy floor before base-ten logarithm.
-        energy_floor: f32,
-    },
-}
-
 trait ProcessorOperations: PreparedInputInspector<Self::Tensor> {
     type Tensor;
-    type Error: std::fmt::Display;
+    type Error: std::fmt::Display + From<MediaError>;
 
-    fn normalize_rgb(
-        &mut self,
-        image: &RgbImage,
-        plan: RgbTransformPlan,
-    ) -> Result<NormalizedImage, Self::Error>;
     fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
     fn tensor_f32(&mut self, values: &[f32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
     fn tensor_i32(&mut self, values: &[i32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
-    fn audio_features(
-        &mut self,
-        audio: &eredu_core::Audio,
-        request: &AudioFeatureRequest,
-    ) -> Result<LogMelFeatures, OptionalProcessorMechanism<Self::Error>>;
     fn tensor_bool(
         &mut self,
         values: &[bool],
@@ -176,30 +122,6 @@ impl ProcessorOperations for HostProcessorMechanisms {
     type Tensor = HostTensor;
     type Error = eredu_media::MediaError;
 
-    fn normalize_rgb(
-        &mut self,
-        image: &RgbImage,
-        plan: RgbTransformPlan,
-    ) -> Result<NormalizedImage, Self::Error> {
-        use eredu_media::image::{
-            rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, RgbImageView,
-        };
-        let source = RgbImageView::packed(image.pixels(), image.width(), image.height())?;
-        let width = u32::try_from(plan.width)
-            .map_err(|_| eredu_media::MediaError::Invalid("RGB target width exceeds u32".into()))?;
-        let height = u32::try_from(plan.height).map_err(|_| {
-            eredu_media::MediaError::Invalid("RGB target height exceeds u32".into())
-        })?;
-        let resized = match plan.resample {
-            RgbResample::Bicubic => resize_rgb8_bicubic(source, width, height)?,
-            RgbResample::AntialiasedBicubic => {
-                eredu_media::image::resize_rgb8_antialiased_bicubic(source, width, height)?
-            }
-            RgbResample::Lanczos3 => resize_rgb8_lanczos3(source, width, height)?,
-        };
-        rescale_and_normalize_rgb8(resized.as_view(), plan.rescale_factor, plan.mean, plan.std)
-    }
-
     fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<HostTensor, Self::Error> {
         if host_tensor_len(shape)? != values.len() {
             return Err(eredu_media::MediaError::Invalid(
@@ -235,67 +157,6 @@ impl ProcessorOperations for HostProcessorMechanisms {
             values: values.to_vec(),
             shape: shape.to_vec(),
         })
-    }
-
-    fn audio_features(
-        &mut self,
-        audio: &eredu_core::Audio,
-        request: &AudioFeatureRequest,
-    ) -> Result<LogMelFeatures, OptionalProcessorMechanism<Self::Error>> {
-        use eredu_media::audio::{extract_leading_slaney_log_mel, extract_log_mel};
-        let waveform = AudioWaveform::new(audio.samples(), audio.sample_rate())
-            .map_err(OptionalProcessorMechanism::Backend)?;
-        match request {
-            AudioFeatureRequest::SemicausalHtk {
-                sample_rate,
-                frame_length,
-                hop_length,
-                fft_length,
-                mel_bins,
-                min_frequency,
-                max_frequency,
-                mel_floor,
-                max_samples,
-                pad_to_multiple,
-            } => extract_log_mel(
-                waveform,
-                &LogMelConfig {
-                    sample_rate: *sample_rate,
-                    frame_length: *frame_length,
-                    hop_length: *hop_length,
-                    fft_length: *fft_length,
-                    mel_bins: *mel_bins,
-                    min_frequency: *min_frequency,
-                    max_frequency: *max_frequency,
-                    mel_floor: *mel_floor,
-                    max_samples: *max_samples,
-                    pad_to_multiple: *pad_to_multiple,
-                },
-            ),
-            AudioFeatureRequest::LeadingSlaney {
-                sample_rate,
-                fft_length,
-                hop_length,
-                leading_zeros,
-                mel_bins,
-                min_frequency,
-                max_frequency,
-                energy_floor,
-            } => extract_leading_slaney_log_mel(
-                waveform,
-                &LeadingSlaneyLogMelConfig {
-                    sample_rate: *sample_rate,
-                    fft_length: *fft_length,
-                    hop_length: *hop_length,
-                    leading_zeros: *leading_zeros,
-                    mel_bins: *mel_bins,
-                    min_frequency: *min_frequency,
-                    max_frequency: *max_frequency,
-                    energy_floor: *energy_floor,
-                },
-            ),
-        }
-        .map_err(OptionalProcessorMechanism::Backend)
     }
 
     fn tensor_bool(
@@ -717,6 +578,19 @@ fn mechanism_error<E: std::fmt::Display, M: std::fmt::Display>(
     ProcessorExecutionError::Mechanism(error)
 }
 
+fn media_error<E: std::fmt::Display, M: std::fmt::Display + From<MediaError>>(
+    error: MediaError,
+) -> ProcessorExecutionError<E, M> {
+    mechanism_error(M::from(error))
+}
+
+fn normalize_rgb(image: &RgbImage, plan: RgbTransformPlan) -> Result<NormalizedImage, MediaError> {
+    transform_rgb8(
+        RgbImageView::packed(image.pixels(), image.width(), image.height())?,
+        plan,
+    )
+}
+
 fn push_tokens<M, E>(
     parts: &mut Vec<PreparedInputPart<M::Tensor>>,
     ids: &[u32],
@@ -807,20 +681,22 @@ where
     E: std::fmt::Display,
 {
     let request = AudioFeatureRequest::SemicausalHtk {
-        sample_rate: plan.sample_rate,
-        frame_length: plan.frame_length,
-        hop_length: plan.hop_length,
-        fft_length: plan.fft_length,
-        mel_bins: plan.mel_bins,
-        min_frequency: plan.min_frequency,
-        max_frequency: plan.max_frequency,
-        mel_floor: plan.mel_floor,
-        max_samples: plan.max_samples,
-        pad_to_multiple: plan.pad_to_multiple,
+        config: LogMelConfig {
+            sample_rate: plan.sample_rate,
+            frame_length: plan.frame_length,
+            hop_length: plan.hop_length,
+            fft_length: plan.fft_length,
+            mel_bins: plan.mel_bins,
+            min_frequency: plan.min_frequency,
+            max_frequency: plan.max_frequency,
+            mel_floor: plan.mel_floor,
+            max_samples: plan.max_samples,
+            pad_to_multiple: plan.pad_to_multiple,
+        },
+        arithmetic: plan.arithmetic,
     };
-    let features = mechanisms
-        .audio_features(audio, &request)
-        .map_err(optional_mechanism_error)?;
+    let waveform = AudioWaveform::new(audio.samples(), audio.sample_rate()).map_err(media_error)?;
+    let features = extract_audio_features(waveform, &request).map_err(media_error)?;
     if features.values.len() != features.frames.saturating_mul(features.mel_bins)
         || features.mask.len() != features.frames
         || features.mel_bins != plan.mel_bins
@@ -868,9 +744,7 @@ where
     M: ProcessorOperations,
     E: std::fmt::Display,
 {
-    let image = mechanisms
-        .normalize_rgb(image, plan.transform)
-        .map_err(mechanism_error)?;
+    let image = normalize_rgb(image, plan.transform).map_err(media_error)?;
     let (values, positions, grid, extent, shape) =
         pack_gemma4(&image, plan.patch_size, plan.max_patches)?;
     let payload = mechanisms
@@ -1108,7 +982,7 @@ where
     M: ProcessorOperations,
     E: std::fmt::Display,
 {
-    let request = AudioFeatureRequest::LeadingSlaney {
+    let request = AudioFeatureRequest::LeadingSlaney(LeadingSlaneyLogMelConfig {
         sample_rate: plan.sample_rate,
         fft_length: plan.fft_length,
         hop_length: plan.hop_length,
@@ -1117,10 +991,9 @@ where
         min_frequency: plan.min_frequency,
         max_frequency: plan.max_frequency,
         energy_floor: plan.energy_floor,
-    };
-    let features = mechanisms
-        .audio_features(audio, &request)
-        .map_err(optional_mechanism_error)?;
+    });
+    let waveform = AudioWaveform::new(audio.samples(), audio.sample_rate()).map_err(media_error)?;
+    let features = extract_audio_features(waveform, &request).map_err(media_error)?;
     if features.values.len() != features.frames.saturating_mul(features.mel_bins)
         || features.mel_bins != plan.mel_bins
     {
@@ -1317,11 +1190,7 @@ where
 {
     let frames = frames
         .iter()
-        .map(|frame| {
-            mechanisms
-                .normalize_rgb(frame, transform)
-                .map_err(mechanism_error)
-        })
+        .map(|frame| normalize_rgb(frame, transform).map_err(media_error))
         .collect::<Result<Vec<_>, ProcessorExecutionError<E, M::Error>>>()?;
     let (values, shape, grid) = pack_muse(&frames, patches, duplicate_image)?;
     let payload = mechanisms
@@ -1412,9 +1281,7 @@ where
     M: ProcessorOperations,
     E: std::fmt::Display,
 {
-    let image = mechanisms
-        .normalize_rgb(image, plan.transform)
-        .map_err(mechanism_error)?;
+    let image = normalize_rgb(image, plan.transform).map_err(media_error)?;
     let (values, shape, grid) = pack_qwen(&[image], plan.patches, true)?;
     let payload = mechanisms
         .tensor_f32(&values, &shape)

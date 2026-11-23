@@ -276,7 +276,6 @@ where
     type Input = I::Input;
     type TargetCache = EmbeddedPredictionCache<S, P::LaneState>;
     type PredictionCache = EmbeddedPredictionDraftCache<P::LaneState>;
-    type Telemetry = N::Telemetry;
 
     /// Releases optional conversions; caller must establish a settled boundary.
     fn trim_parameter_conversions(
@@ -430,17 +429,6 @@ where
         cache
             .checkpoint(N::TargetState::checkpoint)
             .map_err(|error| N::session_failure(eredu_core::BackendFailure::from_error(error)))
-    }
-
-    fn take_telemetry(&mut self) -> Result<Self::Telemetry, M::Error> {
-        N::take_telemetry()
-    }
-
-    fn take_verification_telemetry(
-        &mut self,
-        _output: &mut EmbeddedPredictionOutput<B::Tensor>,
-    ) -> Result<Self::Telemetry, M::Error> {
-        N::take_telemetry()
     }
 
     fn prefill_with_prediction<'a>(

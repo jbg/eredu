@@ -52,21 +52,8 @@ pub(crate) fn positions(
             Ok(row.evaluated()?.as_slice::<bool>().to_vec())
         })
         .transpose()?;
-    raw.into_iter()
-        .enumerate()
-        .map(|(slot, position)| {
-            if position == -1 || valid.as_ref().is_some_and(|v| !v[slot]) {
-                return Ok(None);
-            }
-            i32::try_from(position)
-                .ok()
-                .filter(|v| *v >= 0)
-                .map(Some)
-                .ok_or_else(|| {
-                    Exception::custom("indexed position is outside signed 32-bit token geometry")
-                })
-        })
-        .collect()
+    eredu_nn::decode_indexed_positions(raw, |slot| valid.as_ref().is_none_or(|row| row[slot]))
+        .map_err(|error| Exception::custom(error.to_string()))
 }
 
 fn mask_row(

@@ -157,8 +157,7 @@ impl<M: SharedBackboneMechanisms> SharedBackboneTransaction<M> {
     pub fn proposals(&self) -> &[u32] {
         &self.tokens[1..]
     }
-    /// Conservative host storage for the tokens and cursor, excluding native evidence.
-    pub fn host_retained_bytes(&self) -> Option<u64> {
+    fn host_retained_bytes(&self) -> Option<u64> {
         (self.tokens.capacity() as u64)
             .checked_add(self.proposal.tokens.capacity() as u64)?
             .checked_add(self.verification.inputs.capacity() as u64)?
@@ -166,6 +165,15 @@ impl<M: SharedBackboneMechanisms> SharedBackboneTransaction<M> {
             .checked_add(self.cursor.heap_bytes()?)?
             .checked_add(std::mem::size_of::<Self>() as u64)
     }
+    /// Retained verification evidence, including both cache checkpoints.
+    pub fn retained_bytes(&self) -> Option<u64> {
+        M::checkpoint_retained_bytes(self.baseline())?
+            .checked_add(M::checkpoint_retained_bytes(self.verified())?)?
+            .checked_add(M::verification_output_bytes(self.verification().output())?)?
+            .checked_add(self.host_retained_bytes()?)?
+            .checked_add(M::proposal_randomness_bytes(self.proposal_randomness())?)
+    }
+
     /// Causal row for the next evolving target decision.
     pub fn logits<'context>(
         &self,

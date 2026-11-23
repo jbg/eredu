@@ -314,6 +314,9 @@ default = ["mlx", "metal", "distributed", "onig", "esaxx_fast"]
 distributed = ["eredu-backend-mlx?/distributed"]
 
 mlx = ["dep:eredu-backend-mlx", "dep:safemlx"]
+candle = ["dep:eredu-backend-candle"]
+candle-metal = ["candle", "eredu-backend-candle/metal"]
+candle-cuda = ["candle", "eredu-backend-candle/cuda"]
 accelerate = ["eredu-backend-mlx?/accelerate"]
 projection-profiling = ["mlx", "eredu-backend-mlx/projection-profiling"]
 metal = [
@@ -324,8 +327,8 @@ cuda = ["eredu-backend-mlx?/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
 nccl = ["cuda", "distributed", "eredu-backend-mlx?/nccl"]
-image = ["eredu-architectures/image", "eredu-backend-mlx?/image"]
-audio = ["eredu-architectures/audio", "eredu-backend-mlx?/audio"]
+image = ["eredu-architectures/image", "eredu-backend-mlx?/image", "eredu-backend-candle?/image"]
+audio = ["eredu-architectures/audio", "eredu-backend-mlx?/audio", "eredu-backend-candle?/audio"]
 
 [lints]
 workspace = true
@@ -333,6 +336,7 @@ workspace = true
 [dependencies]
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }
+eredu-backend-candle = { workspace = true, optional = true }
 safemlx = { workspace = true, optional = true, features = ["safetensors"] }
 eredu-core.workspace = true
 eredu-checkpoint.workspace = true

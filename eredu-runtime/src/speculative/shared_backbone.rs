@@ -678,7 +678,7 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     where
         Self: 'a;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
+    type Telemetry = ();
     type Error = M::Error;
 
     fn max_proposals(&self) -> usize {
@@ -1039,15 +1039,17 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
     where
         Self: 'context,
     {
-        let mut seed = seed.clone();
+        let seed = seed.clone();
         #[cfg(feature = "tensor-capture")]
-        {
+        let seed = {
+            let mut seed = seed;
             seed.activations = self
                 .observer
                 .as_ref()
                 .map(|observer| observer.activation_checkpoint())
                 .transpose()?;
-        }
+            seed
+        };
         Ok(Some((
             M::checkpoint(cache)
                 .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
@@ -1081,11 +1083,12 @@ impl<M: SharedBackboneMechanisms> SpeculativeExecutor for SharedBackboneExecutor
         if let Some(prepared) = prepared {
             prepared.commit();
         }
-        let mut seed = seed.clone();
+        let seed = seed.clone();
         #[cfg(feature = "tensor-capture")]
-        {
-            seed.activations = None;
-        }
+        let seed = SharedBackboneSeed {
+            activations: None,
+            ..seed
+        };
         Ok(Some(seed))
     }
 }

@@ -2,7 +2,12 @@
 
 use super::{HybridCacheStorage, HybridState, KeyValueState, PoolingAttentionState};
 use crate::{
-    cache::live::{CacheExport, CacheResidencyManager, RestoredCache},
+    cache::{
+        live::{CacheExport, CacheResidencyManager, RestoredCache},
+        publish_prompt_cache,
+        resident_persistence::{ResidentExport, ResidentRestore},
+        PromptCacheRestore,
+    },
     replicated_session::StateSnapshotMemoryCosts,
     CacheResidencyReport, LayerRuntimeState,
 };
@@ -11,7 +16,7 @@ use eredu_core::{
         mechanisms::{
             CacheTensorStorage, PagedKeyValueStorage, PoolingCacheStorage, ResidentKeyValueStorage,
         },
-        PromptCacheDescriptor,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheStore,
     },
     execution_control::SnapshotEstimate,
     BackendFailure,
@@ -134,6 +139,32 @@ where
         descriptor: &PromptCacheDescriptor,
         layer_frontiers: &[i32],
     ) -> Result<CacheExport<C>, BackendFailure>;
+    /// Persists the selected contiguous state using the shared block and fixed-state format.
+    fn publish_resident_cache(
+        &mut self,
+        _store: &dyn PromptCacheStore,
+        _descriptor: PromptCacheDescriptor,
+        _prefix: &[u32],
+        _options: &PromptCacheOptions,
+        _queue: &C::Queue,
+    ) -> Result<PromptCacheManifest, BackendFailure> {
+        Err(resident_cache_error(
+            "resident prompt cache is unavailable for this state owner",
+        ))
+    }
+
+    /// Installs validated contiguous state into a fresh owner.
+    fn install_resident_cache(
+        &mut self,
+        _restore: &PromptCacheRestore<'_>,
+        _frontiers: &[i32],
+        _queue: &C::Queue,
+    ) -> Result<(), BackendFailure> {
+        Err(resident_cache_error(
+            "resident prompt cache is unavailable for this state owner",
+        ))
+    }
+
     /// Reports residency measured by the active portable cache.
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, BackendFailure>;
     /// Borrows all native roots retained by this state.
@@ -148,6 +179,13 @@ where
         checkpoint: &Self,
         stream: &C::Queue,
     ) -> Result<(), BackendFailure>;
+}
+
+fn resident_cache_error(detail: &'static str) -> BackendFailure {
+    BackendFailure::new(
+        eredu_core::BackendFailureKind::InvalidInput,
+        std::io::Error::other(detail),
+    )
 }
 
 impl<B, C> PortableTextState<B, C> for KeyValueState<C>
@@ -231,6 +269,44 @@ where
         _layer_frontiers: &[i32],
     ) -> Result<CacheExport<C>, BackendFailure> {
         KeyValueState::<C>::cache_export(self, descriptor).map_err(BackendFailure::from_error)
+    }
+
+    fn publish_resident_cache(
+        &mut self,
+        store: &dyn PromptCacheStore,
+        descriptor: PromptCacheDescriptor,
+        prefix: &[u32],
+        options: &PromptCacheOptions,
+        queue: &C::Queue,
+    ) -> Result<PromptCacheManifest, BackendFailure> {
+        let frontiers = descriptor
+            .layer_frontiers(prefix.len())
+            .map_err(BackendFailure::from_error)?;
+        let mut export = ResidentExport::new(queue);
+        for (layer, (state, frontier)) in self.as_mut().iter_mut().zip(frontiers).enumerate() {
+            let super::KeyValueLayerState::Device(cache) = state else {
+                return Err(resident_cache_error("expected resident key/value layer"));
+            };
+            export.add_attention(layer, frontier, cache)?;
+        }
+        publish_prompt_cache(&export, store, descriptor, prefix, options)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn install_resident_cache(
+        &mut self,
+        restore: &PromptCacheRestore<'_>,
+        frontiers: &[i32],
+        queue: &C::Queue,
+    ) -> Result<(), BackendFailure> {
+        let mut target = ResidentRestore::new(restore, queue);
+        for (layer, (state, &frontier)) in self.as_mut().iter_mut().zip(frontiers).enumerate() {
+            let super::KeyValueLayerState::Device(cache) = state else {
+                return Err(resident_cache_error("expected resident key/value layer"));
+            };
+            target.install_attention(layer, frontier, cache)?;
+        }
+        target.finish()
     }
 
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, BackendFailure> {
@@ -354,6 +430,72 @@ where
     ) -> Result<CacheExport<C>, BackendFailure> {
         HybridState::<C>::cache_export(self, descriptor, layer_frontiers)
             .map_err(BackendFailure::from_error)
+    }
+
+    fn publish_resident_cache(
+        &mut self,
+        store: &dyn PromptCacheStore,
+        descriptor: PromptCacheDescriptor,
+        prefix: &[u32],
+        options: &PromptCacheOptions,
+        queue: &C::Queue,
+    ) -> Result<PromptCacheManifest, BackendFailure> {
+        let frontiers = descriptor
+            .layer_frontiers(prefix.len())
+            .map_err(BackendFailure::from_error)?;
+        let mut export = ResidentExport::new(queue);
+        for (layer, (state, frontier)) in self.layers_mut().iter_mut().zip(frontiers).enumerate() {
+            if state.position() != frontier {
+                return Err(resident_cache_error(
+                    "resident state differs from the prefix frontier",
+                ));
+            }
+            if let Some(cache) = state.resident_key_value() {
+                export.add_attention(layer, frontier, cache)?;
+            }
+            for (role, value) in state.fixed_components() {
+                let value =
+                    value.ok_or_else(|| resident_cache_error("missing resident fixed tensor"))?;
+                export.add_state(layer, role, value)?;
+            }
+        }
+        publish_prompt_cache(&export, store, descriptor, prefix, options)
+            .map_err(BackendFailure::from_error)
+    }
+
+    fn install_resident_cache(
+        &mut self,
+        restore: &PromptCacheRestore<'_>,
+        frontiers: &[i32],
+        queue: &C::Queue,
+    ) -> Result<(), BackendFailure> {
+        let mut target = ResidentRestore::new(restore, queue);
+        for (layer, &frontier) in frontiers.iter().enumerate() {
+            let roles = self
+                .layout()
+                .layers()
+                .get(layer)
+                .ok_or_else(|| resident_cache_error("unexpected restored layer"))?
+                .fixed_state()
+                .iter()
+                .map(|tensor| tensor.role)
+                .collect::<Vec<_>>();
+            let state = self.layer(layer).map_err(BackendFailure::from_error)?;
+            if let Some(cache) = state.resident_key_value() {
+                target.install_attention(layer, frontier, cache)?;
+            } else {
+                state
+                    .advance_fixed(frontier)
+                    .map_err(BackendFailure::from_error)?;
+            }
+            for role in roles {
+                *state
+                    .fixed_component(role)
+                    .map_err(BackendFailure::from_error)? =
+                    Some(target.install_state(layer, role)?);
+            }
+        }
+        target.finish()
     }
 
     fn residency_report(&self) -> Result<Option<CacheResidencyReport>, BackendFailure> {

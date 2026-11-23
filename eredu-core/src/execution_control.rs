@@ -9,7 +9,7 @@ use std::sync::{
 
 mod snapshot_native;
 mod snapshot_value;
-pub use snapshot_native::{SamplingGrowthCosts, TextSnapshotNative};
+pub use snapshot_native::{SamplingGrowthCosts, TextModeSnapshotNative, TextSnapshotNative};
 pub use snapshot_value::{
     snapshot_value_estimate, SnapshotCostOverflow, SnapshotRetention, SnapshotValue,
 };

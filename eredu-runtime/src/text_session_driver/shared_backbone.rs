@@ -12,7 +12,7 @@ use eredu_core::speculative::{
 use eredu_core::BoundedCompletionWait;
 use std::num::NonZeroUsize;
 
-impl<R: 'static, N> TextSessionDriver<R, N> {
+impl<R: 'static, N, G> TextSessionDriver<R, N, G> {
     /// Replays authoritative tokens into the installed causal cache and retains
     /// the score row needed to resume generation after a mode transition.
     pub fn append_committed_suffix<B, M>(

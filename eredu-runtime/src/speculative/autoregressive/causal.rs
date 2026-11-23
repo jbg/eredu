@@ -58,7 +58,7 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
     where
         Self: 'a;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
+    type Telemetry = ();
     type Error = M::Error;
 
     fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {

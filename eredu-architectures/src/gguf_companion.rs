@@ -277,6 +277,7 @@ pub(crate) fn resolve_media_projector(
     let model_metadata = metadata(primary);
     let projector_metadata = metadata(projector);
     let mut qwen_vision = None;
+    let mut gemma_projector_names = None;
     let (model, checkpoint) = match primary_plan.model() {
         GgufModelConfig::Qwen4Exp(target) => {
             let vision = crate::qwen4_exp::prepared::GgufVisionPlan::prepare(
@@ -303,13 +304,20 @@ pub(crate) fn resolve_media_projector(
             )
         }
         GgufModelConfig::Gemma4(family) => {
-            let family = crate::gemma4::family_from_gguf_metadata(
+            use crate::gemma4::{checkpoint::mmproj_gguf_layout, projector};
+            let family = projector::family_from_gguf_projector(
                 family.text.clone(),
                 &model_metadata,
-                Some(&projector_metadata),
+                &projector_metadata,
+                projector,
             )
             .map_err(|error| error.to_string())?;
-            let checkpoint = crate::gemma4::mmproj_gguf_plan(&family)?;
+            let (checkpoint, names) = mmproj_gguf_layout(
+                &family,
+                projector::published_vision(&projector_metadata),
+                projector::published_audio(&projector_metadata),
+            )?;
+            gemma_projector_names = Some(names);
             (GgufMediaProjectorConfig::Gemma4(family), checkpoint)
         }
         GgufModelConfig::Inkling(args) => {
@@ -389,7 +397,13 @@ pub(crate) fn resolve_media_projector(
             .map_err(|error| error.to_string())?,
         _ => primary_plan.tensor_mapping().to_vec(),
     };
-    let tensor_mapping = canonical_projector_mapping(projector, &model)?;
+    let tensor_mapping = if let Some(names) = gemma_projector_names {
+        projector
+            .translated_outputs(|name| names.get(name).cloned().unwrap_or_else(|| name.into()))
+            .map_err(|error| error.to_string())?
+    } else {
+        canonical_projector_mapping(projector, &model)?
+    };
     let qwen_text = match &model {
         GgufMediaProjectorConfig::Qwen3Vl(args) => {
             Some(crate::qwen::Declaration::new(args.text.clone()))

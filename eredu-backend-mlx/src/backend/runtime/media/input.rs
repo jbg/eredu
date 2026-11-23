@@ -39,6 +39,18 @@ pub(crate) fn host_token_ids(tokens: &Array) -> Result<Vec<u32>, crate::backend:
                 })
             })
             .collect(),
+        // Concatenating unsigned token parts with signed placeholder parts
+        // can promote the assembled decoder sequence to Int64.
+        Dtype::Int64 => evaluated
+            .try_to_vec::<i64>()
+            .map_err(|error| Error::Other(Box::new(error)))?
+            .into_iter()
+            .map(|id| {
+                u32::try_from(id).map_err(|_| {
+                    Error::ArchitectureModel("decoder alignment token ID is outside u32".into())
+                })
+            })
+            .collect(),
         _ => Err(Error::ArchitectureModel(
             "decoder alignment requires integer token IDs".into(),
         )),

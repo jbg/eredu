@@ -1241,7 +1241,7 @@ where
     /// Constructs one compact gated-product operator from acquired bindings.
     fn gated_product_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedGatedProductSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::GatedProductGroups, Self::Error>;
@@ -1249,7 +1249,7 @@ where
     /// Constructs one compact selected-linear bank from acquired bindings.
     fn linear_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedLinearSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::LinearGroups, Self::Error>;
@@ -1257,7 +1257,7 @@ where
     /// Constructs compact ReLU-squared projections.
     fn relu2_groups(
         &mut self,
-        acquisition: &Self::Acquisition,
+        acquisition: &mut Self::Acquisition,
         spec: &eredu_nn::GroupedRelu2Spec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Relu2Groups, Self::Error>;

@@ -598,6 +598,10 @@ pub trait Config: 'static {
     fn head_dim(&self) -> i32;
     /// RMSNorm epsilon.
     fn rms_norm_epsilon(&self) -> f32;
+    /// Reduction and gain rounding used by the decoder RMS normalizations.
+    fn normalization_reduction(&self) -> eredu_nn::NormalizationReduction {
+        eredu_nn::NormalizationReduction::Native
+    }
     /// Offset added to learned RMS normalization scales.
     fn normalization_offset(&self) -> f32 {
         0.0
@@ -732,8 +736,14 @@ pub trait Config: 'static {
 
 /// Additional neural mechanisms selected by shared decoder equation policy.
 pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOperatorCapabilities {
-    use eredu_nn::{GatedProductActivation, NeuralOperatorCapabilities as Caps};
+    use eredu_nn::NeuralOperatorCapabilities as Caps;
     let mut required = Caps::NONE;
+    if config.rotary_enabled()
+        && config.rotary_spec(config.head_dim()).arithmetic
+            == eredu_nn::RotaryArithmetic::RecurrentFloat32
+    {
+        required = required.union(Caps::RECURRENT_F32_ROTARY);
+    }
     if config.query_position_scaling().is_some() {
         required = required.union(Caps::CAST_FLOAT);
     }
@@ -753,11 +763,8 @@ pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOpe
     if config.attention_softcap().is_some() {
         required = required.union(Caps::ATTENTION_SOFTCAP);
     }
-    if config
-        .gated_product_policy()
-        .is_some_and(|p| matches!(p.activation(), GatedProductActivation::GeluApproximate))
-    {
-        required = required.union(Caps::GELU_APPROXIMATE);
+    if let Some(policy) = config.gated_product_policy() {
+        required = required.union(policy.activation().required_operator_capabilities());
     }
     required
 }
@@ -4161,6 +4168,18 @@ impl StaticModuleConstruction {
 
 impl StaticModuleSpec {
     pub(crate) fn construction_specs(&self) -> Result<StaticModuleConstruction, Error> {
+        self.construction_specs_with_reduction(eredu_nn::NormalizationReduction::Native)
+    }
+
+    fn construction_from_config(config: &impl Config) -> Result<StaticModuleConstruction, Error> {
+        Self::from_config(config)
+            .construction_specs_with_reduction(config.normalization_reduction())
+    }
+
+    fn construction_specs_with_reduction(
+        &self,
+        reduction: eredu_nn::NormalizationReduction,
+    ) -> Result<StaticModuleConstruction, Error> {
         let embedding = EmbeddingSpec {
             vocabulary: self.vocabulary,
             dimensions: self.hidden_size,
@@ -4187,7 +4206,7 @@ impl StaticModuleSpec {
         let weight =
             ParameterSpec::trainable(&self.normalization_weight).map_err(Error::backend)?;
         let normalization = NormalizationConstructionSpec {
-            reduction: eredu_nn::NormalizationReduction::Native,
+            reduction,
             groups: self.normalization_groups,
             dimensions: self.hidden_size,
             epsilon: self.normalization_epsilon,
@@ -4549,7 +4568,7 @@ impl<B: NeuralBackend> StaticModules<B> {
         config: &C,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Self::from_spec(StaticModuleSpec::from_config(config), context)
+        Self::from_construction(StaticModuleSpec::construction_from_config(config)?, context)
     }
 
     /// Builds rank-local pinned modules for a decoder family.
@@ -4561,8 +4580,8 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        Self::from_parallel_spec(
-            StaticModuleSpec::from_config(config),
+        Self::from_parallel_construction(
+            StaticModuleSpec::construction_from_config(config)?,
             geometry.embedding_range().clone(),
             geometry.output_range().cloned(),
             context,

@@ -259,7 +259,7 @@ fn gguf_source_padding_does_not_admit_an_invalid_executable_format() {
     )
     .unwrap();
     assert!(!descriptor.has_valid_direct_geometry());
-    assert!(!descriptor.has_valid_transform_geometry());
+    assert!(!descriptor.supports_word_transform());
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn packed_scalars_cannot_bypass_axis_validation_in_direct_source_branches() {
         )
         .unwrap();
         assert!(!descriptor.has_valid_direct_geometry());
-        assert!(!descriptor.has_valid_transform_geometry());
+        assert!(!descriptor.supports_word_transform());
     }
     let scalar = WeightLoweringDescriptor::new(
         SourceTensorEncoding::Safetensors(StoredDtype::F32),
@@ -554,7 +554,7 @@ fn portable_lowering_geometry_preserves_padding_packing_and_overflow_rejections(
     )
     .unwrap();
     assert!(!nonfinal.has_valid_direct_geometry());
-    assert!(!nonfinal.has_valid_transform_geometry());
+    assert!(!nonfinal.supports_word_transform());
     assert!(WeightLoweringDescriptor::new(
         SourceTensorEncoding::Safetensors(StoredDtype::F16),
         affine,

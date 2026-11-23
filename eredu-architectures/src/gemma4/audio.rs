@@ -175,20 +175,43 @@ impl AudioPolicy {
 #[serde(try_from = "AudioPolicy")]
 pub struct AudioConfig {
     policy: AudioPolicy,
+    pub(crate) published_gguf: bool,
     pinned: std::sync::Arc<specs::StaticSpec>,
     layers: std::sync::Arc<Vec<specs::BlockSpec>>,
 }
 impl AudioConfig {
+    pub(crate) fn arithmetic_capabilities(&self) -> eredu_nn::NeuralOperatorCapabilities {
+        use eredu_nn::NeuralOperatorCapabilities as C;
+        if !self.published_gguf {
+            return C::NONE;
+        }
+        self.pinned
+            .subsampling
+            .iter()
+            .fold(C::FUSED_F16_PROJECTION, |capabilities, layer| {
+                capabilities.union(layer.norm.arithmetic.required_operator_capabilities())
+            })
+    }
+
     /// Validates external policy and declares every source parameter before allocation.
     pub fn new(policy: AudioPolicy) -> Result<Self, AudioConfigError> {
+        Self::from_projector_policy(policy, false)
+    }
+
+    pub(super) fn from_projector_policy(
+        policy: AudioPolicy,
+        published_gguf: bool,
+    ) -> Result<Self, AudioConfigError> {
         policy.validate()?;
-        let pinned = specs::StaticSpec::new(&policy).map_err(audio_declaration_error)?;
+        let pinned =
+            specs::StaticSpec::new(&policy, published_gguf).map_err(audio_declaration_error)?;
         let layers = (0..policy.num_hidden_layers as usize)
             .map(|layer| specs::BlockSpec::at(&policy, layer))
             .collect::<Result<Vec<_>, _>>()
             .map_err(audio_declaration_error)?;
         let config = Self {
             policy,
+            published_gguf,
             pinned: pinned.into(),
             layers: layers.into(),
         };
@@ -321,15 +344,19 @@ struct SubsampleLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     epsilon: f32,
     #[parameter(skip)]
+    published_gguf: bool,
+    #[parameter(skip)]
     arithmetic: eredu_nn::LayerNormalizationArithmetic,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleLayer<B> {
     fn new(
         spec: specs::SubsampleSpec,
+        published_gguf: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
+            published_gguf,
             weight: Parameter::unloaded(spec.weight, &spec.shape, context)?,
             norm_weight: Parameter::unloaded(
                 spec.norm
@@ -348,15 +375,20 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleLayer<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let convolved = B::Tensor::conv2d(
-            input,
-            self.weight.as_ref(),
-            (2, 2),
-            (1, 1),
-            (1, 1),
-            1,
-            context,
-        )?;
+        let weight = self.weight.as_ref();
+        let input = match weight.element_type() {
+            Some(dtype) if input.element_type() != Some(dtype) => {
+                input.cast_float(dtype, context)?
+            }
+            _ => input.clone(),
+        };
+        let convolved = if self.published_gguf
+            && weight.element_type() == Some(eredu_nn::TensorElementType::F32)
+        {
+            published_subsample_convolution(&input, weight, context)?
+        } else {
+            B::Tensor::conv2d(&input, weight, (2, 2), (1, 1), (1, 1), 1, context)?
+        };
         B::Tensor::layer_norm(
             &convolved,
             Some(self.norm_weight.as_ref()),
@@ -367,6 +399,55 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleLayer<B> {
         )?
         .maximum_scalar(0.0, context)
     }
+}
+
+fn published_subsample_convolution<T: Tensor>(
+    input: &T,
+    weight: &T,
+    context: &T::Context,
+) -> Result<T, Error> {
+    let [batch, time, frequency, channels] = <[i32; 4]>::try_from(input.shape())
+        .map_err(|_| Error::backend("invalid audio subsampling input"))?;
+    let outputs = weight.dim(0);
+    // Convolutions unfold in channel, time, frequency order.
+    let out_time = (time + 1) / 2;
+    let out_frequency = (frequency + 1) / 2;
+    let padded_frequency = frequency + 2;
+    let positions = out_time * out_frequency;
+    let mut offsets = Vec::with_capacity(positions as usize * 9);
+    for row in 0..out_time {
+        for column in 0..out_frequency {
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    offsets.push((2 * row + dy) * padded_frequency + 2 * column + dx);
+                }
+            }
+        }
+    }
+    let offsets = T::from_i32_slice(&offsets, &[positions, 9], context)?;
+    let patches = T::pad(
+        input,
+        &[(0, 0), (1, 1), (1, 1), (0, 0)],
+        PadMode::Constant,
+        context,
+    )?
+    .reshape(&[batch, (time + 2) * padded_frequency, channels], context)?
+    .take_axis(&offsets, 1, context)?
+    .transpose_axes(&[0, 1, 3, 2], context)?
+    .compact(context)?
+    .reshape(&[batch * positions, 9 * channels], context)?;
+    let weight = weight
+        .transpose_axes(&[0, 3, 1, 2], context)?
+        .compact(context)?
+        .reshape(&[outputs, 9 * channels], context)?;
+    // The nine-tap projection uses a wide reduction. The second projection
+    // rounds each of its eight accumulation lanes to binary16.
+    let projected = if channels == 1 {
+        T::linear_f16_operands(&patches, &weight, context)?
+    } else {
+        T::linear_f16_fused_accumulation(&patches, &weight, context)?
+    };
+    projected.reshape(&[batch, out_time, out_frequency, outputs], context)
 }
 
 #[derive(Debug, Clone, Parameterized)]
@@ -383,13 +464,14 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleProjection<
     fn new(
         layers: [specs::SubsampleSpec; 2],
         input: LinearSpec,
+        published_gguf: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let [first, second] = layers;
         let input_width = input.input;
         Ok(Self {
-            layer0: SubsampleLayer::new(first, context)?,
-            layer1: SubsampleLayer::new(second, context)?,
+            layer0: SubsampleLayer::new(first, published_gguf, context)?,
+            layer1: SubsampleLayer::new(second, published_gguf, context)?,
             input_projection: B::linear(input, context)?,
             input_width,
         })
@@ -433,6 +515,7 @@ struct AudioFeedForward<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioFeedForward<B> {
     fn new(
         spec: specs::FeedForwardSpec,
+        published_gguf: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         eredu_nn::DeclareLogicalParameters::logical_parameters(&spec)?;
@@ -444,14 +527,16 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioFeedForward<B> 
                     bounds: spec.first_bounds,
                 },
                 context,
-            )?,
+            )?
+            .with_rounded_weight_inputs(published_gguf),
             second: MediaLinear::new(
                 eredu_nn::ClippedLinearSpec {
                     linear: spec.network.down,
                     bounds: spec.second_bounds,
                 },
                 context,
-            )?,
+            )?
+            .with_rounded_weight_inputs(published_gguf),
             post_norm: B::normalization(spec.post, context)?,
             residual_weight: spec.residual_weight,
             activation: spec.network.activation,
@@ -495,15 +580,18 @@ struct LightConv1d<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LightConv1d<B> {
     fn new(
         spec: specs::ConvolutionSpec,
+        published_gguf: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let shape = spec.depthwise.shape();
         Ok(Self {
             pre_norm: B::normalization(spec.pre, context)?,
-            linear_start: MediaLinear::new(spec.input, context)?,
+            linear_start: MediaLinear::new(spec.input, context)?
+                .with_rounded_weight_inputs(published_gguf),
             depthwise_weight: Parameter::unloaded(spec.depthwise.weight, &shape, context)?,
             conv_norm: B::normalization(spec.norm, context)?,
-            linear_end: MediaLinear::new(spec.output, context)?,
+            linear_end: MediaLinear::new(spec.output, context)?
+                .with_rounded_weight_inputs(published_gguf),
             kernel_size: spec.depthwise.kernel_size,
             hidden_size: spec.depthwise.channels,
         })
@@ -560,6 +648,8 @@ struct AudioAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     relative_key: B::Linear,
     per_dimension_scale: Parameter<B::Tensor>,
     #[parameter(skip)]
+    published_gguf: bool,
+    #[parameter(skip)]
     heads: i32,
     #[parameter(skip)]
     head_dim: i32,
@@ -578,6 +668,7 @@ struct AudioAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
     fn new(
         spec: specs::AttentionSpec,
+        published_gguf: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         spec.logical_parameters()?;
@@ -585,16 +676,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
         let hidden_size = spec.projections.projection.query.input;
         let [query, key, value, output] = spec.projections.into_projections()?;
         Ok(Self {
-            query: MediaLinear::new(query, context)?,
-            key: MediaLinear::new(key, context)?,
-            value: MediaLinear::new(value, context)?,
-            output: MediaLinear::new(output, context)?,
+            query: MediaLinear::new(query, context)?.with_rounded_weight_inputs(published_gguf),
+            key: MediaLinear::new(key, context)?.with_rounded_weight_inputs(published_gguf),
+            value: MediaLinear::new(value, context)?.with_rounded_weight_inputs(published_gguf),
+            output: MediaLinear::new(output, context)?.with_rounded_weight_inputs(published_gguf),
             relative_key: B::linear(spec.relative_key, context)?,
             per_dimension_scale: Parameter::unloaded(
                 spec.scale.weight,
                 &[spec.scale.dimensions],
                 context,
             )?,
+            published_gguf,
             heads: heads.query_heads(),
             head_dim: heads.key_dimensions(),
             hidden_size,
@@ -633,45 +725,59 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
                 context,
             )?
         };
-        let query_scale = B::softplus(self.per_dimension_scale.as_ref().clone(), 1.0, context)?
-            .multiply_scalar(
-                (self.head_dim as f32).powf(-0.5) / std::f32::consts::LN_2,
-                context,
-            )?;
+        use eredu_nn::TensorElementType;
+        let fp32 = |value: B::Tensor| match value.element_type() {
+            Some(TensorElementType::F16 | TensorElementType::Bf16) => {
+                value.cast_float(TensorElementType::F32, context)
+            }
+            _ => Ok(value),
+        };
+        let query_scale = self.per_dimension_scale.as_ref().clone();
+        let query_scale = if self.published_gguf {
+            query_scale
+        } else {
+            B::softplus(query_scale, 1.0, context)?
+        };
+        let query_coefficient = (self.head_dim as f32).powf(-0.5) / std::f32::consts::LN_2;
         let key_scale = 1.0_f32.exp().ln_1p() / std::f32::consts::LN_2;
-        let query = self
-            .query
-            .forward(&hidden, context)?
+        let query = fp32(self.query.forward(&hidden, context)?)?
             .reshape(
                 &[batch, padded_sequence, self.heads, self.head_dim],
                 context,
             )?
             .transpose_axes(&[0, 2, 1, 3], context)?
-            .multiply(&query_scale, context)?;
-        let key = self
-            .key
-            .forward(&hidden, context)?
+            .multiply_scalar(query_coefficient, context)?
+            .multiply(&fp32(query_scale)?, context)?;
+        let key = fp32(self.key.forward(&hidden, context)?)?
             .reshape(
                 &[batch, padded_sequence, self.heads, self.head_dim],
                 context,
             )?
             .transpose_axes(&[0, 2, 1, 3], context)?
             .multiply_scalar(key_scale, context)?;
-        let value = self
-            .value
-            .forward(&hidden, context)?
+        let value = fp32(self.value.forward(&hidden, context)?)?
             .reshape(
                 &[batch, padded_sequence, self.heads, self.head_dim],
                 context,
             )?
             .transpose_axes(&[0, 2, 1, 3], context)?;
-        let relative = self
-            .relative_key
-            .forward(&self.relative_embeddings(context)?, context)?
-            .reshape(&[self.past + 1, self.heads, self.head_dim], context)?
-            .transpose_axes(&[1, 0, 2], context)?
-            .expand_dims(0, context)?
-            .swap_axes(2, 3, context)?;
+        let relative_embeddings = self.relative_embeddings(context)?;
+        let relative_embeddings = match input.element_type() {
+            Some(dtype @ (TensorElementType::F16 | TensorElementType::Bf16)) => {
+                relative_embeddings.cast_float(dtype, context)?
+            }
+            _ => relative_embeddings,
+        };
+        let relative = fp32(super::media::forward_linear(
+            &mut self.relative_key,
+            &relative_embeddings,
+            self.published_gguf,
+            context,
+        )?)?
+        .reshape(&[self.past + 1, self.heads, self.head_dim], context)?
+        .transpose_axes(&[1, 0, 2], context)?
+        .expand_dims(0, context)?
+        .swap_axes(2, 3, context)?;
         let mut outputs = Vec::new();
         for start in (0..padded_sequence).step_by(self.chunk_size as usize) {
             let key_start = (start - self.past).max(0);
@@ -746,12 +852,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mask = B::Tensor::stack(&masks, 0, context)?;
-            logits = logits
-                .multiply_scalar(1.0 / self.logit_cap, context)?
-                .tanh(context)?
-                .multiply_scalar(self.logit_cap, context)?
-                .add(&mask, context)?;
-            let probabilities = logits.softmax_axis(-1, false, context)?;
+            let probabilities =
+                logits.capped_attention_probabilities(&mask, self.logit_cap, context)?;
             outputs.push(B::Tensor::matmul(&probabilities, &value_chunk, context)?);
         }
         let output = B::Tensor::concatenate(&outputs, 2, context)?
@@ -766,6 +868,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
             )?
             .transpose_axes(&[0, 2, 1, 3], context)?
             .reshape(&[batch, sequence, self.heads * self.head_dim], context)?;
+        let output = match input.element_type() {
+            Some(dtype @ (TensorElementType::F16 | TensorElementType::Bf16)) => {
+                output.cast_float(dtype, context)?
+            }
+            _ => output,
+        };
         self.output.forward(&output, context)
     }
 }
@@ -792,12 +900,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioLayer<B> {
     ) -> Result<Self, Error> {
         let spec = config.layer(layer)?.clone();
         Ok(Self {
-            feed_forward1: AudioFeedForward::new(spec.first, context)?,
+            feed_forward1: AudioFeedForward::new(spec.first, config.published_gguf, context)?,
             pre_attention_norm: B::normalization(spec.pre_attention, context)?,
-            attention: AudioAttention::new(spec.attention, context)?,
+            attention: AudioAttention::new(spec.attention, config.published_gguf, context)?,
             post_attention_norm: B::normalization(spec.post_attention, context)?,
-            light_convolution: LightConv1d::new(spec.convolution, context)?,
-            feed_forward2: AudioFeedForward::new(spec.second, context)?,
+            light_convolution: LightConv1d::new(spec.convolution, config.published_gguf, context)?,
+            feed_forward2: AudioFeedForward::new(spec.second, config.published_gguf, context)?,
             output_norm: B::normalization(spec.output, context)?,
         })
     }
@@ -843,7 +951,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
     ) -> Result<Self, Error> {
         let spec = config.pinned().clone();
         let output_projection = B::linear(spec.output_construction(), context)?;
-        let subsampling = SubsampleProjection::new(spec.subsampling, spec.input, context)?;
+        let subsampling =
+            SubsampleProjection::new(spec.subsampling, spec.input, config.published_gguf, context)?;
         Ok(Self {
             config,
             subsampling,
@@ -885,7 +994,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let hidden = B::Tensor::concatenate(&hidden, 1, context)?;
-        self.output_projection.forward(&hidden, context)
+        super::media::forward_linear(
+            &mut self.output_projection,
+            &hidden,
+            self.config.published_gguf,
+            context,
+        )
     }
 
     /// Validated configuration retained by the tower.

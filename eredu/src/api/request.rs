@@ -594,24 +594,27 @@ pub(super) enum GenerationStepKind {
     Failed,
 }
 
-pub(super) struct BackendGenerationTokenSource<'a, B, S>
+pub(super) struct BackendGenerationTokenSource<'a, 'delivery, B, S>
 where
     B: eredu_core::TextGenerationBackend,
     S: eredu_core::TextExecutionSession<B>,
 {
     pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController, S>,
-    pub(super) on_token: Option<&'a mut GenerationStepCallback<'a>>,
-    pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
+    pub(super) on_token: Option<&'delivery mut GenerationStepCallback<'delivery>>,
+    pub(super) delivery_failure:
+        Option<&'delivery dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
     pub(super) generation_started: std::time::Instant,
     pub(super) time_to_first_token: Option<std::time::Duration>,
+    pub(super) prompt_cache: Option<super::prompt_cache::PromptCacheRun<'a, B, S>>,
+    pub(super) cancellation: GenerationCancellationToken,
 }
 
-impl<B, S> CommittedTokenSource for BackendGenerationTokenSource<'_, B, S>
+impl<B, S> CommittedTokenSource for BackendGenerationTokenSource<'_, '_, B, S>
 where
     B: eredu_core::TextGenerationBackend,
     S: eredu_core::TextExecutionSession<B>,
 {
-    type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
+    type Error = PreparedChatError;
 
     fn finish_step<T, E>(
         &mut self,
@@ -622,11 +625,7 @@ where
         self.generator.finish_text_preparation_cancellable(
             eredu_core::run_preparation::TextPreparationStage::Delivery,
             local.map(|value| (!cancelled).then_some(value)),
-            |error| {
-                map_source(eredu_core::ControlledTextGenerationError::Preparation(
-                    error,
-                ))
-            },
+            |error| map_source(PreparedChatError::Backend(error)),
         )
     }
 
@@ -650,18 +649,17 @@ where
                         started.elapsed().as_secs_f64(),
                     );
                 }
-                return Err(error);
+                return Err(super::loaded::map_controlled_generation_error(error));
             }
         };
         #[cfg(feature = "tensor-capture")]
-        let capture = self
-            .generator
-            .take_captured_step()
-            .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
+        let capture = self.generator.take_captured_step().map_err(|error| {
+            PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+        })?;
         #[cfg(not(feature = "tensor-capture"))]
-        self.generator
-            .settle_step()
-            .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
+        self.generator.settle_step().map_err(|error| {
+            PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+        })?;
         let (outcome, record) = match advance {
             Some(eredu_core::TextAdvancement::ModeChanged(acknowledgement)) => (
                 SourceAdvancement::Progress,
@@ -700,6 +698,20 @@ where
                 started.elapsed().as_secs_f64(),
             );
         }
+        let publishable =
+            matches!(outcome, SourceAdvancement::Progress) && self.delivery_failure().is_none();
+        let step = self.generator.position().execution_step;
+        if let Some(cache) = self
+            .prompt_cache
+            .as_mut()
+            .filter(|cache| publishable && cache.publication_due(step, &self.cancellation))
+        {
+            if let Some(runtime) = self.generator.prefill_boundary().map_err(|error| {
+                PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+            })? {
+                cache.publish(runtime, &self.cancellation)?;
+            }
+        }
         Ok(outcome)
     }
 
@@ -707,7 +719,7 @@ where
         self.generator
             .controller_mut()
             .grammar_is_complete()
-            .map_err(eredu_core::ControlledTextGenerationError::Controller)
+            .map_err(PreparedChatError::Constraint)
     }
 }
 

@@ -10,6 +10,9 @@ use safemlx::{
 /// Applies the SiLU activation function.
 pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
     let dtype = x.dtype();
+    if dtype == safemlx::Dtype::Float32 && x.ndim() > 0 && super::ordered_f32::supported(stream)? {
+        return super::ordered_f32::silu(&x, stream);
+    }
     // SiLU is one pointwise operation. Keep its intermediate sigmoid in FP32
     // for low-precision input so it is rounded only once at the output.
     let work = match dtype {
@@ -117,6 +120,7 @@ pub(crate) fn gated_product(
             }
             gelu_approximate(gate, stream)?
         }
+        GatedProductActivation::GeluApproximateF16 => gelu_approximate_f16(gate, stream)?,
         _ => return Err(Exception::custom("unsupported gated-product activation")),
     };
     gate.multiply(up, stream)
@@ -215,6 +219,35 @@ fn metal_bf16_gelu(input: &Array, stream: &Stream) -> MlxResult<Array> {
             stream,
         )
     })
+}
+
+pub(crate) fn gelu_approximate_f16(x: impl AsRef<Array>, stream: &Stream) -> MlxResult<Array> {
+    let x = x.as_ref();
+    if x.dtype() != safemlx::Dtype::Float32 {
+        return gelu_approximate(x, stream);
+    }
+
+    thread_local! {
+        static TABLE: std::cell::OnceCell<Array> = const { std::cell::OnceCell::new() };
+    }
+    let table = TABLE.with(|slot| {
+        slot.get_or_init(|| {
+            let values = eredu_nn::activations::gelu_approximate_f16_table();
+            Array::from_slice(values, &[values.len() as i32])
+        })
+        .clone()
+    });
+    let indices = x
+        .as_dtype(safemlx::Dtype::Float16, stream)?
+        .view_dtype(safemlx::Dtype::Uint16, stream)?;
+    let rounded = table.take_axis(indices, 0, stream)?;
+    let below_upper = r#where(x.lt(Array::from_f32(10.0), stream)?, rounded, x, stream)?;
+    r#where(
+        x.le(Array::from_f32(-10.0), stream)?,
+        Array::from_f32(0.0),
+        below_upper,
+        stream,
+    )
 }
 
 /// Applies the tanh GELU approximation.

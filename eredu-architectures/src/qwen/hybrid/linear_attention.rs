@@ -1,6 +1,6 @@
 //! Qwen hybrid parameter identities and formats for the shared recurrent mixer.
 use super::{HybridPolicy, HybridVariant};
-use crate::gated_delta::GatedDeltaMixerSpec;
+use crate::gated_delta::{GatedDeltaArithmetic, GatedDeltaMixerSpec};
 use eredu_nn::{
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, Error, LinearSpec, OutputGateActivation,
     ParameterSpec,
@@ -36,6 +36,10 @@ pub(super) fn recurrent_spec(
         })
     };
     let dense_ba = config.variant == HybridVariant::Qwen3Next && config.fp8.is_some();
+    let epsilon = match config.recurrent_arithmetic {
+        GatedDeltaArithmetic::LogTransition => 1e-6,
+        GatedDeltaArithmetic::NegativeTransition => config.rms_norm_eps,
+    };
     let spec = GatedDeltaMixerSpec {
         geometry,
         input_qkv: linear("in_proj_qkv", config.hidden_size, qkv_width, false)?,
@@ -62,11 +66,12 @@ pub(super) fn recurrent_spec(
             activation: ConvolutionActivation::Silu,
         },
         decay_bias: parameter("dt_bias")?,
-        transition_log: parameter("A_log")?,
+        transition: parameter("A_log")?,
         normalization_weight: parameter("norm.weight")?,
         output: linear("out_proj", value_width, config.hidden_size, false)?,
-        l2_epsilon: 1e-6,
-        output_epsilon: 1e-6,
+        arithmetic: config.recurrent_arithmetic,
+        l2_epsilon: epsilon,
+        output_epsilon: epsilon,
         output_gate: OutputGateActivation::Silu,
         output_arithmetic: eredu_nn::OutputGatedNormArithmetic::RoundedNormalization,
     };

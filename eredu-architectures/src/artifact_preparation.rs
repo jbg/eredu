@@ -272,7 +272,14 @@ pub(crate) fn source_declarations(
                     declarations.roles.insert(ArtifactSourceRole::Component(crate::lfm3::vision::DECODER_ROLE), BTreeMap::from([(PhysicalArtifactId::Primary, keys.clone())]));
                 }
                 declarations.roles.insert(ArtifactSourceRole::Target, BTreeMap::from([(PhysicalArtifactId::Primary, keys)]));
-                declarations.artifacts.insert(PhysicalArtifactId::Primary, PhysicalArtifactPreparation::Gguf { checkpoint: checkpoint.clone(), mapping: mapping.to_vec(), resolution });
+                let checkpoint = match primary.model() {
+                    crate::configuration::GgufModelConfig::Gemma4(config) => {
+                        crate::gemma4::checkpoint::prepared_gguf_payload(checkpoint, &config.text)
+                            .map_err(invalid)?
+                    }
+                    _ => checkpoint.clone(),
+                };
+                declarations.artifacts.insert(PhysicalArtifactId::Primary, PhysicalArtifactPreparation::Gguf { checkpoint, mapping: mapping.to_vec(), resolution });
                 match (plan.gguf_media_projector(), validated.companion(&ArtifactCompanionRole::MediaProjector)) {
                     (Some(projector), Some(companion)) => {
                         let checkpoint = vl.map_or_else(|| companion.checkpoint(), |(_, projector)| projector);

@@ -6,7 +6,9 @@ use super::UnitSpec;
 use crate::qwen4_exp::target::MixerSpec;
 #[cfg(feature = "tensor-capture")]
 use crate::speculative_execution::SpeculativeActivationExecution;
-use eredu_core::{capture::*, intervention::*, speculative::*, *};
+#[cfg(feature = "tensor-capture")]
+use eredu_core::capture::*;
+use eredu_core::{intervention::*, speculative::*, *};
 
 /// Loaded source/session authority and native collector facts. The composition
 /// owner supplies the content identity of the retained prepared source graph;
@@ -492,6 +494,7 @@ impl Declaration {
             "Internal projection channels in operator storage order",
         );
     }
+    #[cfg(feature = "tensor-capture")]
     fn feed_forward(
         &mut self,
         path: &str,
@@ -622,6 +625,7 @@ impl Declaration {
         }
         Ok(())
     }
+    #[cfg(feature = "tensor-capture")]
     fn routed_units(
         &mut self,
         routing: &str,
@@ -709,6 +713,7 @@ impl Declaration {
             Some(vocabulary),
         );
     }
+    #[cfg(feature = "tensor-capture")]
     fn readout(
         &mut self,
         path: &str,

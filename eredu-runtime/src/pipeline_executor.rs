@@ -518,7 +518,7 @@ where
         A::Unit: 'static,
     {
         let native =
-            self.pipeline_mechanisms(resources.communication.native_groups().cloned().collect());
+            self.pipeline_mechanisms(resources.communication.native_groups().cloned().collect())?;
         component_driver::assemble_component_pipeline(native, architecture, selected, resources)
     }
 }

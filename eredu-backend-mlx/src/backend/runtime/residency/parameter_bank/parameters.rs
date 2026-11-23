@@ -18,9 +18,9 @@ impl NativeBankMechanisms for MlxResidencyResources {
         )
     }
 
-    fn member(transfer: &ResidentTransfer, index: usize, name: &str) -> Result<MlxTensor, Error> {
+    fn member(loan: &Self::Loan, index: usize, name: &str) -> Result<MlxTensor, Error> {
         Ok(MlxTensor::from_array(
-            transfer.leases()[index].device_value(name)?.clone(),
+            loan.transfer().leases()[index].device_value(name)?.clone(),
         ))
     }
 
@@ -42,7 +42,7 @@ impl NativeBankMechanisms for MlxResidencyResources {
         MlxIndexedMovement.concatenate_rows(values, stream)
     }
 
-    fn begin_loan(transfer: ResidentTransfer) -> Result<Self::Loan, Error> {
+    fn begin_loan(transfer: ResidentTransfer, _: &Stream) -> Result<Self::Loan, Error> {
         Self::Loan::begin(transfer)
     }
 

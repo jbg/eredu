@@ -58,15 +58,9 @@ impl GenerationMemoryOptions {
 
 fn observed_allocator_overhead(backend: &impl BackendInspection) -> MemoryBytes {
     match backend.allocator_observation() {
-        Ok(Some((policy, memory))) => {
-            let mut overhead = ForecastCalibration::default()
-                .allocator_overhead(policy.limit_bytes, memory.cache_bytes);
-            overhead
-                .detail
-                .push_str(&format!("; native policy provenance: {:?}", policy.source));
-            overhead
+        Ok(observation) => {
+            ForecastCalibration::default().allocator_overhead_from_observation(observation)
         }
-        Ok(None) => MemoryBytes::unknown("backend allocator overhead is unavailable"),
         Err(error) => MemoryBytes::unknown(format!("allocator-cache observation failed: {error}")),
     }
 }

@@ -57,8 +57,6 @@ pub trait TextErasureTypes: TextInvocationMechanisms {
         state: &Self::PredictionState,
         additional: u64,
     ) -> Result<(u64, Option<u64>, Option<u64>), BackendFailure>;
-    /// Reads decoder token IDs already materialized by the architecture.
-    fn decoder_token_ids(value: &Self::Tensor) -> Result<Vec<u32>, Self::Error>;
 }
 
 type TypesOf<N> = <N as TextInvocationResources>::Types;
@@ -395,6 +393,10 @@ where
         AttentionState = M::PredictionState,
     >,
 {
+    fn realized_session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        self.session.session_capabilities()
+    }
+
     fn forecast_state_offset(&self) -> Result<Option<i32>, M::StateError> {
         self.session
             .report()

@@ -394,15 +394,11 @@ impl ParallelCommunicators {
         crate::backend::runtime::distributed::completion::ensure_group_available(&owned_world)?;
         let _setup = owned_world.begin_bounded_setup()?;
         let manifest = prepared.manifest();
-        if world.rank() != manifest.rank() || world.size() != manifest.world_size() {
-            return Err(Error::Parallel(format!(
-                "collective realization expects world rank {}/{} but received {}/{}",
-                manifest.rank(),
-                manifest.world_size(),
-                world.rank(),
-                world.size()
-            )));
-        }
+        eredu_core::automatic::validate_realized_world(
+            (manifest.world_size(), manifest.rank()),
+            (world.size(), world.rank()),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
         // This unsplit handle is intentionally uncontracted: it is the control
         // plane from which exact manifest handles are realized.
         let world = owned_world;

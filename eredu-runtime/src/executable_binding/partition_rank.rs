@@ -497,9 +497,6 @@ where
     where
         U: Parameterized<B::Tensor> + 'static,
     {
-        <N::Values as eredu_core::checkpoint_mechanisms::NativeTextWeights>::observe_text_binding(
-            true,
-        );
         super::route_assembly::weights::TextRouteWeights::new(store, self.text_components())
     }
 
@@ -533,7 +530,7 @@ pub trait PartitionPredictionResources<B, S>:
                 Logits = <PredictionTensors<Self> as SpeculativeTensorMechanisms>::Logits,
                 Completion = <PredictionTensors<Self> as SpeculativeTensorMechanisms>::Completion,
                 Error = <PredictionTensors<Self> as SpeculativeTensorMechanisms>::Error,
-                Telemetry = <Self::Materializer as ReplicatedPredictionNative<B, S, PredictionTensors<Self>>>::Telemetry,
+                Telemetry = (),
             >,
         >>,
     >
@@ -582,7 +579,7 @@ where
         Logits = T::Logits,
         Completion = T::Completion,
         Error = T::Error,
-        Telemetry = M::Telemetry,
+        Telemetry = (),
     >,
     M: for<'a> PredictionExtensionMaterializer<B, Error = F, Context<'a> = V::Reader<'a>>
         + ReplicatedPredictionNative<B, S, T, ExecutorTypes = G>

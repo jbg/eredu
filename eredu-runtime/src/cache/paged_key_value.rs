@@ -6,9 +6,7 @@ use eredu_core::cache::{
     },
     CacheRankIdentity, CacheRepresentation,
 };
-use eredu_nn::{
-    AttentionArithmetic, AttentionRequest, IndexedAttentionInput, RelativeAttentionInput, Tensor,
-};
+use eredu_nn::{AttentionRequest, IndexedAttentionInput, RelativeAttentionInput, Tensor};
 
 use super::live::{
     CacheBlockArrays, CacheResidencyError, CacheResidencyManager, CacheStreamCheckpoint,
@@ -501,7 +499,6 @@ impl<M: PagedKeyValueStorage> PagedKeyValueCache<M> {
             transient.map(|[keys, _]| i64::from(M::shape(keys)[2])),
         )?;
         let geometry = self.geometry(&read, transient.is_some());
-        let two_pass = operands.arithmetic == AttentionArithmetic::InputScores;
         let kernel = M::paged_attention(operands, geometry, queue)?;
         self.manager.run_attention_scan(
             &self.live_stream(),
@@ -509,7 +506,6 @@ impl<M: PagedKeyValueStorage> PagedKeyValueCache<M> {
             read,
             transient,
             self.sliding_window.map(i64::from),
-            two_pass,
             queue,
             kernel,
         )
@@ -541,7 +537,6 @@ impl<M: PagedKeyValueStorage> PagedKeyValueCache<M> {
             read,
             None,
             self.sliding_window.map(i64::from),
-            false,
             queue,
             kernel,
         )

@@ -79,8 +79,8 @@ impl RealtimeBindingTarget<crate::backend::MlxRankContext, MlxRealtimeQueue>
 }
 
 impl RealtimeRandomRoot<MlxTensor> for MlxRealtimeExecutionContext {
-    fn random_root(random: &crate::backend::random::RandomState) -> MlxTensor {
-        MlxTensor::from_array(random.as_array().clone())
+    fn random_root(random: &crate::backend::random::RandomState) -> Option<MlxTensor> {
+        Some(MlxTensor::from_array(random.as_array().clone()))
     }
 }
 
@@ -93,7 +93,6 @@ impl SpeechRealtimeNative for MlxRealtimeExecutionContext {
     }
 
     type Components = MlxComponentBinder;
-    type Sampling = MlxSamplingBackend;
     type Queue = MlxRealtimeQueue;
 
     fn components(&self) -> Self::Components {

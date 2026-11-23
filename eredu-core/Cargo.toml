@@ -16,10 +16,13 @@ tensor-capture = []
 workspace = true
 
 [dependencies]
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 eredu-gguf.workspace = true
 eredu-checkpoint.workspace = true
 eredu-nn.workspace = true

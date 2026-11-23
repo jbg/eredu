@@ -62,7 +62,9 @@ impl eredu_core::preparation::NativePreparation for MlxPreparationMechanisms {
         recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
         source: &C,
     ) -> Result<u64, String> {
-        crate::backend::runtime::checkpoint::recipe::native_recipe_workspace(recipe, source)
+        eredu_core::checkpoint_mechanisms::recipe_execution::conservative_workspace_bytes(
+            recipe, source,
+        )
     }
 
     fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {

@@ -167,7 +167,8 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
     let mut text = ReplicatedTextRequirements::new(
         identity,
         old.operators()
-            .union(crate::operator_requirements::QWEN_VISION),
+            .union(crate::operator_requirements::QWEN_VISION)
+            .union(vision_scope.config().arithmetic_capabilities()),
         graph,
         layout,
         transport,
@@ -416,7 +417,7 @@ impl SelectedConditionalExecution {
     pub fn visit_composite<B, S, V>(
         self,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut visitor: V,
+        visitor: V,
     ) -> Result<V::Output, crate::prepared_execution::PreparedExecutionError<V::Error>>
     where
         B: eredu_core::SubmissionBackend<
@@ -448,7 +449,6 @@ impl SelectedConditionalExecution {
             .processor_requirements()
             .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
         let admission = self.ingress.admission_config().clone();
-        visitor.construction_started();
         let (prepared, source, processor) = self
             .prepare_composite::<B, S>(context)
             .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
@@ -482,7 +482,7 @@ impl SelectedConditionalExecution {
     pub fn visit_composite_prediction<B, S, V>(
         self,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut visitor: V,
+        visitor: V,
         binding: crate::prepared_execution::RetainedPredictionBinding,
     ) -> Result<V::Output, crate::prepared_execution::PreparedExecutionError<V::Error>>
     where
@@ -533,7 +533,6 @@ impl SelectedConditionalExecution {
             eredu_runtime::SourceHandoffScope::Complete,
         )
         .map_err(|handoff| PreparedExecutionError::Architecture(handoff.to_string()))?;
-        visitor.construction_started();
         let prediction = self
             .selected
             .prepare_prediction_weights::<B>(context)

@@ -248,6 +248,8 @@ pub struct NativeMemoryFacts {
     pub active_allocation_bytes: Observed<u64>,
     /// Current allocator cache.
     pub allocator_cache_bytes: Observed<u64>,
+    /// Total device allocation, when separately observable.
+    pub device_allocated_bytes: Observed<u64>,
     /// Relationship between device and host physical memory.
     pub physical_semantics: PhysicalMemorySemantics,
 }
@@ -256,6 +258,8 @@ pub struct NativeMemoryFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorCachePolicySource {
+    /// This backend placement has no backend-owned allocation cache.
+    NoBackendCache,
     /// No runtime initialization or explicit setter has configured the limit.
     NativeDefault,
     /// The runtime applied its default ceiling to the untouched native policy.
@@ -306,10 +310,17 @@ pub struct StaticMemoryReport {
     pub backend_active_allocation_bytes: Observed<u64>,
     /// Process-global backend allocator-cache counter.
     pub backend_allocator_cache_bytes: Observed<u64>,
+    /// Total device allocations, including cached buffers when measured together.
+    #[serde(default = "unreported_device_allocations")]
+    pub backend_device_allocated_bytes: Observed<u64>,
     /// Whether logical host/device tiers share physical capacity.
     pub physical_semantics: PhysicalMemorySemantics,
     /// Currently retained checkpoint shard buffers or readers.
     pub currently_cached_shards: Observed<u64>,
+}
+
+fn unreported_device_allocations() -> Observed<u64> {
+    Observed::unavailable("total device allocations were not reported")
 }
 
 fn unreported_parameter_conversions() -> Observed<u64> {
@@ -323,8 +334,51 @@ pub struct AvailableMemory {
     pub physical_memory_bytes: Observed<u64>,
     /// Defensible point-in-time availability estimate.
     pub available_memory_bytes: Observed<u64>,
+    /// Capacity of the exact execution device when it has a separate physical pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceMemoryCapacity>,
     /// Physical tier semantics.
     pub physical_semantics: PhysicalMemorySemantics,
+}
+
+/// Capacity facts for one independently budgeted accelerator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceMemoryCapacity {
+    /// Physical capacity, when the driver exposes it.
+    pub total_bytes: Observed<u64>,
+    /// Point-in-time device headroom. This can be an advisory estimate.
+    pub available_bytes: Observed<u64>,
+}
+
+impl AvailableMemory {
+    /// Reports capacity for a host queue or the selected accelerator.
+    pub fn selected_capacity(&self, host_execution: bool) -> DeviceMemoryCapacity {
+        if host_execution || self.physical_semantics == PhysicalMemorySemantics::Unified {
+            DeviceMemoryCapacity {
+                total_bytes: self.physical_memory_bytes.clone(),
+                available_bytes: self.available_memory_bytes.clone(),
+            }
+        } else {
+            self.device.clone().unwrap_or_else(|| DeviceMemoryCapacity {
+                total_bytes: Observed::unavailable("selected device capacity is unavailable"),
+                available_bytes: Observed::unavailable("selected device headroom is unavailable"),
+            })
+        }
+    }
+
+    /// Returns the observed headroom for work on the selected execution pool.
+    pub fn execution_headroom(&self) -> Option<&Observed<u64>> {
+        if self.physical_semantics == PhysicalMemorySemantics::SeparateTiers {
+            self.device_headroom()
+        } else {
+            Some(&self.available_memory_bytes)
+        }
+    }
+
+    /// Returns independent device headroom without falling back to host memory.
+    pub fn device_headroom(&self) -> Option<&Observed<u64>> {
+        self.device.as_ref().map(|device| &device.available_bytes)
+    }
 }
 
 /// One pre-generation admission request.
@@ -991,12 +1045,17 @@ pub fn apply_admission_policy(
         }
     }
     let available_memory_bytes = match available {
-        Some(report) => match &report.available_memory_bytes {
-            Observed::Available { value, .. } => Some(*value),
-            Observed::Unsupported { reason } | Observed::Unavailable { reason } => {
+        Some(report) => match report.execution_headroom() {
+            Some(Observed::Available { value, .. }) => Some(*value),
+            headroom => {
                 return Ok(AdmissionResult::Rejected(
                     AdmissionRejection::AvailableMemoryUnavailable {
-                        reason: reason.clone(),
+                        reason: match headroom {
+                            Some(
+                                Observed::Unavailable { reason } | Observed::Unsupported { reason },
+                            ) => reason.clone(),
+                            _ => "headroom for the selected execution device is unavailable".into(),
+                        },
                     },
                 ))
             }
@@ -1115,6 +1174,7 @@ mod tests {
         let unavailable = AvailableMemory {
             physical_memory_bytes: Observed::unavailable("not reported"),
             available_memory_bytes: Observed::unavailable("not reported"),
+            device: None,
             physical_semantics: PhysicalMemorySemantics::Unknown,
         };
         let request = AdmissionRequest {
@@ -1161,6 +1221,7 @@ mod tests {
             planned_disk_backed_bytes: Observed::exact(0, "mock plan"),
             backend_active_allocation_bytes: Observed::unavailable("no allocator probe"),
             backend_allocator_cache_bytes: Observed::unsupported("no allocator cache"),
+            backend_device_allocated_bytes: Observed::unavailable("device total was not measured"),
             physical_semantics: PhysicalMemorySemantics::SeparateTiers,
             currently_cached_shards: Observed::exact(1, "mock store"),
         };
@@ -1184,16 +1245,6 @@ mod tests {
 #[path = "capability/append_tests.rs"]
 mod append_tests;
 
-/// Native allocator measurements for portable resource accounting.
-pub trait NativeAllocatorObservations {
-    /// Physical allocator and memory topology facts.
-    fn native_memory_facts() -> NativeMemoryFacts;
-    /// Available device and host memory observed without submitting model work.
-    fn available_memory() -> Result<crate::AvailableMemory, crate::BackendFailure>;
-    /// Native allocator cache limit, when known.
-    fn allocator_cache_limit() -> crate::Observed<u64>;
-}
-
 /// Host memory observation for a native allocator whose defaults remain untouched.
 pub struct InitialAllocatorCacheFacts {
     /// Currently available bytes, when the host can establish them.
@@ -1213,10 +1264,8 @@ pub trait NativeAllocatorCacheDefaults {
 
 /// Exact native memory observations for a retained execution placement.
 pub trait NativePlacementMemory {
-    /// Native allocator facts for the retained placement.
-    type Memory: NativeAllocatorObservations;
-    /// Whether the admitted queue executes on the host.
-    fn host_execution(&self) -> Result<bool, crate::BackendFailure>;
+    /// Observes the exact retained placement, including its allocator and headroom.
+    fn placement_memory(&self) -> Result<ParameterMemoryFacts, crate::BackendFailure>;
     /// Exact native upper bound for scratch storage, when exposed.
     fn scratch_memory_upper_bound(&self) -> Option<u64>;
 }
@@ -1233,22 +1282,31 @@ pub struct NativeWorkspaceEstimate {
 
 /// Observations needed for forecasts without submitting or synchronizing work.
 pub trait NativeExecutionMemory<B: crate::BackendProvider> {
-    /// Exact allocator and physical memory observations for this backend.
-    type Allocator: NativeAllocatorObservations;
     /// Native storage envelope for a vocabulary entry in one refinement invocation.
     fn refinement_workspace() -> NativeWorkspaceEstimate;
     /// Native storage envelope for a vocabulary entry in one speculative sampling invocation.
     fn sampling_workspace() -> NativeWorkspaceEstimate;
-    /// Whether target and draft report memory from the same allocator.
-    fn shares_allocator() -> bool;
+    /// Observes physical headroom and cache policy for the exact selected context.
+    fn placement_memory(backend: &B) -> Result<ParameterMemoryFacts, crate::BackendFailure>;
     /// Whether native capture temporaries are released between predictions.
     fn capture_completes_per_step() -> bool;
-    /// Whether the execution device is a host CPU.
-    fn host_execution(backend: &B) -> Result<bool, B::Error>;
+}
+
+/// Physical placement and allocator ownership of a retained execution queue.
+#[derive(Debug, Clone)]
+pub struct ExecutionMemoryPlacement {
+    /// Canonical device identity for an independently budgeted accelerator.
+    pub device: crate::DevicePlan,
+    /// Whether work executes on the CPU.
+    pub host_execution: bool,
+    /// Identity of the observed allocator, when sharing can be established.
+    pub allocator: Option<String>,
 }
 
 /// Backend memory counters used by portable parameter memory reporting.
 pub struct ParameterMemoryFacts {
+    /// The exact placement to which these observations apply.
+    pub placement: ExecutionMemoryPlacement,
     /// Process allocation observations.
     pub native: crate::capability::NativeMemoryFacts,
     /// Current capacity and available physical memory.

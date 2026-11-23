@@ -599,6 +599,29 @@ fn shared_pool_uses_stricter_budgets_and_independent_devices_stay_separate() {
         estimate_speculative_memory(&target, &plan).unwrap().fit,
         MemoryFit::LikelyFit
     );
+
+    // A unified target consumes the host capacity seen by a discrete draft.
+    // Neither owner can lend its execution headroom to another physical pool.
+    let mut target = request(MemoryDomain::Unified);
+    target.domains[0].budget.available_bytes = Some(1 << 24);
+    let draft = plan.draft.as_mut().unwrap();
+    draft.domains[0].budget.available_bytes = Some(0);
+    let mut host = request(MemoryDomain::Host).domains.remove(0);
+    host.executions.clear();
+    host.resident_parameters = MemoryBytes::exact(0);
+    host.already_resident_bytes = 0;
+    host.backend_overhead = MemoryBytes::exact(0);
+    host.budget.available_bytes = Some(1 << 23);
+    draft.domains.push(host);
+    let estimate = estimate_speculative_memory(&target, &plan).unwrap();
+    assert_eq!(estimate.domains.len(), 2);
+    assert_eq!(estimate.domains[0].domain, MemoryDomain::Host);
+    assert_eq!(estimate.domains[0].fit, MemoryFit::LikelyFit);
+    assert_eq!(
+        estimate.domains[1].domain,
+        MemoryDomain::Device("draft".into())
+    );
+    assert_ne!(estimate.domains[1].fit, MemoryFit::LikelyFit);
 }
 
 #[test]

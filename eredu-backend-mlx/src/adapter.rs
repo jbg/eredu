@@ -4,7 +4,6 @@ use crate::backend::error::Error;
 use eredu_core::residency::AllocatorMemoryMetrics;
 
 pub use crate::composition::mlx::automatic::{discover_hardware, MlxBackendFactory};
-pub use crate::composition::mlx::speculative::SpeculativeComponentTimingGuard;
 
 pub use crate::composition::mlx::inspection_mechanisms;
 
@@ -63,9 +62,9 @@ impl eredu_core::capability::NativeAllocatorCacheDefaults for MlxAllocatorCacheD
         Ok(
             (current.source == eredu_core::AllocatorCachePolicySource::NativeDefault).then(|| {
                 eredu_core::capability::InitialAllocatorCacheFacts {
-                    available_memory_bytes: safemlx::system::system_memory()
+                    available_memory_bytes: crate::composition::mlx::capability::available_memory()
                         .ok()
-                        .and_then(|memory| memory.available),
+                        .and_then(|memory| memory.available_memory_bytes.value().copied()),
                 }
             }),
         )

@@ -14,6 +14,7 @@ use eredu_checkpoint::{
     store::{SharedCheckpointSource, TensorMetadata},
     StoredDtype,
 };
+pub use eredu_gguf::QuantizedTensorRepresentation;
 use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType, MetadataValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -607,11 +608,12 @@ pub enum CompanionSelection {
     Disabled,
 }
 
-/// Local primary artifact and explicit companion selection policy.
+/// Local primary artifact and its explicit inspection options.
 #[derive(Debug, Clone)]
 pub struct ArtifactSource {
     path: PathBuf,
     companions: BTreeMap<ArtifactCompanionRole, CompanionSelection>,
+    gguf_representation: Option<QuantizedTensorRepresentation>,
 }
 
 impl ArtifactSource {
@@ -620,7 +622,18 @@ impl ArtifactSource {
         Self {
             path: path.as_ref().to_owned(),
             companions: BTreeMap::new(),
+            gguf_representation: None,
         }
+    }
+
+    /// Chooses a representation for quantized tensors in the primary GGUF.
+    /// The architecture still validates the resulting parameter layout.
+    pub fn with_gguf_tensor_representation(
+        mut self,
+        representation: QuantizedTensorRepresentation,
+    ) -> Self {
+        self.gguf_representation = Some(representation);
+        self
     }
 
     /// Sets selection for one semantic companion role. `Discover` restores the
@@ -670,7 +683,9 @@ pub struct ArtifactInspection<P = ()> {
 #[derive(Debug, Clone)]
 pub struct ValidatedGguf {
     checkpoint: GgufCheckpoint,
+    requested_representation: Option<QuantizedTensorRepresentation>,
     companions: BTreeMap<ArtifactCompanionRole, ValidatedGgufCompanion>,
+    sidecars: Arc<BTreeMap<String, Vec<u8>>>,
 }
 
 /// One exact sibling GGUF admitted during portable inspection.
@@ -696,6 +711,11 @@ impl ValidatedGguf {
     /// Header-only checkpoint admitted by portable inspection.
     pub fn checkpoint(&self) -> &GgufCheckpoint {
         &self.checkpoint
+    }
+
+    /// Uniform representation explicitly requested at artifact inspection.
+    pub const fn requested_representation(&self) -> Option<QuantizedTensorRepresentation> {
+        self.requested_representation
     }
 
     /// Returns the resolved companion for one semantic role.
@@ -759,6 +779,41 @@ impl<P> ArtifactInspection<P> {
     /// Portable GGUF checkpoint handle, when applicable.
     pub fn gguf_checkpoint(&self) -> Option<&GgufCheckpoint> {
         self.validated_gguf().map(ValidatedGguf::checkpoint)
+    }
+
+    /// Readmits the primary GGUF layout with selected quantized tensors kept as
+    /// encoded blocks. Uses the retained headers, sidecars and companion handles.
+    pub fn with_encoded_gguf_tensors(
+        mut self,
+        names: Vec<String>,
+        resolver: &impl ModelConfigurationResolver<ArtifactPlan = P>,
+    ) -> Result<Self, ArtifactError> {
+        if names.is_empty() {
+            return Ok(self);
+        }
+        let validated = self.validated_gguf.take().ok_or_else(|| {
+            ArtifactError::InvalidArtifact("encoded tensors require a GGUF inspection".into())
+        })?;
+        let checkpoint = validated
+            .checkpoint
+            .into_tensor_representation(names, QuantizedTensorRepresentation::Encoded)?;
+        let name = checkpoint
+            .metadata()
+            .get("general.architecture")
+            .and_then(MetadataValue::as_str)
+            .ok_or(ArtifactError::MissingGgufArchitecture)?;
+        let (configuration, plan) = resolver.resolve_gguf(name, &checkpoint)?.into_parts();
+        finish_gguf_inspection(
+            &self.path,
+            checkpoint,
+            validated.companions,
+            configuration,
+            plan,
+            validated.sidecars,
+            resolver,
+            self.metadata_provenance,
+            validated.requested_representation,
+        )
     }
     /// Architecture-owned state derived from the exact inspected artifact.
     pub fn architecture_plan(&self) -> &P {
@@ -1102,6 +1157,11 @@ pub fn inspect_artifact_source<R: ModelConfigurationResolver>(
     if is_gguf(path) {
         inspect_gguf(source, resolver)
     } else if path.is_dir() {
+        if source.gguf_representation.is_some() {
+            return Err(ArtifactError::InvalidArtifact(
+                "SafeTensors checkpoints do not accept a GGUF tensor representation".into(),
+            ));
+        }
         if !source.companions.is_empty() {
             return Err(ArtifactError::InvalidArtifact(
                 "SafeTensors checkpoints do not accept GGUF companion selections".into(),
@@ -1158,7 +1218,12 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
     resolver: &R,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     let path = source.path();
-    let checkpoint = GgufCheckpoint::open(path)?;
+    let checkpoint = match source.gguf_representation {
+        Some(representation) => {
+            GgufCheckpoint::open_with_representation(path, Default::default(), representation)?
+        }
+        None => GgufCheckpoint::open(path)?,
+    };
     let architecture_name = checkpoint
         .metadata()
         .get("general.architecture")
@@ -1177,9 +1242,10 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         companions,
         configuration,
         resolved_plan,
-        &sidecars,
+        Arc::new(sidecars),
         resolver,
         None,
+        source.gguf_representation,
     )
 }
 
@@ -1189,9 +1255,10 @@ fn finish_gguf_inspection<R: ModelConfigurationResolver>(
     companions: BTreeMap<ArtifactCompanionRole, ValidatedGgufCompanion>,
     configuration: ModelConfiguration,
     resolved_plan: R::ArtifactPlan,
-    sidecars: &BTreeMap<String, Vec<u8>>,
+    sidecars: Arc<BTreeMap<String, Vec<u8>>>,
     resolver: &R,
     metadata_provenance: Option<MetadataProvenance>,
+    requested_representation: Option<QuantizedTensorRepresentation>,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     validate_gguf_container(&checkpoint)?;
     let tensors = checkpoint
@@ -1221,10 +1288,12 @@ fn finish_gguf_inspection<R: ModelConfigurationResolver>(
     let tensors = TensorCatalog::new(tensors)?;
     let validated_gguf = ValidatedGguf {
         checkpoint,
+        requested_representation,
         companions,
+        sidecars,
     };
     let architecture_plan = resolver.artifact_plan(
-        sidecars,
+        &validated_gguf.sidecars,
         ArtifactFormat::Gguf,
         &configuration,
         &tensors,
@@ -1578,7 +1647,8 @@ fn finish_safetensors_inspection<R: ModelConfigurationResolver>(
     })
 }
 
-fn stored_to_tensor_dtype(dtype: &StoredDtype) -> TensorDtype {
+/// Converts a stored scalar to its portable tensor dtype.
+pub fn stored_to_tensor_dtype(dtype: &StoredDtype) -> TensorDtype {
     match dtype {
         StoredDtype::Bool => TensorDtype::Bool,
         StoredDtype::U8 => TensorDtype::U8,

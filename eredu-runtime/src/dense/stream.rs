@@ -6,8 +6,7 @@ pub use eredu_core::residency::observations::{
     DenseResidencyMechanisms, NativeResidencyObservations,
 };
 use eredu_core::residency::{
-    AllocatorMemoryMetrics, BackgroundPrefetchReport, MemoryTier, OffloadUnitId,
-    PrefetchDemandResolution,
+    BackgroundPrefetchReport, MemoryTier, OffloadUnitId, PrefetchDemandResolution,
 };
 
 use crate::{
@@ -43,7 +42,10 @@ pub trait DenseStreamMechanisms: ResidencyAccess + Clone + Send + Sync + 'static
     fn settle_transfer(transfer: &mut Self::Transfer) -> Result<(), Self::Error>;
 
     /// Samples the native allocator's current counters.
-    fn allocator_memory(&self) -> Result<AllocatorMemoryMetrics, Self::Error>;
+    fn allocator_memory(
+        &self,
+        state: &crate::residency::ResidencyState<Self::Storage>,
+    ) -> Result<eredu_core::AllocatorTelemetry, Self::Error>;
 
     /// Logical residency report augmented with backend physical observations.
     fn report_residency(&self) -> Result<ResidencyReport, Self::Error>;
@@ -89,8 +91,11 @@ where
         N::settle_transfer(transfer)
     }
 
-    fn allocator_memory(&self) -> Result<AllocatorMemoryMetrics, Self::Error> {
-        self.native_resources().allocator_memory()
+    fn allocator_memory(
+        &self,
+        state: &crate::residency::ResidencyState<Self::Storage>,
+    ) -> Result<eredu_core::AllocatorTelemetry, Self::Error> {
+        self.native_resources().allocator_memory(state.native())
     }
 
     fn report_residency(&self) -> Result<ResidencyReport, Self::Error> {
@@ -109,10 +114,14 @@ pub(crate) fn sample_residency_memory<M: DenseStreamMechanisms>(
     }
 
     let mut state = manager.lock_storage()?;
-    let ledger = state.controller_mut().ledger_mut();
     if backend {
-        ledger.record_allocator_memory(manager.allocator_memory()?);
+        let sample = manager.allocator_memory(&state)?;
+        state
+            .controller_mut()
+            .ledger_mut()
+            .record_allocator_memory(sample);
     }
+    let ledger = state.controller_mut().ledger_mut();
     if process {
         ledger.sample_process_metrics();
     }

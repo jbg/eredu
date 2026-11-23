@@ -27,7 +27,7 @@ float s1 = simd_shuffle(sum, 1);
 float s2 = simd_shuffle(sum, 2);
 float s3 = simd_shuffle(sum, 3);
 float inverse = PAIRWISE
-    ? metal::precise::divide(1.0f, (s0 + s2) + (s1 + s3))
+    ? bf16_softmax_inverse(s0, s1, s2, s3)
     : metal::fast::divide(1.0f, ((s0 + s1) + s2) + s3);
 // Normalizing lanes read values written by the four accumulation lanes.
 threadgroup_barrier(mem_flags::mem_device);

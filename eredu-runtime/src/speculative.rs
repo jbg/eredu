@@ -13,6 +13,8 @@ pub use batch::{
     SpeculativeBatchLane,
 };
 mod capture;
+mod host_sampling;
+pub use host_sampling::HostSpeculativeSampling;
 mod sampling;
 pub use sampling::{InstalledSpeculativeSampling, SamplingContext};
 mod control;
@@ -296,7 +298,7 @@ pub use assistant_policy::AssistantParameterPolicy;
 mod assistant_mechanisms;
 pub use assistant_mechanisms::{
     bind_external_assistant, external_assistant_conversion_retention,
-    external_assistant_input_identity, trim_external_assistant_conversions,
+    external_assistant_input_identity, trim_external_assistant_conversions, AssistantExecutorTypes,
     BoundAssistantRefVisitor, BoundAssistantVisitor, ExternalAssistantConstruction,
     ExternalAssistantExecutionMechanisms, ExternalAssistantExecutorVisitor, ExternalAssistantModel,
     ExternalAssistantPrompt, ExternalAssistantTarget, ExternalAssistantTensorPlacement,
@@ -337,7 +339,7 @@ pub use replicated_prediction::ReplicatedMaterializedPredictionStrategy;
 mod routed_preparation;
 pub use routed_preparation::{PredictionConstructionError, PreparedRoutedPrediction};
 mod installed_draft;
-pub use installed_draft::InstalledDraftSession;
+pub use installed_draft::{DraftSessionInstallation, InstalledDraftSession};
 mod prepared_external;
 pub use prepared_external::{
     AssistantDispatch, BoundAssistant, BoundAssistantDispatch, ExternalDraftExecution,

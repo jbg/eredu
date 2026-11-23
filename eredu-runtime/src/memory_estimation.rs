@@ -279,13 +279,27 @@ pub struct ExecutionMemoryPlan {
 pub struct MemoryBudget {
     /// Limit for total modeled memory in this physical pool.
     pub application_limit_bytes: Option<u64>,
-    /// Point-in-time free capacity; compared with additional memory only.
+    /// Observed or advisory capacity headroom, compared with additional memory only.
     pub available_bytes: Option<u64>,
     /// Explicit reserve for other work and uncertainty, added to both comparisons.
     pub reserve_bytes: u64,
 }
 
 impl MemoryBudget {
+    pub(crate) fn fill_observed_headroom(
+        &mut self,
+        available: &AvailableMemory,
+        domain: &MemoryDomain,
+    ) {
+        self.available_bytes = self.available_bytes.or_else(|| {
+            let observation = match domain {
+                MemoryDomain::Device(_) => available.device_headroom(),
+                _ => Some(&available.available_memory_bytes),
+            };
+            observation.and_then(Observed::value).copied()
+        });
+    }
+
     /// Reuses a host/unified availability observation without substituting total
     /// installed capacity when a free-capacity observation is unavailable.
     /// Device domains instead need the selected device's own availability fact.
@@ -920,11 +934,13 @@ pub fn estimate_prefill_candidates(
 /// `None` means overlap is unknown. Missing observations preserve an unknown
 /// upper end. Use the returned interval's `lower_bytes` as the conservative
 /// parameter contribution to [`DomainMemoryPlan::already_resident_bytes`].
+/// The returned execution pool uses the retained placement's device identity.
 /// Loaded facade forecasts, including the CLI, use this rule with unknown overlap.
 pub fn static_parameter_placement(
     report: &StaticMemoryReport,
+    placement: &eredu_core::capability::ExecutionMemoryPlacement,
     shared_backing_bytes: Option<u64>,
-) -> Result<Vec<(MemoryDomain, MemoryBytes)>, CapabilityError> {
+) -> Result<(MemoryDomain, Vec<(MemoryDomain, MemoryBytes)>), CapabilityError> {
     fn bytes(value: &Observed<u64>) -> MemoryBytes {
         match value {
             Observed::Available {
@@ -944,12 +960,25 @@ pub fn static_parameter_placement(
     }
     let host = bytes(&report.current_host_resident_bytes);
     let device = bytes(&report.current_device_resident_bytes);
-    match report.physical_semantics {
-        PhysicalMemorySemantics::SeparateTiers => Ok(vec![
-            (MemoryDomain::Host, host),
-            (MemoryDomain::Device("default".into()), device),
-        ]),
-        PhysicalMemorySemantics::Unified => {
+    use PhysicalMemorySemantics::{SeparateTiers, Unified, Unknown};
+    match (placement.host_execution, report.physical_semantics) {
+        (false, SeparateTiers) => {
+            let domain = MemoryDomain::Device(format!(
+                "{}/{}",
+                placement.device.backend(),
+                placement.device.device(),
+            ));
+            Ok((
+                domain.clone(),
+                vec![(MemoryDomain::Host, host), (domain, device)],
+            ))
+        }
+        (true, _) | (_, Unified) => {
+            let domain = if report.physical_semantics == Unified {
+                MemoryDomain::Unified
+            } else {
+                MemoryDomain::Host
+            };
             let sum = host.add(&device)?;
             let payload = if let Some(shared) = shared_backing_bytes {
                 if shared > host.lower_bytes.min(device.lower_bytes) {
@@ -972,11 +1001,11 @@ pub fn static_parameter_placement(
                     detail: "unified capacity; host/device backing overlap is unknown".into(),
                 }
             };
-            Ok(vec![(MemoryDomain::Unified, payload)])
+            Ok((domain.clone(), vec![(domain, payload)]))
         }
-        PhysicalMemorySemantics::Unknown => Err(invalid(
+        (false, Unknown) => Err(invalid(
             "physical_semantics",
-            "host/device relationship is unknown; supply explicit physical domain plans",
+            "selected accelerator has no known physical memory relationship",
         )),
     }
 }

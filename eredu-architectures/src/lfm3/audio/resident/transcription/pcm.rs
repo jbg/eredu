@@ -230,7 +230,7 @@ where
         &mut self,
         restart: bool,
     ) -> Result<Option<AudioTranscriptionBlock>, AudioTranscriptionError> {
-        let _scope = H::open_input_recovery()?;
+        let _scope = self.session.open_input_recovery()?;
         self.advance_pcm(restart)
     }
 

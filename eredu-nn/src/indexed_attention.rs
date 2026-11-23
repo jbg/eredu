@@ -169,3 +169,27 @@ pub fn compact_indexed_positions(positions: &[Option<i32>]) -> (Vec<i32>, Vec<Op
         .collect();
     (unique, slots)
 }
+
+/// Converts one host position row into exact optional positions. Invalid slots
+/// are discarded before checking the signed token index range.
+pub fn decode_indexed_positions(
+    positions: impl IntoIterator<Item = i64>,
+    mut eligible: impl FnMut(usize) -> bool,
+) -> Result<Vec<Option<i32>>, Error> {
+    positions
+        .into_iter()
+        .enumerate()
+        .map(|(slot, position)| {
+            if position == -1 || !eligible(slot) {
+                return Ok(None);
+            }
+            i32::try_from(position)
+                .ok()
+                .filter(|position| *position >= 0)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::backend("indexed position is outside signed 32-bit token geometry")
+                })
+        })
+        .collect()
+}

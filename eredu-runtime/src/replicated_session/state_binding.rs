@@ -21,9 +21,6 @@ use eredu_core::{
 use eredu_nn::{NeuralBackend, Tensor};
 
 type Context<B> = <<B as NeuralBackend>::Tensor as Tensor>::Context;
-type StorageTensor<C> = <C as eredu_core::cache::mechanisms::LiveCacheBackend>::Tensor;
-type NumericRead<C> = fn(&StorageTensor<C>) -> Result<Vec<f32>, BackendFailure>;
-
 /// The state type selected by portable route dispatch and the native operations it needs.
 pub trait TextStateStorage<B>
 where
@@ -38,14 +35,6 @@ where
 
     /// Converts a state operation failure while preserving its cause.
     fn state_failure(error: BackendFailure) -> Self::NativeError;
-
-    #[doc(hidden)]
-    fn numeric_read() -> Option<NumericRead<Self::CacheStorage>> {
-        None
-    }
-
-    #[doc(hidden)]
-    fn observe_state_allocation() {}
 }
 
 /// Report assembled from the live state and the storage observations it returns.
@@ -93,7 +82,6 @@ where
         global_layer_start: usize,
         _: &Context<B>,
     ) -> Result<Self::State, Self::Error> {
-        N::observe_state_allocation();
         N::Owner::allocate(selected, cache, rank, global_layer_start).map_err(N::state_failure)
     }
 
@@ -156,6 +144,32 @@ where
     ) -> Result<Self::CacheExport, Self::Error> {
         state
             .cache_export(descriptor, layer_frontiers)
+            .map_err(N::state_failure)
+    }
+
+    fn publish_resident_cache(
+        &self,
+        state: &mut Self::State,
+        store: &dyn eredu_core::cache::PromptCacheStore,
+        descriptor: PromptCacheDescriptor,
+        prefix: &[u32],
+        options: &eredu_core::cache::PromptCacheOptions,
+        context: &Context<B>,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, Self::Error> {
+        state
+            .publish_resident_cache(store, descriptor, prefix, options, context)
+            .map_err(N::state_failure)
+    }
+
+    fn install_resident_cache(
+        &self,
+        state: &mut Self::State,
+        restore: &crate::PromptCacheRestore<'_>,
+        frontiers: &[i32],
+        context: &Context<B>,
+    ) -> Result<(), Self::Error> {
+        state
+            .install_resident_cache(restore, frontiers, context)
             .map_err(N::state_failure)
     }
 

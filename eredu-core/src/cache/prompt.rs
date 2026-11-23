@@ -737,6 +737,7 @@ pub struct PromptCacheOptions {
     /// Allows atomically replacing an existing destination.
     replace_existing: bool,
     capture_limit: Option<u64>,
+    cancellation: Option<crate::GenerationCancellationToken>,
 }
 
 impl PromptCacheOptions {
@@ -757,6 +758,7 @@ impl PromptCacheOptions {
             application_namespace,
             replace_existing,
             capture_limit: None,
+            cancellation: None,
         })
     }
 
@@ -768,6 +770,24 @@ impl PromptCacheOptions {
     /// Optional per-rank export allowance carried through coordinated publication.
     pub fn capture_limit(&self) -> Option<u64> {
         self.capture_limit
+    }
+
+    /// Aborts staging if cancellation is observed before publication.
+    pub fn with_cancellation(mut self, token: crate::GenerationCancellationToken) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    /// Checks cancellation before a transfer or the start of commit.
+    pub fn check_publication(&self) -> Result<(), super::PromptCacheStoreError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(super::PromptCacheStoreError::Cancelled);
+        }
+        Ok(())
     }
 
     /// Returns the optional application grouping label.
@@ -1436,11 +1456,27 @@ where
 
 /// Hashes exact prefix token IDs as little-endian `u32` values.
 pub fn prompt_cache_token_fingerprint(tokens: &[u32]) -> String {
-    let mut hasher = Sha256::new();
-    for token in tokens {
-        hasher.update(token.to_le_bytes());
+    let mut digest = PromptCacheTokenDigest::default();
+    digest.append(tokens);
+    digest.fingerprint()
+}
+
+/// Incremental identity of the exact committed token prefix.
+#[derive(Clone, Default)]
+pub struct PromptCacheTokenDigest(Sha256);
+
+impl PromptCacheTokenDigest {
+    /// Extends the digest with successfully committed decoder token IDs.
+    pub fn append(&mut self, tokens: &[u32]) {
+        for token in tokens {
+            self.0.update(token.to_le_bytes());
+        }
     }
-    hex(hasher.finalize())
+
+    /// Produces the canonical prefix fingerprint without consuming the digest.
+    pub fn fingerprint(&self) -> String {
+        hex(self.0.clone().finalize())
+    }
 }
 
 fn hash_component(hasher: &mut Sha256, value: &[u8]) {

@@ -101,23 +101,31 @@ impl MeasuredReadout {
                 0.0
             };
             let input_scaled = norm.kind == ComponentNormalizationKind::InputScaledRmsFloat32;
+            let sum_of_squares = matches!(
+                norm.kind,
+                ComponentNormalizationKind::L2 | ComponentNormalizationKind::L2WithFloor
+            );
             let denominator = if norm.kind == ComponentNormalizationKind::Identity {
                 1.0
             } else {
-                (signed_sum((start..end).map(|i| {
+                let squared = signed_sum((start..end).map(|i| {
                     let value = if input_scaled {
                         residual[i] * norm.gain[i]
                     } else {
                         residual[i] - center
                     };
                     value.powi(2)
-                        / if norm.kind == ComponentNormalizationKind::L2 {
+                        / if sum_of_squares {
                             1.0
                         } else {
                             group_width as f64
                         }
-                })) + norm.epsilon)
-                    .sqrt()
+                }));
+                if norm.kind == ComponentNormalizationKind::L2WithFloor {
+                    squared.sqrt().max(norm.epsilon)
+                } else {
+                    (squared + norm.epsilon).sqrt()
+                }
             };
             if !denominator.is_finite() || denominator <= 0.0 {
                 return Err(AttributionError::NonFinite);

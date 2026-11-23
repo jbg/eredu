@@ -17,7 +17,10 @@ distributed = ["mlx", "eredu/distributed"]
 vision = ["eredu/image", "dep:image"]
 realtime = ["eredu/audio", "dep:eredu-media"]
 system-audio = ["realtime", "eredu-media/system-audio", "dep:ctrlc", "dep:crossterm"]
-mlx = ["eredu/mlx", "dep:eredu-backend-mlx"]
+mlx = ["eredu/mlx"]
+candle = ["eredu/candle"]
+candle-metal = ["candle", "eredu/candle-metal"]
+candle-cuda = ["candle", "eredu/candle-cuda"]
 metal = ["mlx", "eredu/metal"]
 cuda = ["mlx", "eredu/cuda"]
 nccl = ["cuda", "distributed", "eredu/nccl"]
@@ -25,7 +28,6 @@ nccl = ["cuda", "distributed", "eredu/nccl"]
 [[bin]]
 name = "eredu"
 path = "src/main.rs"
-required-features = ["mlx"]
 
 [lints]
 workspace = true
@@ -35,7 +37,6 @@ anyhow.workspace = true
 clap.workspace = true
 hf-cache-reader = "=0.1.0"
 eredu = { workspace = true, default-features = false }
-eredu-backend-mlx = { workspace = true, optional = true }
 eredu-architectures.workspace = true
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
@@ -49,8 +50,5 @@ crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
-safemlx.workspace = true
 eredu-text.workspace = true
-eredu-evaluation.workspace = true
-eredu-gguf.workspace = true
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }

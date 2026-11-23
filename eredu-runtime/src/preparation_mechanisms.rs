@@ -214,6 +214,60 @@ pub struct ModelLoadFacts<M> {
     pub mechanisms: M,
 }
 
+/// Chooses supported original GGUF blocks when affine storage is unavailable
+/// or the native integer dot prefers original blocks under automatic selection.
+pub fn select_packed_gguf_tensors(
+    mechanisms: &impl PreparationMechanismProvider,
+    checkpoint: &eredu_gguf::Checkpoint,
+    allow_native_preference: bool,
+) -> Vec<String> {
+    use eredu_checkpoint::{
+        lowering::WeightLoweringDescriptor, AffineQuantization, LinearFormat, SourceTensorEncoding,
+    };
+
+    let Some(support) = mechanisms.replicated_text_support() else {
+        return Vec::new();
+    };
+    checkpoint
+        .shards()
+        .iter()
+        .flat_map(|shard| {
+            shard.tensors().iter().filter_map(|tensor| {
+                let (bits, group) = tensor.affine()?;
+                let affine =
+                    AffineQuantization::new(i32::try_from(group).ok()?, bits.into()).ok()?;
+                let tensor = tensor.descriptor();
+                let shape = tensor
+                    .dimensions
+                    .iter()
+                    .rev()
+                    .map(|&dim| usize::try_from(dim))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                let axis = Some(shape.len().checked_sub(1)?);
+                let endian = shard.endian();
+                let ggml_type = tensor.ggml_type;
+                let descriptor = |format| {
+                    WeightLoweringDescriptor::new(
+                        SourceTensorEncoding::Gguf { ggml_type, endian },
+                        format,
+                        shape.clone(),
+                        shape.clone(),
+                        axis,
+                    )
+                };
+                let packed = descriptor(LinearFormat::GgufIQuant { ggml_type, endian }).ok()?;
+                let affine = descriptor(LinearFormat::Affine(affine))
+                    .is_ok_and(|descriptor| support.supports_direct(&descriptor));
+                (support.supports_direct(&packed)
+                    && (!affine
+                        || allow_native_preference && support.prefers_original_encoding(&packed)))
+                .then(|| tensor.name.clone())
+            })
+        })
+        .collect()
+}
+
 /// Native mechanism and weight-lowering facts used to admit an external draft.
 pub struct ExternalDraftFacts<M> {
     /// Exact backend mechanism predicates.

@@ -77,7 +77,7 @@ pub trait NativeComponentRank<B: eredu_nn::NeuralBackend, C>:
     fn pipeline_mechanisms(
         &self,
         groups: Vec<<Self::PipelineRank as RankCommunication>::Group>,
-    ) -> (Self::PipelineAllocator, Self::PipelineExecution);
+    ) -> Result<(Self::PipelineAllocator, Self::PipelineExecution), BackendFailure>;
 }
 
 /// Opens the native world for a selected pipeline route.

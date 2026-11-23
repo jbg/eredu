@@ -20,7 +20,7 @@ pub mod codebooks;
 mod indexed_attention;
 mod read_only_attention;
 pub use indexed_attention::{
-    compact_indexed_positions, IndexedAttentionInput, LocalAttentionInput,
+    compact_indexed_positions, decode_indexed_positions, IndexedAttentionInput, LocalAttentionInput,
 };
 pub use read_only_attention::{ReadOnlyAttentionCache, ReadOnlyCache};
 
@@ -42,6 +42,10 @@ mod joint_selector;
 pub use joint_selector::JointGroupSelectorSpec;
 mod routed_gated;
 pub use routed_gated::RoutedGatedProductSpec;
+/// Scalar activation arithmetic shared by native implementations.
+pub mod activations;
+/// Scalar and tensor arithmetic for exact operator profiles.
+pub mod arithmetic;
 mod unary_feed_forward;
 pub use unary_feed_forward::{UnaryActivation, UnaryFeedForwardSpec};
 mod split_gated;
@@ -68,6 +72,8 @@ mod grouped_units;
 mod linear_rows;
 pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
 pub use linear_rows::LinearRowLayout;
+/// Portable additive attention masks.
+pub mod attention_mask;
 /// Separate low-rank projection deltas over an immutable base projection.
 pub mod low_rank;
 /// Logical and implementation memory descriptions for reusable mechanisms.
@@ -76,15 +82,27 @@ pub mod mechanism_memory;
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
 pub mod operation_geometry;
+/// Visibility and numerical composition for bounded attention scans.
+pub mod paged_attention;
 /// Portable recurrent inference with explicitly retained hidden and cell state.
 pub mod recurrent;
 mod retained_tensors;
 pub use retained_tensors::RetainedTensorRoots;
+/// Scalar reference for block-FP8 activation operands.
+pub mod block_fp8;
+/// Native-tensor composition of FP32 residual stream mixing.
+pub mod hyper;
 /// Complete residual stream geometry and portable gated mixing.
 pub mod residual_streams;
 /// Typed pre-dispatch controls for architecture-configured expert selectors.
 pub mod routing_intervention;
-pub use grouped_linear::{GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec};
+pub mod routing_selection;
+pub mod weighted_embedding;
+pub use grouped_linear::{
+    project_group_diagonal, GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec,
+};
+/// Exact views on the sequence axis of batch-first tensors.
+pub mod sequence;
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
 /// Indexed movement contracts for grouped operators.
@@ -1542,6 +1560,11 @@ pub enum LayerNormalizationArithmetic {
     /// scalar moment merges use fused multiply-add; vector chains round their
     /// products and sums separately.
     CascadedMoments,
+    /// Center the row and accumulate FP32 variance in 32-element blocks.
+    /// The two 16-lane partials have explicit accumulation and merge order.
+    /// The affine transform stays in FP32 before one cast to the input dtype.
+    /// The validated geometry has a positive width divisible by 32.
+    BlockedFloat32,
 }
 
 impl LayerNormalizationArithmetic {
@@ -1550,6 +1573,7 @@ impl LayerNormalizationArithmetic {
         match self {
             Self::Native => NeuralOperatorCapabilities::NONE,
             Self::CascadedMoments => NeuralOperatorCapabilities::CASCADED_LAYER_NORM,
+            Self::BlockedFloat32 => NeuralOperatorCapabilities::BLOCKED_LAYER_NORM,
         }
     }
 }
@@ -1724,6 +1748,10 @@ impl RotaryAlgorithm {
 pub enum RotaryArithmetic {
     /// Backend-native fused rotary application.
     Native,
+    /// Advance absolute FP32 angles by a fixed FP32 factor per pair.
+    /// Derive the tables from an absolute offset and round the second
+    /// component’s product in FP32 before the fused update and output cast.
+    RecurrentFloat32,
     /// Keep trigonometric tables, products and sums in FP32 and cast only
     /// the completed rotated value to the input dtype.
     Float32Products,
@@ -1783,21 +1811,51 @@ pub enum PreparedRotaryAlgorithm {
         /// Fraction of the head covered by rotary embeddings.
         rotary_fraction: f32,
     },
-    /// YaRN frequency interpolation and attention concentration.
+    /// YaRN interpolation with a resolved inverse-frequency table.
     Yarn {
-        /// Context extension factor.
-        factor: f32,
-        /// Context length used during training.
-        original_max_positions: i32,
-        /// Fast correction rotation count.
-        beta_fast: f32,
-        /// Slow correction rotation count.
-        beta_slow: f32,
-        /// Multiplier on rotary sine and cosine values.
+        /// One F32 inverse frequency per rotating pair.
+        inverse_frequencies: Vec<f32>,
+        /// Multiplicative attention concentration for the rotary prefix.
         amplitude: f32,
-        /// Whether correction boundaries are rounded to integer frequency slots.
-        truncate: bool,
     },
+}
+
+fn yarn_inverse_frequencies(
+    dims: i32,
+    base: f32,
+    factor: f32,
+    original_context: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    truncate: bool,
+) -> Vec<f32> {
+    let correction = |rotations: f32| {
+        dims as f64
+            * (original_context as f64 / (rotations as f64 * 2.0 * std::f64::consts::PI)).ln()
+            / (2.0 * (base as f64).ln())
+    };
+    let low = if truncate {
+        correction(beta_fast).floor()
+    } else {
+        correction(beta_fast)
+    }
+    .max(0.0) as f32;
+    let high = if truncate {
+        correction(beta_slow).ceil()
+    } else {
+        correction(beta_slow)
+    }
+    .min((dims - 1) as f64) as f32;
+    let width = if low == high { 0.001 } else { high - low };
+    (0..dims / 2)
+        .map(|index| {
+            let base_frequency = base.powf(2.0 * index as f32 / dims as f32);
+            let ramp = ((index as f32 - low) / width).clamp(0.0, 1.0);
+            let extrapolation_mask = 1.0 - ramp;
+            (1.0 / (factor * base_frequency)) * (1.0 - extrapolation_mask)
+                + (1.0 / base_frequency) * extrapolation_mask
+        })
+        .collect()
 }
 
 impl RotarySpec {
@@ -1811,6 +1869,16 @@ impl RotarySpec {
         {
             return Err(Error::backend(
                 "invalid rotary head geometry or frequency base",
+            ));
+        }
+        if self.arithmetic == RotaryArithmetic::RecurrentFloat32
+            && !matches!(
+                self.algorithm,
+                RotaryAlgorithm::Default | RotaryAlgorithm::Linear { .. }
+            )
+        {
+            return Err(Error::backend(
+                "recurrent rotary angles require uniform position scaling",
             ));
         }
         let denominator = |index: i32| self.base.powf(2.0 * index as f32 / self.dimensions as f32);
@@ -1874,12 +1942,16 @@ impl RotarySpec {
                 amplitude,
                 truncate,
             } => PreparedRotaryAlgorithm::Yarn {
-                factor,
-                original_max_positions,
-                beta_fast,
-                beta_slow,
+                inverse_frequencies: yarn_inverse_frequencies(
+                    self.dimensions,
+                    self.base,
+                    factor,
+                    original_max_positions as f32,
+                    beta_fast,
+                    beta_slow,
+                    truncate,
+                ),
                 amplitude,
-                truncate,
             },
         };
         Ok(PreparedRotarySpec {
@@ -1977,6 +2049,25 @@ pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 
     /// Applies the projection without host materialization.
     fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+    /// For FP32 activations and a reduced-precision floating weight, rounds
+    /// the dot operands to the weight's scalar type and returns FP32.
+    fn forward_with_rounded_weight_inputs(
+        &mut self,
+        input: &T,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        use TensorElementType::{Bf16, F16, F32};
+        if input.element_type() == Some(F32) {
+            if let Some(precision @ (F16 | Bf16)) = self.parameter_element_type() {
+                let rounded = input
+                    .cast_float(precision, context)?
+                    .cast_float(F32, context)?;
+                return self.forward(&rounded, context);
+            }
+        }
+        self.forward(input, context)
+    }
+
     /// Projects while optionally exposing the actual multiplication input.
     /// Mechanisms that transform inputs must override this default identity path.
     fn forward_with_input_observer(
@@ -2026,9 +2117,19 @@ pub trait EmbeddingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
         policy.validate()?;
         match policy {
             EmbeddingLookupPolicy::Strict => self.forward(input, context),
-            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Err(Error::backend(format!(
-                "embedding backend does not implement zero sentinel {sentinel}"
-            ))),
+            EmbeddingLookupPolicy::ZeroSentinel(_)
+                if input.element_type() == Some(TensorElementType::U32) =>
+            {
+                self.forward(input, context)
+            }
+            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => {
+                let mask = input.equal_i32(sentinel, context)?;
+                let zero_id = T::full_i32(0, &[], context)?;
+                let safe_ids = T::where_condition(&mask, &zero_id, input, context)?;
+                let rows = self.forward(&safe_ids, context)?;
+                let zero_rows = rows.zeros_like(context)?;
+                T::where_condition(&mask.expand_dims(-1, context)?, &zero_rows, &rows, context)
+            }
         }
     }
     /// Projects hidden states through the transposed embedding table.
@@ -2935,6 +3036,33 @@ pub enum GatedProductActivation {
     Gelu,
     /// Approximate Gaussian error linear unit.
     GeluApproximate,
+    /// Tanh GELU with explicit binary16 rounding on FP32 input.
+    GeluApproximateF16,
+}
+
+impl GatedProductActivation {
+    /// Operator capabilities required by the activation.
+    pub const fn required_operator_capabilities(self) -> NeuralOperatorCapabilities {
+        match self {
+            Self::GeluApproximate => NeuralOperatorCapabilities::GELU_APPROXIMATE,
+            Self::GeluApproximateF16 => NeuralOperatorCapabilities::GELU_APPROXIMATE_F16,
+            Self::Silu | Self::Gelu => NeuralOperatorCapabilities::NONE,
+        }
+    }
+
+    /// Applies the activation without gate-branch modifiers or a value product.
+    pub fn apply<B: NeuralBackend>(
+        self,
+        input: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        match self {
+            Self::Silu => B::silu(input, context),
+            Self::Gelu => B::Tensor::gelu(&input, context),
+            Self::GeluApproximate => B::gelu_approximate(input, context),
+            Self::GeluApproximateF16 => B::gelu_approximate_f16(input, context),
+        }
+    }
 }
 
 /// Validated equation policy for a gated product.
@@ -3006,6 +3134,14 @@ impl GatedProductPolicy {
     pub const fn ordinary_gelu_approximate() -> Self {
         Self {
             activation: GatedProductActivation::GeluApproximate,
+            ..Self::ordinary_silu()
+        }
+    }
+
+    /// Unbounded approximate GELU gating with binary16 rounding on FP32 input.
+    pub const fn gelu_approximate_f16() -> Self {
+        Self {
+            activation: GatedProductActivation::GeluApproximateF16,
             ..Self::ordinary_silu()
         }
     }
@@ -4717,8 +4853,16 @@ impl NeuralOperatorCapabilities {
     pub const LOG1P: Self = Self(1 << 56);
     /// Forward F32 real FFT using the backend's host execution mechanism.
     pub const HOST_RFFT: Self = Self(1 << 57);
+    /// Tanh GELU with binary16 argument and result rounding for FP32 input.
+    pub const GELU_APPROXIMATE_F16: Self = Self(1 << 58);
+    /// Eight-lane projection with one fused binary16 rounding per update.
+    pub const FUSED_F16_PROJECTION: Self = Self(1 << 59);
+    /// LayerNorm with explicit 32-element blocked FP32 moments.
+    pub const BLOCKED_LAYER_NORM: Self = Self(1 << 60);
+    /// Uniform recurrent FP32 rotary angles with fused FP32 rotation.
+    pub const RECURRENT_F32_ROTARY: Self = Self(1 << 61);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 58) - 1);
+    pub const ALL: Self = Self((1 << 62) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -4757,6 +4901,22 @@ impl NeuralOperatorCapabilities {
             (
                 NeuralOperatorCapabilities::GELU_APPROXIMATE,
                 "gelu_approximate",
+            ),
+            (
+                NeuralOperatorCapabilities::GELU_APPROXIMATE_F16,
+                "gelu_approximate_f16",
+            ),
+            (
+                NeuralOperatorCapabilities::FUSED_F16_PROJECTION,
+                "fused_f16_projection",
+            ),
+            (
+                NeuralOperatorCapabilities::BLOCKED_LAYER_NORM,
+                "blocked_layer_norm",
+            ),
+            (
+                NeuralOperatorCapabilities::RECURRENT_F32_ROTARY,
+                "recurrent_f32_rotary",
             ),
             (NeuralOperatorCapabilities::SIGMOID, "sigmoid"),
             (NeuralOperatorCapabilities::SOFTPLUS, "softplus"),
@@ -4993,6 +5153,20 @@ pub trait NeuralBackend: Sized + 'static {
             "approximate GELU is not implemented by this backend",
         ))
     }
+    /// Applies the binary16-rounded tanh GELU profile to FP32 inputs and
+    /// returns FP32. Values at or below -10 return zero, and values at or
+    /// above 10 pass through. Inside the interval, round the input to FP16,
+    /// evaluate the documented scalar approximation in FP32, and round the
+    /// result to FP16 before widening. Other floating dtypes use ordinary GELU.
+    fn gelu_approximate_f16(
+        input: Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "binary16-rounded approximate GELU is not implemented",
+        ))
+    }
     /// Applies the logistic sigmoid elementwise.
     fn sigmoid(
         input: Self::Tensor,
@@ -5050,6 +5224,19 @@ pub trait NeuralBackend: Sized + 'static {
         Err(Error::backend(
             "L2 normalization is not implemented by this backend",
         ))
+    }
+    /// Applies `input / max(sqrt(sum(input * input)), epsilon)` over the final axis.
+    fn l2_normalize_with_floor(
+        input: &Self::Tensor,
+        epsilon: f32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
+        let squared = input.square(context)?;
+        let denominator = Self::Tensor::sum_axis(&squared, -1, true, context)?
+            .sqrt(context)?
+            .maximum_scalar(epsilon, context)?;
+        input.divide(&denominator, context)
     }
     /// Applies grouped RMS normalization to `input`, multiplies by a learned
     /// scale, and then modulates the result by the selected gate activation.
@@ -5699,8 +5886,13 @@ pub fn reference_selective_state_space_scan(
         for token in 0..sequence {
             for head in 0..heads {
                 let group = (batch_index * sequence + token) * heads + head;
-                let dt =
-                    ((time_step[group] + time_step_bias[head]).exp().ln_1p()).max(time_step_floor);
+                let biased_step = time_step[group] + time_step_bias[head];
+                let step = if biased_step > 20.0 {
+                    biased_step
+                } else {
+                    biased_step.exp().ln_1p()
+                };
+                let dt = step.max(time_step_floor);
                 let transition = (-transition_log[head].exp() * dt).exp();
                 let vector_base = group * state_dimensions;
                 for dimension in 0..head_dimensions {
@@ -6117,6 +6309,10 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "square root is not implemented by this tensor backend",
         ))
     }
+    /// Elementwise reciprocal square root.
+    fn reciprocal_sqrt(&self, context: &Self::Context) -> Result<Self, Error> {
+        Self::from_f32_slice(&[1.], &[], context)?.divide(&self.sqrt(context)?, context)
+    }
     /// Elementwise hyperbolic tangent.
     fn tanh(&self, context: &Self::Context) -> Result<Self, Error> {
         let _ = context;
@@ -6164,6 +6360,16 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         Err(Error::backend(
             "clip is not implemented by this tensor backend",
         ))
+    }
+
+    /// Soft-caps a score block before adding the visibility mask and normalizing each row.
+    fn capped_attention_probabilities(
+        &self,
+        mask: &Self,
+        softcap: f32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        arithmetic::capped_attention_probabilities(self, mask, softcap, context)
     }
 
     /// Softmax over one axis.
@@ -6332,6 +6538,17 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     fn concatenate(values: &[Self], axis: i32, context: &Self::Context) -> Result<Self, Error>;
     /// Stacks tensors along a new axis.
     fn stack(values: &[Self], axis: i32, context: &Self::Context) -> Result<Self, Error>;
+    /// Resamples an F32 [height, width, channels] table with a half-pixel
+    /// antialiased bilinear filter and normalized weights at the borders.
+    fn resize_bilinear_antialiased(
+        &self,
+        height: i32,
+        width: i32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        multimodal::resize_bilinear_antialiased(self, height, width, context)
+    }
+
     /// Matrix multiplication.
     fn matmul(lhs: &Self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
     /// Reduction sum.
@@ -6494,6 +6711,46 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         bias: Option<&Self>,
         context: &Self::Context,
     ) -> Result<Self, Error>;
+
+    /// Rounds both operands to binary16 and returns the dot products in FP32.
+    fn linear_f16_operands(
+        input: &Self,
+        weight: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let round = |tensor: &Self| {
+            tensor
+                .cast_float(TensorElementType::F16, context)?
+                .cast_float(TensorElementType::F32, context)
+        };
+        Self::linear(&round(input)?, &round(weight)?, None, context)
+    }
+
+    /// Projects with eight FP16 lanes, computing each update in FP32 before
+    /// rounding the lane to binary16.
+    fn linear_f16_accumulation(
+        input: &Self,
+        weight: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        arithmetic::linear_binary16_lanes(input, weight, context, |x, y, lanes, context| {
+            lanes
+                .add(&x.multiply(y, context)?, context)?
+                .cast_float(TensorElementType::F16, context)?
+                .cast_float(TensorElementType::F32, context)
+        })
+    }
+
+    /// Projects with eight FP16 lanes using one fused FP16 rounding per
+    /// update. The final lane reduction uses pairwise FP32 additions.
+    fn linear_f16_fused_accumulation(
+        input: &Self,
+        weight: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (input, weight, context);
+        Err(Error::backend("fused binary16 projection is unsupported"))
+    }
 
     /// Layer normalization.
     fn layer_norm(

@@ -37,6 +37,8 @@ pub mod schema;
 pub mod store;
 /// Header-only validation of declarative SafeTensors and GGUF plans.
 pub mod validation;
+/// Bounded scalar encoding of canonical packed checkpoint tiles.
+pub mod word_quantization;
 
 pub use recipe::{AtomicMatrixRecipeFamily, MatrixRecipeMember, RecipeAlias};
 

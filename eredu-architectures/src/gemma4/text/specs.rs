@@ -717,11 +717,7 @@ impl DenseSpec {
                 linear(args, &root, "gate_proj", args.hidden_size, width, false)?,
                 linear(args, &root, "up_proj", args.hidden_size, width, false)?,
                 linear(args, &root, "down_proj", width, args.hidden_size, false)?,
-                if args.approximate_gelu {
-                    eredu_nn::GatedProductPolicy::ordinary_gelu_approximate()
-                } else {
-                    eredu_nn::GatedProductPolicy::ordinary_gelu()
-                },
+                args.dense_gated_product(),
             )?,
         };
         spec.validate_for(args, layer)?;
@@ -748,11 +744,7 @@ impl DenseSpec {
         let policy = args
             .layer_policy(layer)
             .ok_or_else(|| Error::backend("dense layer outside its schedule"))?;
-        let expected = if args.approximate_gelu {
-            eredu_nn::GatedProductPolicy::ordinary_gelu_approximate()
-        } else {
-            eredu_nn::GatedProductPolicy::ordinary_gelu()
-        };
+        let expected = args.dense_gated_product();
         if self.owner()?.1 != layer
             || self.product.gate.input != args.hidden_size
             || self.product.gate.output as u32 != policy.intermediate_size.get()
@@ -909,7 +901,8 @@ impl DeclareLogicalParameters for DenseSpec {
     fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
         if self.product.gate.input != self.product.down.output
             || (self.product.policy != eredu_nn::GatedProductPolicy::ordinary_gelu()
-                && self.product.policy != eredu_nn::GatedProductPolicy::ordinary_gelu_approximate())
+                && self.product.policy != eredu_nn::GatedProductPolicy::ordinary_gelu_approximate()
+                && self.product.policy != eredu_nn::GatedProductPolicy::gelu_approximate_f16())
         {
             return Err(Error::backend(
                 "incompatible Gemma dense residual geometry or GELU policy",

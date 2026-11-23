@@ -181,8 +181,8 @@ impl<M: LiveCacheBackend> CacheResidencyManager<M> {
     pub fn bind_transfer_device(&self, stream: &Queue<M>) -> Result<(), CacheResidencyError> {
         let device = M::device(stream)?;
         let mut state = self.lock()?;
-        match state.transfer_device {
-            Some(bound) if bound != device => Err(CacheResidencyError::Runtime(format!(
+        match &state.transfer_device {
+            Some(bound) if *bound != device => Err(CacheResidencyError::Runtime(format!(
                 "paged cache is bound to device {bound:?} but received {device:?}"
             ))),
             Some(_) => Ok(()),

@@ -7,19 +7,26 @@ use super::{
     InstalledTextState, TextExecutable, TextPrefillInput, TextSamplingState, TextSessionDriver,
     TextSessionMechanisms,
 };
+#[cfg(feature = "tensor-capture")]
+use crate::capture::CaptureSession;
 use crate::{
-    capture::CaptureSession,
     execution_control::TextSnapshotBackend,
     generation::refinement::{architecture::BlockRefinementGeometry, RefinementValue},
 };
 use eredu_core::{
     backend::TextTransactionMechanisms,
-    capture::{CaptureError, CaptureSelection, CaptureUsage, ResolvedCaptureSlice},
     decoding::DecodingMode,
-    execution_control::{NativeTextStateSession, SnapshotEstimate, TextSnapshotNative},
-    intervention::InterventionEstimator,
+    execution_control::{
+        NativeTextStateSession, SnapshotEstimate, TextModeSnapshotNative, TextSnapshotNative,
+    },
     ModelRuntime, PendingTextInput,
 };
+#[cfg(feature = "tensor-capture")]
+use eredu_core::{
+    capture::{CaptureError, CaptureSelection, CaptureUsage, ResolvedCaptureSlice},
+    intervention::InterventionEstimator,
+};
+#[cfg(feature = "tensor-capture")]
 use std::sync::Arc;
 
 /// Prepared input geometry observable without evaluating native work.
@@ -49,7 +56,7 @@ pub trait TextSnapshotMechanisms:
     super::specialized::TextModeBinding<
         Shared: crate::speculative::shared_backbone::SharedBackboneMechanisms<Output: Clone>,
         Error: From<eredu_core::BackendFailure>,
-    > + TextSnapshotNative<
+    > + TextModeSnapshotNative<
         CausalScores = ScoresFor<Self>,
         RefinementTokens = <<Self as super::specialized::TextModeBinding>::Refinement as RefinementBackend>::Token,
         RefinementScores = <<Self as super::specialized::TextModeBinding>::Refinement as RefinementBackend>::Logits,
@@ -63,7 +70,7 @@ where
     B: super::specialized::TextModeBinding<
         Shared: crate::speculative::shared_backbone::SharedBackboneMechanisms<Output: Clone>,
         Error: From<eredu_core::BackendFailure>,
-    > + TextSnapshotNative<
+    > + TextModeSnapshotNative<
         CausalScores = ScoresFor<B>,
         RefinementTokens = <<B as super::specialized::TextModeBinding>::Refinement as RefinementBackend>::Token,
         RefinementScores = <<B as super::specialized::TextModeBinding>::Refinement as RefinementBackend>::Logits,
@@ -107,19 +114,7 @@ fn estimate_sampling_state<B: TextSnapshotMechanisms>(
         bytes = bytes.checked_add(B::score_bytes(scores)?)?;
     }
     if let Some(transaction) = &sampling.decoding.speculative {
-        use crate::speculative::autoregressive::AutoregressiveMechanisms as _;
-        bytes = bytes
-            .checked_add(B::Shared::checkpoint_retained_bytes(
-                transaction.baseline(),
-            )?)?
-            .checked_add(B::Shared::checkpoint_retained_bytes(
-                transaction.verified(),
-            )?)?
-            .checked_add(B::Shared::verification_output_bytes(
-                transaction.verification().output(),
-            )?)?
-            .checked_add(transaction.host_retained_bytes()?)?
-            .checked_add(B::proposal_random_bytes(transaction.proposal_randomness())?)?;
+        bytes = bytes.checked_add(transaction.retained_bytes()?)?;
     }
     bytes = bytes.checked_add(
         sampling
@@ -186,6 +181,18 @@ fn copy_sampling_state<B: TextSnapshotMechanisms>(
     })
 }
 
+pub(super) fn shared_verification_growth<C: ?Sized>(
+    state: Option<&dyn super::ErasedTextStateAccess<C>>,
+    installed: Option<SnapshotEstimate>,
+    inputs: u64,
+) -> Option<u64> {
+    // Baseline, verification, accepted restoration, and rollback can coexist.
+    installed?
+        .retained_bytes
+        .checked_add(state?.estimate_installed_growth(inputs)?)?
+        .checked_mul(4)
+}
+
 fn estimate_sampling_growth<B: TextSnapshotMechanisms>(
     sampling: &SnapshotSamplingFor<B>,
     predictions: u64,
@@ -223,7 +230,7 @@ fn estimate_sampling_growth<B: TextSnapshotMechanisms>(
         .checked_add(REFINEMENT_HOST_RESERVE)
 }
 
-fn plain_tokens<B: TextSnapshotMechanisms>(
+pub(super) fn plain_tokens<B: TextSnapshotNative>(
     prompt: &crate::text_session_driver::TextPromptFor<B>,
 ) -> Option<(&B::InputTensor, u64)> {
     use eredu_core::checkpoint::TensorDtype;
@@ -238,7 +245,7 @@ fn plain_tokens<B: TextSnapshotMechanisms>(
     Some((tensor, u64::try_from(*count).ok()?))
 }
 
-fn pending_geometry<B: TextSnapshotMechanisms>(
+pub(super) fn pending_geometry<B: TextSnapshotNative>(
     input: PendingTextInput<&crate::text_session_driver::TextPromptFor<B>, &B::Token>,
 ) -> Option<SnapshotPendingGeometry> {
     Some(match input {
@@ -264,9 +271,12 @@ fn pending_geometry<B: TextSnapshotMechanisms>(
     })
 }
 
-fn estimate_pending_input<B: TextSnapshotMechanisms>(
+pub(super) fn estimate_pending_input<B: TextSnapshotNative>(
     input: Option<PendingTextInput<&crate::text_session_driver::TextPromptFor<B>, &B::Token>>,
-) -> Result<Option<SnapshotEstimate>, B::Error> {
+) -> Result<Option<SnapshotEstimate>, B::Error>
+where
+    B::Error: From<eredu_core::BackendFailure>,
+{
     let cursor_bytes = match input.as_ref() {
         Some(PendingTextInput::Prefill(prompt)) => prompt
             .prefill_cursor()
@@ -315,13 +325,16 @@ fn estimate_pending_input<B: TextSnapshotMechanisms>(
     })())
 }
 
-fn copy_pending_input<B: TextSnapshotMechanisms>(
+pub(super) fn copy_pending_input<B: TextSnapshotNative>(
     backend: &B,
     input: Option<PendingTextInput<&crate::text_session_driver::TextPromptFor<B>, &B::Token>>,
 ) -> Result<
     Option<PendingTextInput<crate::text_session_driver::TextPromptFor<B>, B::Token>>,
     B::Error,
-> {
+>
+where
+    B::Error: From<eredu_core::BackendFailure>,
+{
     use eredu_core::{BackendFailure, InputModality};
     if estimate_pending_input::<B>(input.as_ref().map(|input| match input {
         PendingTextInput::Prefill(prompt) => PendingTextInput::Prefill(*prompt),
@@ -506,12 +519,7 @@ where
                 match (native, additional) {
                     (Some(native), Some(additional)) => {
                         session.ensure_no_submission_in_flight()?;
-                        model
-                            .control_state()
-                            .and_then(|state| state.estimate_installed_growth(additional))
-                            .and_then(|growth| native.retained_bytes.checked_add(growth))
-                            // Baseline, verification, accepted restoration, and rollback retain independent state.
-                            .and_then(|bytes| bytes.checked_mul(4))
+                        shared_verification_growth(model.control_state(), Some(native), additional)
                     }
                     _ => None,
                 }
@@ -604,13 +612,13 @@ where
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError> {
-        <B as TextSnapshotNative>::child_capture_workspace().estimate(shape, selection, slice)
+        <B as TextModeSnapshotNative>::child_capture_workspace().estimate(shape, selection, slice)
     }
     #[cfg(feature = "tensor-capture")]
     fn child_intervention_estimator(
         _: &ModelRuntime<Self, TextSessionDriver<R, N>>,
     ) -> Result<Arc<dyn InterventionEstimator>, CaptureError> {
-        <B as TextSnapshotNative>::child_intervention_estimator()
+        <B as TextModeSnapshotNative>::child_intervention_estimator()
     }
 }
 

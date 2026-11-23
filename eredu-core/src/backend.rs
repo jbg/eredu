@@ -2,6 +2,7 @@
 
 mod continuation;
 mod failure;
+pub mod local_text;
 mod steps;
 pub use continuation::{
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
@@ -980,6 +981,14 @@ pub trait ModelLoadAdmission<P> {
     /// Reason portable selection failed.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Projects the admitted source layout using cold mechanism facts before selection.
+    fn project_inspection(
+        &self,
+        inspection: ArtifactInspection<P>,
+    ) -> Result<ArtifactInspection<P>, ArtifactError> {
+        Ok(inspection)
+    }
+
     /// Selects a preparation for this inspection without materializing sources.
     fn select(
         self,
@@ -1148,11 +1157,13 @@ impl<B: ModelLoadingBackend, P, S> SelectedModelPreparation<B, P, S> {
         Self { plan, selected }
     }
 
-    pub(crate) const fn plan(&self) -> &ModelPreparationPlan<P> {
+    /// Borrows the exact admitted artifact and preparation policy.
+    pub const fn plan(&self) -> &ModelPreparationPlan<P> {
         &self.plan
     }
 
-    pub(crate) const fn selected(&self) -> &SelectedModelBinding<S, B::Binding> {
+    /// Borrows the selected source and placement without changing admission.
+    pub const fn selected(&self) -> &SelectedModelBinding<S, B::Binding> {
         &self.selected
     }
 
@@ -1226,17 +1237,34 @@ where
             SourcePreparation: ModelSourcePreparation<P, Prepared: BindModelSources<B>>,
         >,
 {
+    let selected = select_inspected_model::<B, P, A>(backend, inspection, options)?;
+    prepare_selected_model(backend, selected)
+}
+
+/// Selects an inspected model before opening checkpoint payloads.
+pub fn select_inspected_model<B: ModelLoadingBackend, P, A>(
+    backend: &B,
+    inspection: ArtifactInspection<P>,
+    options: ModelLoadOptions<A::Request, B::LoadPlacement>,
+) -> Result<SelectedModelPreparation<B, P, A::SourcePreparation>, ModelLoadError<B::Error>>
+where
+    P: Clone + std::fmt::Debug,
+    A: DirectLoadFacts<Mechanisms = B::LoadMechanisms> + ModelLoadAdmission<P>,
+{
     let ModelLoadOptions { request, placement } = options;
+    let rank = A::rank(&request);
+    let facts = A::from_request(request, backend.load_mechanisms());
+    let inspection = facts.project_inspection(inspection)?;
     let binding = backend
-        .bind_load_placement(A::rank(&request), placement)
+        .bind_load_placement(rank, placement)
         .map_err(ModelLoadError::Backend)?;
-    let selected = A::from_request(request, backend.load_mechanisms())
+    let selected = facts
         .select(&inspection)
         .map_err(|error| ModelLoadError::Selection(Box::new(error)))?;
     let admission = selected.admission();
     let selected = SelectedModelBinding::new(selected, binding);
     let plan = ModelPreparationPlan::from_retained_admission(inspection, admission)?;
-    prepare_selected_model(backend, SelectedModelPreparation::new(plan, selected))
+    Ok(SelectedModelPreparation::new(plan, selected))
 }
 
 /// Materializes an already planned artifact with its retained backend selection.
@@ -1244,7 +1272,7 @@ where
 /// Selection and capability admission must have completed before the backend
 /// instance was realized. This entry point therefore performs no policy or
 /// route selection after native resources exist.
-pub(crate) fn prepare_selected_model<B: ModelLoadingBackend, P, S>(
+pub fn prepare_selected_model<B: ModelLoadingBackend, P, S>(
     backend: &B,
     selected: SelectedModelPreparation<B, P, S>,
 ) -> Result<PreparedModel<LoadedModelFor<B, P, S>>, ModelLoadError<B::Error>>
@@ -2318,17 +2346,6 @@ pub trait TextOperationDriver<B: TextGenerationBackend>: BackendSession<B> + Siz
         Ok(false)
     }
 
-    /// Completes the remaining prepared prompt without sampling. On success
-    /// the exact input identity is committed and the input is consumed. Returns
-    /// false without execution when the session has no such boundary.
-    fn complete_text_prefill(
-        _runtime: &mut ModelRuntime<B, Self>,
-        _prompt: Self::Prompt,
-        _state: &mut Self::TextGenerationState,
-    ) -> Result<bool, B::Error> {
-        Ok(false)
-    }
-
     /// Agrees pending commands and cancellation before entering distributed work.
     /// The default is a single-owner execution with no transport.
     fn coordinate_decoding_control(
@@ -2357,7 +2374,7 @@ pub trait TextOperationDriver<B: TextGenerationBackend>: BackendSession<B> + Siz
         .into())
     }
 
-    /// Publishes accepted verification state after a canonical token commits.
+    /// Publishes accepted sampling or verification state after a canonical token commits.
     fn commit_text_token(
         _runtime: &mut ModelRuntime<B, Self>,
         _token_id: u32,
@@ -2405,10 +2422,10 @@ pub trait AutomaticPromptCacheSession<B: TextGenerationBackend>: BackendSession<
             "prompt-cache export is unavailable",
         )))
     }
-    /// Loads through the installed session's ordinary prompt-cache import path.
-    fn load_prompt_cache(
+    /// Restores the exact immutable generation admitted by the caller.
+    fn restore_prompt_cache(
         _runtime: &mut ModelRuntime<B, Self>,
-        _store: &dyn crate::cache::PromptCacheStore,
+        _read: &dyn crate::cache::PromptCacheRead,
         _descriptor: &crate::cache::PromptCacheDescriptor,
         _prefix: &[u32],
     ) -> Result<crate::cache::PromptCacheManifest, BackendFailure> {
@@ -2521,15 +2538,6 @@ pub trait NativeTextValues: 'static {
     /// Native tensor operators and collectors for embedded verification.
     type Embedded: crate::speculative::embedded::EmbeddedPredictionOperators<Tensor = Self::Tensor>;
 
-    /// Materializes the requested token range on the specified queue.
-    fn slice_tokens(
-        tokens: &Self::Tensor,
-        range: std::ops::Range<usize>,
-        queue: &Self::Context,
-    ) -> Result<
-        Self::Tensor,
-        <Self::Embedded as crate::speculative::embedded::EmbeddedPredictionOperators>::Error,
-    >;
     /// Settles the retained input handle.
     fn settle_input(
         value: &Self::Tensor,
@@ -2541,20 +2549,6 @@ pub trait NativeTextValues: 'static {
     fn input_failure(
         error: BackendFailure,
     ) -> <Self::Embedded as crate::speculative::embedded::EmbeddedPredictionOperators>::Error;
-
-    #[doc(hidden)]
-    fn observe_forward() {}
-    #[doc(hidden)]
-    fn observe_publication() {}
-    #[doc(hidden)]
-    fn read_fixed_values(
-        _: &<Self::Cache as crate::cache::mechanisms::LiveCacheBackend>::Tensor,
-    ) -> Result<Vec<f32>, BackendFailure> {
-        Err(BackendFailure::new(
-            crate::BackendFailureKind::Unsupported,
-            std::io::Error::other("native fixed-state readback is unavailable"),
-        ))
-    }
 }
 
 /// Backend representations needed to erase an installed executable.
@@ -2587,7 +2581,7 @@ pub trait TextExecutableTypes: 'static {
     /// Exact native group used for coordinated token sampling.
     type Group;
     /// Native completion and input types for the bound embedded executor.
-    type EmbeddedExecutor: crate::speculative::erasure::GenerationExecutorTypes;
+    type EmbeddedExecutor: crate::speculative::erasure::GenerationExecutorTypes<Binding = ()>;
     /// Native representations used by the installed prediction collectors.
     type EmbeddedObservers;
     /// Side-effect-free metadata inspection for prepared input.
@@ -2608,27 +2602,28 @@ pub trait TextExecutableTypes: 'static {
     ) -> Result<Vec<u32>, Self::Error>;
 }
 
+/// Local host generation with optional masked block refinement.
+pub struct CausalTextGeneration;
+
+/// A session that can realize the advanced text dispatch routes.
+pub struct AdvancedTextGeneration;
+
 /// The native resource, queue and submission operations used by the driver.
 pub trait TextSessionNative<B: BackendProvider>:
     Sized + crate::session_authority::SessionRetirement<Error = B::Error>
 {
+    /// Generation dispatch profile supported by this native implementation.
+    type Generation;
     /// Exact native placement of prepared resources.
     type Target;
     /// Native communication retained for a prepared executable.
     type Communication;
 
-    /// Reads native counters and physical memory semantics for this backend.
-    fn native_memory() -> crate::capability::NativeMemoryFacts;
     /// Reports an existing native failure without progressing outstanding work.
     fn check_native_health(&self) -> Result<(), B::Error>;
 
     /// Validates native placement before creating installed resources.
     fn validate_target(backend: &B, target: &Self::Target) -> Result<(), B::Error>;
-
-    /// An exact capability observation supplied by the native target, when available.
-    fn target_capabilities(_target: &Self::Target) -> Option<SessionCapabilities> {
-        None
-    }
 
     /// Attaches native placement and completion lifetimes for installation.
     fn attach_native(
@@ -2688,6 +2683,102 @@ pub trait TextSessionNative<B: BackendProvider>:
 
     /// The selected device context.
     fn context(backend: &B) -> &<Self::TextValues as NativeTextValues>::Context;
+
+    /// Collector for local capture and intervention, borrowing the exact context.
+    type LocalCollector<'a>: crate::intervention::InterventionBackend<
+        Tensor = <Self::TextValues as NativeTextValues>::Tensor,
+        Error = B::Error,
+    >;
+
+    /// Opens the optional local collector on its exact native context.
+    fn local_capture<'a>(
+        _context: &'a <Self::TextValues as NativeTextValues>::Context,
+        _domain: Option<crate::capture::CaptureTokenDomain<'a>>,
+    ) -> Option<Self::LocalCollector<'a>> {
+        None
+    }
+
+    /// Side-effect-free mechanisms and the estimator used by local intervention.
+    fn local_intervention(
+        &self,
+    ) -> Option<(
+        crate::intervention::InterventionMechanisms,
+        std::sync::Arc<dyn crate::intervention::InterventionEstimator>,
+    )> {
+        None
+    }
+
+    /// Whether the selected local device can realize host-backed refinement.
+    fn supports_host_refinement(&self) -> bool {
+        false
+    }
+
+    /// Uploads the exact tentative canvas for one local refinement invocation.
+    fn host_refinement_canvas(
+        _ids: &[u32],
+        _context: &<Self::TextValues as NativeTextValues>::Context,
+    ) -> Result<<Self::TextValues as NativeTextValues>::Tensor, B::Error>
+    where
+        B::Error: From<crate::BackendFailure>,
+    {
+        Err(crate::BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::other("no host refinement canvas adapter"),
+        )
+        .into())
+    }
+
+    /// Reports the floating representation retained by soft-feedback ingress.
+    fn host_refinement_format(
+        _scores: &<Self::TextValues as NativeTextValues>::Scores,
+    ) -> Option<eredu_nn::TensorElementType> {
+        None
+    }
+
+    /// Uploads immutable feedback on the exact execution context and settles
+    /// the upload before returning the tensor for a refinement invocation.
+    fn host_refinement_feedback(
+        _scores: &[f32],
+        _shape: &[i32],
+        _element: eredu_nn::TensorElementType,
+        _context: &<Self::TextValues as NativeTextValues>::Context,
+    ) -> Result<<Self::TextValues as NativeTextValues>::Tensor, B::Error>
+    where
+        B::Error: From<crate::BackendFailure>,
+    {
+        Err(crate::BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::other("no host refinement feedback adapter"),
+        )
+        .into())
+    }
+
+    /// Copies the exact admitted canvas score matrix after native completion.
+    fn host_refinement_scores(
+        _scores: &<Self::TextValues as NativeTextValues>::Scores,
+        _shape: [usize; 2],
+        _context: &<Self::TextValues as NativeTextValues>::Context,
+    ) -> Result<Vec<f32>, B::Error>
+    where
+        B::Error: From<crate::BackendFailure>,
+    {
+        Err(crate::BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::other("no host refinement score adapter"),
+        )
+        .into())
+    }
+
+    /// Prices all work and host staging before creating a local native capture view.
+    fn estimate_local_capture(
+        _source: &[u64],
+        _selection: &crate::capture::CaptureSelection,
+        _slice: &crate::capture::ResolvedCaptureSlice,
+    ) -> Result<crate::capture::CaptureUsage, crate::capture::CaptureError> {
+        Err(crate::capture::CaptureError::Unsupported(
+            "no local native capture collector".into(),
+        ))
+    }
 
     /// Publishes scores on the selected output rank.
     fn publish_scores(
@@ -2763,25 +2854,25 @@ pub trait TextSamplingNative<B: TextGenerationBackend>: TextSessionNative<B> {
     /// Exact completion for a sample from already submitted causal scores.
     type SamplingCompletion: crate::Completion<Error = B::Error>;
 
-    /// Exact native numerical failure.
-    type SamplingError: std::error::Error + Send + Sync + 'static;
+    /// Final vocabulary row owned by the sampling route. Host routes return
+    /// one owned FP32 vector, while device routes retain a native tensor.
+    type ScoreRow;
 
-    /// Native tensor and random stream operations selected for text sampling.
-    type Sampling: crate::sampling::SamplingBackend<
-        Context = <Self::TextValues as NativeTextValues>::Context,
-        Error = Self::SamplingError,
-    >;
+    /// Selected value handed to the native completion scope.
+    type Sample;
+
     /// Exact native resources retained while a token is derived from submitted scores.
     type SamplingScope;
 
-    /// Attaches the token operation to the live score submission.
+    /// Attaches the token operation to the live score submission. A host
+    /// adapter establishes safe readback here before its score-row method runs.
     fn begin_sampling(completion: &Self::Completion) -> Result<Self::SamplingScope, B::Error>;
 
     /// Returns the final physical score row when the backend owns the submitted output.
     fn last_score_row(
         output: &Self::Output,
-        context: &<Self::Sampling as crate::sampling::SamplingBackend>::Context,
-    ) -> Result<Option<<Self::Sampling as crate::sampling::SamplingBackend>::Logits>, B::Error>;
+        context: &<Self::TextValues as NativeTextValues>::Context,
+    ) -> Result<Option<Self::ScoreRow>, B::Error>;
 
     /// Observes the realized collective coordinates without submitting work.
     fn sampling_group_coordinates(
@@ -2790,25 +2881,69 @@ pub trait TextSamplingNative<B: TextGenerationBackend>: TextSessionNative<B> {
 
     /// Broadcasts exactly one selected token on the admitted group.
     fn exchange_sampled_token(
-        token: Option<<Self::Sampling as crate::sampling::SamplingBackend>::Token>,
+        token: Option<Self::Sample>,
         rank: usize,
         group: &<Self::TextValues as NativeTextValues>::Group,
         authority: &crate::communication::CommunicationAuthority,
-        context: &<Self::Sampling as crate::sampling::SamplingBackend>::Context,
-    ) -> Result<<Self::Sampling as crate::sampling::SamplingBackend>::Token, B::Error>;
+        context: &<Self::TextValues as NativeTextValues>::Context,
+    ) -> Result<Self::Sample, B::Error>;
 
     /// Combines score and token completion or safely retires a failed token operation.
     fn finish_sampling(
         scope: Self::SamplingScope,
         completion: Self::Completion,
-        token: Result<<Self::Sampling as crate::sampling::SamplingBackend>::Token, B::Error>,
-        context: &<Self::Sampling as crate::sampling::SamplingBackend>::Context,
+        token: Result<Self::Sample, B::Error>,
+        context: &<Self::TextValues as NativeTextValues>::Context,
     ) -> Result<Submission<Self::Token, Self::SamplingCompletion>, B::Error>;
+
+    /// Publishes settled host-only refinement progress under installed authority.
+    fn complete_host_progress(
+        _lease: crate::SubmissionLease,
+    ) -> Result<Self::SamplingCompletion, B::Error>
+    where
+        B::Error: From<crate::BackendFailure>,
+    {
+        Err(crate::BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::other("no host progress completion"),
+        )
+        .into())
+    }
+
+    /// Publishes a host-selected token under an acquired installed-session lease.
+    /// There is no pending device computation for this host-only decision.
+    fn complete_host_token(
+        _token: u32,
+        _lease: crate::SubmissionLease,
+    ) -> Result<Submission<Self::Token, Self::SamplingCompletion>, B::Error>
+    where
+        B::Error: From<crate::BackendFailure>,
+    {
+        Err(crate::BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::other("no host token completion"),
+        )
+        .into())
+    }
 
     /// Native token value consumed by one cached decode.
     type Token;
     /// Extracts the sampled value without preparing or submitting a decode.
     fn sampled_token_value(token: Self::Token) -> Self::SampledDecode;
+}
+
+/// Device-native numerical operations for a causal text submission.
+pub trait DeviceTextSampling<B: TextGenerationBackend>: TextSamplingNative<B> {
+    /// Exact native numerical failure.
+    type SamplingError: std::error::Error + Send + Sync + 'static;
+
+    /// Numerical operations over native scores and the native random stream.
+    type Sampling: crate::sampling::SamplingBackend<
+        Logits = Self::ScoreRow,
+        Token = Self::Sample,
+        Context = <Self::TextValues as NativeTextValues>::Context,
+        Error = Self::SamplingError,
+    >;
 }
 
 /// Native preparation and sampling state for text generation.
@@ -2829,8 +2964,8 @@ pub trait TextMediaNative<B: TextGenerationBackend>: TextSessionNative<B> {
         Error = B::Error,
     >;
 
-    /// Opens native allocation and submission recovery.
-    fn begin_processor() -> Result<Self::ProcessorScope, B::Error>;
+    /// Opens native allocation and submission recovery for the installed placement.
+    fn begin_processor(&self) -> Result<Self::ProcessorScope, B::Error>;
 }
 
 /// Native values borrowed by the portable shared-target text driver.
@@ -3267,6 +3402,16 @@ where
             crate::run_preparation::TextPreparationStage::Instrumentation,
             local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
             crate::run_preparation::TextCaptureSetupError::Preparation,
+        )
+    }
+
+    /// Borrows the model at a completed boundary before the final prefill.
+    /// The caller drains the step's captures before accessing the runtime.
+    pub fn prefill_boundary(&mut self) -> Result<Option<&mut ModelRuntime<B, S>>, B::Error> {
+        self.settle_step()?;
+        Ok(
+            matches!(self.inner.step, Some(PendingTextInput::Prefill(_)))
+                .then_some(&mut *self.runtime),
         )
     }
 
@@ -4166,6 +4311,7 @@ mod tests {
                 planned_disk_backed_bytes: unavailable(),
                 backend_active_allocation_bytes: unavailable(),
                 backend_allocator_cache_bytes: unavailable(),
+                backend_device_allocated_bytes: unavailable(),
                 physical_semantics: crate::PhysicalMemorySemantics::Unknown,
                 currently_cached_shards: unavailable(),
             })

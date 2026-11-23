@@ -481,6 +481,7 @@ struct PreparedAttentionKeyValues {
     key_product: Option<super::matrix::PreparedBf16BatchedProduct>,
     value_product: Option<super::matrix::PreparedBf16BatchedProduct>,
     score_dtype: Dtype,
+    query_rows: u64,
     score_reduction: super::matrix::BatchedDotReduction,
     value_reduction: super::matrix::BatchedDotReduction,
 }
@@ -505,18 +506,19 @@ impl PreparedAttentionKeyValues {
             .as_dtype(score_dtype, stream)?
             .swap_axes(-1, -2, stream)?;
         let values = values.clone();
-        let score_reduction = super::matrix::batched_dot_reduction(
-            queries.dim(2) as u64,
-            queries.dim(3) as u64,
-            values.dim(2) as u64,
-            super::matrix::BatchedDotReduction::Row32,
-        );
-        let value_reduction = super::matrix::batched_dot_reduction(
-            queries.dim(2) as u64,
-            values.dim(2) as u64,
-            values.dim(3) as u64,
-            super::matrix::BatchedDotReduction::Native,
-        );
+        use super::matrix::BatchedDotReduction;
+        use eredu_nn::arithmetic::Bf16DotGeometry;
+
+        let score_reduction = BatchedDotReduction::for_scores(Bf16DotGeometry {
+            rows: queries.dim(2) as u64,
+            width: queries.dim(3) as u64,
+            columns: values.dim(2) as u64,
+        });
+        let value_reduction = BatchedDotReduction::for_native_values(Bf16DotGeometry {
+            rows: queries.dim(2) as u64,
+            width: values.dim(2) as u64,
+            columns: values.dim(3) as u64,
+        });
         let key_product = super::matrix::PreparedBf16BatchedProduct::new(
             &keys,
             false,
@@ -537,6 +539,7 @@ impl PreparedAttentionKeyValues {
             key_product,
             value_product,
             score_dtype,
+            query_rows: queries.dim(2) as u64,
             score_reduction,
             value_reduction,
         })
@@ -569,6 +572,26 @@ pub(crate) fn grouped_head_product(
         .reshape(&[lhs.dim(0), heads, lhs.dim(2), rhs.dim(3)], stream)
 }
 
+/// Executes a score product with the same reduction for contiguous and paged keys.
+pub(crate) fn input_score_product(
+    queries: &Array,
+    transposed_keys: &Array,
+    prepared: Option<&super::matrix::PreparedBf16BatchedProduct>,
+    reduction: super::matrix::BatchedDotReduction,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if let Some(product) = prepared {
+        if let Some(scores) = product.apply(queries, stream)? {
+            return Ok(scores);
+        }
+    }
+    match super::matrix::ordered_bf16_batched_product(queries, transposed_keys, reduction, stream)?
+    {
+        Some(scores) => Ok(scores),
+        None => grouped_head_product(queries, transposed_keys, stream),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attention_with_prepared_key_values(
     queries: &Array,
@@ -582,25 +605,26 @@ fn attention_with_prepared_key_values(
     let tokens = prepared.values.dim(2);
     let score_dtype = prepared.score_dtype;
     let query = queries.as_dtype(score_dtype, stream)?;
-    let scores = match prepared
-        .key_product
-        .as_ref()
-        .map(|product| product.apply(&query, stream))
-        .transpose()?
-        .flatten()
-    {
-        Some(scores) => scores,
-        None => {
-            match super::matrix::ordered_bf16_batched_product(
-                &query,
-                &prepared.keys,
-                prepared.score_reduction,
-                stream,
-            )? {
-                Some(scores) => scores,
-                None => grouped_head_product(&query, &prepared.keys, stream)?,
-            }
-        }
+    let ordered = score_dtype == Dtype::Float32
+        && queries.dtype() == Dtype::Float32
+        && prepared.values.dtype() == Dtype::Float32
+        && super::ordered_f32::supported(stream)?;
+    let scores = if ordered {
+        super::ordered_f32::attention_product(
+            &query,
+            &prepared.keys.swap_axes(-1, -2, stream)?,
+            false,
+            prepared.query_rows,
+            stream,
+        )?
+    } else {
+        input_score_product(
+            &query,
+            &prepared.keys,
+            prepared.key_product.as_ref(),
+            prepared.score_reduction,
+            stream,
+        )?
     };
     let probabilities = explicit_probabilities(
         scores,
@@ -611,8 +635,18 @@ fn attention_with_prepared_key_values(
         mask,
         sinks,
         softcap,
+        ordered,
         stream,
     )?;
+    if ordered {
+        return super::ordered_f32::attention_product(
+            &probabilities,
+            &prepared.values.swap_axes(-1, -2, stream)?,
+            true,
+            prepared.query_rows,
+            stream,
+        );
+    }
     match prepared
         .value_product
         .as_ref()
@@ -650,6 +684,7 @@ fn explicit_probabilities(
     mask: Option<&Array>,
     sinks: Option<&Array>,
     softcap: Option<f32>,
+    ordered_f32: bool,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -698,11 +733,14 @@ fn explicit_probabilities(
         scores = concatenate_axis(&[&scores, &sinks], -1, stream)?;
     }
     let scores = scores.as_dtype(Dtype::Float32, stream)?;
-    let probabilities =
+    let probabilities = if ordered_f32 {
+        super::ordered_f32::softmax(&scores, stream)?
+    } else {
         match super::arithmetic::softmax_last(&scores, score_dtype == Dtype::Bfloat16, stream)? {
             Some(value) => value,
             None => safemlx::ops::softmax_axis(&scores, -1, true, stream)?,
-        };
+        }
+    };
     probabilities
         .try_index_device((.., .., .., ..tokens), stream)?
         .as_dtype(output_dtype, stream)
@@ -710,7 +748,7 @@ fn explicit_probabilities(
 
 /// Explicit rounding need not materialize the complete Q-by-K score matrix.
 /// Complete key rows use the ordinary softmax and product reduction when they
-/// fit the score budget. Larger rows use the same two-pass recurrence as paged
+/// fit the score budget. Larger rows use the same bounded sweeps as paged
 /// storage, with bounded views and caller-provided (possibly noncausal) masks.
 #[allow(clippy::too_many_arguments)]
 fn bounded_input_score_attention(
@@ -839,12 +877,12 @@ fn input_score_attention_with_tile_batches(
             i64::from(keys.dim(2)),
             stream,
         )?;
-        accumulator.set_arithmetic(eredu_nn::AttentionArithmetic::InputScores)?;
+        accumulator.set_arithmetic(eredu_nn::AttentionArithmetic::InputScores, stream)?;
         accumulator.set_softcap(softcap)?;
         accumulator.use_explicit_mask_only()?;
-        for pass in 0..2 {
-            if pass == 1 {
-                accumulator.begin_value_pass()?;
+        for pass in 0..accumulator.scan().passes() {
+            if pass > 0 {
+                accumulator.begin_pass(pass, stream)?;
             }
             for key_start in (0..keys.dim(2)).step_by(INPUT_SCORE_KEY_TILE_POSITIONS) {
                 let key_end = (key_start + INPUT_SCORE_KEY_TILE_POSITIONS as i32).min(keys.dim(2));

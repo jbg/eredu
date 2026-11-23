@@ -73,7 +73,7 @@ where
     }
 
     fn snapshot_estimate(state: &Self::State) -> Option<SnapshotEstimate> {
-        M::model_snapshot_estimate(state)
+        crate::state::PortableTextState::isolated_snapshot_estimate(state)
     }
 
     fn memory_observation(
@@ -102,7 +102,10 @@ where
         state: &Self::State,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<Self::State>, BackendFailure> {
-        M::model_snapshot(state, context)
+        use crate::speculative::{PortablePredictionTargetState, PredictionTargetLifecycle};
+        PortablePredictionTargetState::<B, M::ModelCacheStorage, BackendFailure>::snapshot(
+            state, context,
+        )
     }
 }
 

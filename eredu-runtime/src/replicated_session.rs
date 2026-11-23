@@ -20,14 +20,14 @@ use eredu_core::cache::{
 use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCommitPhase};
 use eredu_nn::{NeuralBackend, Tensor};
 
-mod capture_bundle;
+pub(crate) mod capture_bundle;
 mod composite;
 pub use composite::{CompositePrompt, CompositeTextInvocation};
 mod control;
 mod installed_parameters;
 pub use installed_parameters::PredictionModuleParameters;
 mod prediction;
-mod prompt_cache;
+pub(crate) mod prompt_cache;
 mod state_snapshot_memory;
 mod target_transport;
 pub use capture_bundle::{ForwardCaptureBundle, ForwardCaptureSlot};
@@ -39,6 +39,7 @@ pub use control::{
 };
 pub use prediction::{finish_prediction_state_operation, PredictionStateRecoveryFailure};
 pub use prompt_cache::{PromptCacheInput, TextPromptCache};
+
 pub use state_snapshot_memory::StateSnapshotMemoryCosts;
 pub use target_transport::{
     PredictionTargetTransport, PredictionTensorAssembly, PredictionTensorAssemblyPlan,
@@ -160,6 +161,40 @@ where
         descriptor: &PromptCacheDescriptor,
         layer_frontiers: &[i32],
     ) -> Result<Self::CacheExport, Self::Error>;
+
+    /// Publishes an admitted local cache backed by contiguous native state.
+    fn publish_resident_cache(
+        &self,
+        _state: &mut Self::State,
+        _store: &dyn eredu_core::cache::PromptCacheStore,
+        _descriptor: PromptCacheDescriptor,
+        _prefix: &[u32],
+        _options: &PromptCacheOptions,
+        _context: &B::Executor,
+    ) -> Result<PromptCacheManifest, Self::Error> {
+        Err(Self::parameter_storage_error(
+            eredu_core::BackendFailure::new(
+                eredu_core::BackendFailureKind::Unsupported,
+                std::io::Error::other("resident prompt-cache state is unavailable"),
+            ),
+        ))
+    }
+
+    /// Installs an admitted local cache into a candidate contiguous state.
+    fn install_resident_cache(
+        &self,
+        _state: &mut Self::State,
+        _restore: &crate::PromptCacheRestore<'_>,
+        _frontiers: &[i32],
+        _context: &B::Executor,
+    ) -> Result<(), Self::Error> {
+        Err(Self::parameter_storage_error(
+            eredu_core::BackendFailure::new(
+                eredu_core::BackendFailureKind::Unsupported,
+                std::io::Error::other("resident prompt-cache state is unavailable"),
+            ),
+        ))
+    }
 
     /// Borrows the exact mutable-state tensor roots for completion.
     fn state_roots(state: &Self::State) -> Vec<&B::Tensor>;
@@ -1139,6 +1174,7 @@ where
     partition_parameters: Option<std::sync::Arc<crate::ArchitectureParameterDescription>>,
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
     committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
+    local_token_prefix: Option<eredu_core::cache::PromptCacheTokenDigest>,
     next_commit_epoch: DistributedCommitEpoch,
     complete_text_prefill: bool,
     active_commit_epoch: Option<DistributedCommitEpoch>,
@@ -1663,6 +1699,7 @@ impl SessionStateRealization {
 /// Complete transactional checkpoint including composite prompt-input identity.
 pub struct ReplicatedTextSessionCheckpoint<C> {
     state: C,
+    local_token_prefix: Option<eredu_core::cache::PromptCacheTokenDigest>,
     prompt_input_identity: Option<PreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
     last_commit_outcome: Option<DistributedCommitOutcome>,
@@ -2413,6 +2450,7 @@ where
         partition_parameters: None,
         prompt_cache_identity: Some(prompt_cache_identity),
         committed_prompt_input_identity: None,
+        local_token_prefix: Some(Default::default()),
         next_commit_epoch: DistributedCommitEpoch::FIRST,
         complete_text_prefill: false,
         active_commit_epoch: None,
@@ -2533,6 +2571,7 @@ where
         partition_parameters: Some(parameters),
         prompt_cache_identity,
         committed_prompt_input_identity: None,
+        local_token_prefix: Some(Default::default()),
         next_commit_epoch: DistributedCommitEpoch::FIRST,
         complete_text_prefill: false,
         active_commit_epoch: None,
@@ -2545,7 +2584,7 @@ where
     })
 }
 
-fn construct_units<A, B, S>(
+pub(crate) fn construct_units<A, B, S>(
     architecture: &A,
     invocations: &crate::ExecutionUnitAddressMap,
     context: &<B::Tensor as Tensor>::Context,
@@ -3887,6 +3926,7 @@ where
     > {
         Ok(ReplicatedTextSessionCheckpoint {
             state: self.checkpoint(context)?,
+            local_token_prefix: self.local_token_prefix.clone(),
             prompt_input_identity: self.committed_prompt_input_identity.clone(),
             next_commit_epoch: self.next_commit_epoch,
             last_commit_outcome: self.last_commit_outcome,
@@ -3950,6 +3990,7 @@ where
         self.mechanisms
             .restore_state(&mut self.state, checkpoint, context)
             .map_err(ReplicatedTextSessionError::Mechanism)?;
+        self.local_token_prefix = None;
         // A state-only checkpoint cannot prove which multimodal prompt produced its bytes.
         self.committed_prompt_input_identity = None;
         Ok(())
@@ -3965,6 +4006,7 @@ where
         self.mechanisms
             .restore_state(&mut self.state, checkpoint.state, context)
             .map_err(ReplicatedTextSessionError::Mechanism)?;
+        self.local_token_prefix = checkpoint.local_token_prefix;
         self.committed_prompt_input_identity = checkpoint.prompt_input_identity;
         self.next_commit_epoch = self.next_commit_epoch.max(checkpoint.next_commit_epoch);
         self.last_commit_outcome = checkpoint.last_commit_outcome;
@@ -4056,6 +4098,7 @@ where
             ));
         }
         self.committed_prompt_input_identity = None;
+        self.local_token_prefix = Some(Default::default());
         Ok(())
     }
 
@@ -4068,31 +4111,48 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
+        crate::cache::with_rank_prompt_cache_store(store, expected.topology(), |store| {
+            let read = store.open()?.ok_or_else(prompt_cache::empty_store)?;
+            self.restore_prompt_cache(&*read, expected, prefix_token_ids, None, context)
+        })
+    }
+
+    /// Installs the admitted immutable generation without reopening its store.
+    fn restore_prompt_cache(
+        &mut self,
+        read: &dyn eredu_core::cache::PromptCacheRead,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        input: Option<PreparedInputCacheIdentity>,
+        context: &B::Executor,
+    ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
         self.ensure_control_unfenced()?;
+        if let Some(input) = &input {
+            self.validate_prompt_input_descriptor(expected, input)?;
+        }
         let identity = self.prompt_cache_identity()?.clone();
-        validate_prompt_cache_model_identity(expected, &identity)?;
         let selected_state = self.selected_state.state().ok_or_else(|| {
             ReplicatedTextSessionError::Contract(
                 "this partition rank owns no prompt-cache state shard".into(),
             )
         })?;
-        let (state, manifest) =
-            crate::cache::with_rank_prompt_cache_store(store, expected.topology(), |store| {
-                prompt_cache::restore_cached_state::<A, B, M>(
-                    &mut self.mechanisms,
-                    store,
-                    expected,
-                    &identity,
-                    prefix_token_ids,
-                    selected_state,
-                    context,
-                )
-            })?;
+        let (state, manifest) = prompt_cache::restore_cached_state::<A, B, M>(
+            &mut self.mechanisms,
+            read,
+            expected,
+            &identity,
+            prefix_token_ids,
+            selected_state,
+            context,
+        )?;
         manifest.validate_compatibility(expected, prefix_token_ids)?;
         validate_realized_state(&state, selected_state)?;
-        self.state = state;
-        self.committed_prompt_input_identity = None;
         self.restore_distributed_commit(manifest.distributed_commit)?;
+        self.state = state;
+        self.committed_prompt_input_identity = input;
+        self.local_token_prefix = Some(Default::default());
+        self.record_local_tokens(Some(prefix_token_ids));
         Ok(manifest)
     }
 
@@ -4106,10 +4166,16 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
-        self.validate_prompt_input_descriptor(expected, &input_identity)?;
-        let manifest = self.load_prompt_cache(store, expected, prefix_token_ids, context)?;
-        self.committed_prompt_input_identity = Some(input_identity);
-        Ok(manifest)
+        crate::cache::with_rank_prompt_cache_store(store, expected.topology(), |store| {
+            let read = store.open()?.ok_or_else(prompt_cache::empty_store)?;
+            self.restore_prompt_cache(
+                &*read,
+                expected,
+                prefix_token_ids,
+                Some(input_identity),
+                context,
+            )
+        })
     }
 
     /// Atomically replaces partition state from rank-local cache shards.
@@ -4165,12 +4231,30 @@ where
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        _context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
         self.ensure_control_unfenced()?;
         validate_prompt_cache_model_identity(&descriptor, self.prompt_cache_identity()?)?;
         let descriptor = descriptor.with_distributed_commit(self.last_commit_outcome);
+        if matches!(
+            self.selected.state().policy(),
+            crate::CacheResidencyPolicy::Device
+        ) {
+            let manifest = self
+                .mechanisms
+                .publish_resident_cache(
+                    &mut self.state,
+                    store,
+                    descriptor.clone(),
+                    prefix_token_ids,
+                    options,
+                    context,
+                )
+                .map_err(ReplicatedTextSessionError::Mechanism)?;
+            manifest.validate_compatibility(&descriptor, prefix_token_ids)?;
+            return Ok(manifest);
+        }
         let manifest =
             crate::cache::with_rank_prompt_cache_store(store, descriptor.topology(), |store| {
                 prompt_cache::publish_cached_state::<A, B, M>(
@@ -4257,9 +4341,11 @@ where
         let provisional = local.map(|(selected_state, identity)| {
             let path = crate::prompt_cache_rank_path(directory, expected.topology());
             let store = crate::DirectoryPromptCacheStore::new(path, u64::MAX);
+            let read = eredu_core::cache::PromptCacheStore::open(&store)?
+                .ok_or_else(prompt_cache::empty_store)?;
             prompt_cache::restore_cached_state::<A, B, M>(
                 &mut self.mechanisms,
-                &store,
+                &*read,
                 expected,
                 &identity,
                 prefix_token_ids,
@@ -5140,8 +5226,6 @@ where
         &mut self,
         outcome: Option<DistributedCommitOutcome>,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.active_commit_epoch = None;
-        self.last_commit_outcome = outcome;
         if let Some(outcome) = outcome {
             self.next_commit_epoch =
                 self.next_commit_epoch
@@ -5151,6 +5235,8 @@ where
                         )
                     })?);
         }
+        self.active_commit_epoch = None;
+        self.last_commit_outcome = outcome;
         Ok(())
     }
 
@@ -5167,9 +5253,31 @@ where
         Ok(())
     }
 
+    pub(crate) fn tracks_local_tokens(&self) -> bool {
+        !D::PARTITIONED_SESSION && self.selected.prompt_cache()
+    }
+
+    pub(crate) fn record_local_tokens(&mut self, tokens: Option<&[u32]>) {
+        if self.tracks_local_tokens() {
+            self.local_token_prefix =
+                self.local_token_prefix
+                    .take()
+                    .zip(tokens)
+                    .map(|(mut prefix, tokens)| {
+                        prefix.append(tokens);
+                        prefix
+                    });
+        }
+    }
+
     /// Exact model identity retained by the current rank, when it owns cache state.
     pub fn prompt_cache_model_identity(&self) -> Option<&PromptCacheModelIdentity> {
         self.prompt_cache_identity.as_ref()
+    }
+
+    /// Session facilities bound by the selected execution and state realization.
+    pub const fn session_capabilities(&self) -> eredu_core::SessionCapabilities {
+        self.selected.session()
     }
 
     fn prompt_cache_identity(

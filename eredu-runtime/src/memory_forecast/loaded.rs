@@ -1,6 +1,6 @@
 //! Portable composition of native residency facts and request calibration.
 use super::*;
-use eredu_core::{InputTokenCount, Observed, PhysicalMemorySemantics};
+use eredu_core::{InputTokenCount, Observed};
 fn observed(value: &Observed<u64>) -> Option<u64> {
     value.value().copied()
 }
@@ -27,21 +27,34 @@ pub struct GenerationForecastOptions {
     pub calibration: ForecastCalibration,
 }
 
+impl GenerationForecastOptions {
+    pub(super) fn pool_budget(
+        &self,
+        available: &AvailableMemory,
+        domain: &MemoryDomain,
+        executes: bool,
+    ) -> MemoryBudget {
+        let mut budget = if executes {
+            self.budget.clone()
+        } else {
+            self.host_budget.clone()
+        };
+        budget.fill_observed_headroom(available, domain);
+        budget
+    }
+}
+
 /// Composes loaded request geometry and native residency without allocation or execution.
 pub fn loaded_generation_request(
-    mut profile: LoadedMemoryProfile,
+    profile: LoadedMemoryProfile,
     input: InputTokenCount,
     output: u64,
     prefill: eredu_core::PrefillChunkPolicy,
     contract: ForecastExecutionContract,
     options: &GenerationForecastOptions,
 ) -> Result<(GenerationMemoryRequest, Vec<String>), GenerationForecastError> {
-    let unified = profile.parameters.physical_semantics == PhysicalMemorySemantics::Unified;
-    if profile.host_execution {
-        profile.parameters.physical_semantics = PhysicalMemorySemantics::Unified;
-    }
-    let placements =
-        crate::memory_estimation::static_parameter_placement(&profile.parameters, None)?;
+    let (execution_domain, placements) =
+        static_parameter_placement(&profile.parameters, &profile.placement, None)?;
     let mut geometry = profile.geometry;
     let retention_reports = profile.parameters.parameter_conversion_retention.value();
     if let Some(reports) = retention_reports {
@@ -92,23 +105,14 @@ pub fn loaded_generation_request(
         }
     }
     let overhead = options.backend_overhead.clone().unwrap_or_else(|| {
-        match (
-            observed(&profile.allocator_cache_limit),
-            observed(&profile.parameters.backend_allocator_cache_bytes),
-        ) {
-            (Some(limit), Some(retained)) => {
-                options.calibration.allocator_overhead(limit, retained)
-            }
-            _ => MemoryBytes::unknown("current allocator cache limit or retention unavailable"),
-        }
+        options.calibration.allocator_overhead_from_counters(
+            &profile.allocator_cache_limit,
+            &profile.parameters.backend_allocator_cache_bytes,
+        )
     });
     let mut domains = Vec::new();
-    let separate = profile.parameters.physical_semantics == PhysicalMemorySemantics::SeparateTiers;
-    for (mut domain, mut parameters) in placements {
-        let executes = !separate || matches!(domain, MemoryDomain::Device(_));
-        if profile.host_execution && !unified {
-            domain = MemoryDomain::Host;
-        }
+    for (domain, mut parameters) in placements {
+        let executes = domain == execution_domain;
         let already_resident_bytes = parameters.lower_bytes;
         if !geometry.fully_resident {
             parameters.upper_bytes = observed(&profile.parameters.logical_parameter_bytes)
@@ -117,14 +121,7 @@ pub fn loaded_generation_request(
             parameters.detail =
                 "current residency through possible host/device parameter copies".into();
         }
-        let mut budget = if executes {
-            options.budget.clone()
-        } else {
-            options.host_budget.clone()
-        };
-        if budget.available_bytes.is_none() && (!separate || !executes) {
-            budget.available_bytes = observed(&profile.available.available_memory_bytes);
-        }
+        let budget = options.pool_budget(&profile.available, &domain, executes);
         let token_bytes =
             input
                 .text_tokens

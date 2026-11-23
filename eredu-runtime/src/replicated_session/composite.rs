@@ -45,6 +45,109 @@ where
     M::PolicyError: std::fmt::Display,
     M::Error: std::fmt::Display,
 {
+    /// Selects ordered prepared spans on the local resident path.
+    pub(crate) fn resident_composite_prefill_boundaries(
+        &self,
+        config: &A::AdmissionConfig,
+        prompt: &CompositePrompt<B::Tensor, A::InputPartPlan>,
+    ) -> Result<Vec<usize>, eredu_nn::Error> {
+        if self.selected.residency() != crate::LayerWeightResidency::FullyResident
+            || !self.selected.topology().is_replicated()
+        {
+            return Ok(Vec::new());
+        }
+        let input =
+            PreparedCompositeInput::new(&prompt.0, &prompt.1).map_err(eredu_nn::Error::backend)?;
+        Ok(A::resident_prefill_boundaries(config, input))
+    }
+
+    /// Uses the admitted parts in order while preserving whole-request publication.
+    pub(crate) fn prefill_composite_spans<O>(
+        &mut self,
+        (prepared, admitted, identity): CompositePrompt<B::Tensor, A::InputPartPlan>,
+        boundaries: Vec<usize>,
+        final_position_only: bool,
+        context: &B::Executor,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        if !self.selected.exact_completion_available() {
+            return Err(ReplicatedTextSessionError::BeforeStateMutation(Box::new(
+                ReplicatedTextSessionError::Contract(
+                    "resident composite prefill spans require exact completion".into(),
+                ),
+            )));
+        }
+        let mut start = 0;
+        let spans = boundaries
+            .into_iter()
+            .map(|end| {
+                let range = start..end;
+                start = end;
+                let prepared = prepared.slice_parts(range.clone())?;
+                let admitted = admitted.slice_parts(range)?;
+                Some((prepared, admitted))
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|spans| !spans.is_empty() && start == prepared.len())
+            .ok_or_else(|| {
+                ReplicatedTextSessionError::Contract(
+                    "invalid resident composite prefill spans".into(),
+                )
+            })?;
+        let checkpoint = self.checkpoint_complete(context)?;
+        let selects_position = self.output_selection.sequence_index().is_some();
+        let publish_last = final_position_only || selects_position;
+        let was_completing = self.complete_text_prefill;
+        self.complete_text_prefill = true;
+        let result = (|| {
+            let count = spans.len();
+            let mut outputs = Vec::with_capacity(if publish_last { 0 } else { count });
+            for (index, (prepared, admitted)) in spans.iter().enumerate() {
+                let input = PreparedCompositeInput::new(prepared, admitted)
+                    .map(A::prepared_input)
+                    .map_err(eredu_nn::Error::backend);
+                let last = index + 1 == count;
+                let identity = if last { identity.clone() } else { None };
+                // Preserve the packed reduction that sees every row in the span.
+                let output =
+                    self.prefill_input_result_with_observer(input, identity, context, observer)?;
+                if publish_last && last {
+                    if final_position_only && !selects_position {
+                        let rows = eredu_nn::sequence::length(&output)
+                            .map_err(ReplicatedTextSessionError::Architecture)?;
+                        return eredu_nn::sequence::row(
+                            &output,
+                            rows.saturating_sub(1),
+                            true,
+                            context,
+                        )
+                        .map_err(ReplicatedTextSessionError::Architecture);
+                    }
+                    return Ok(output);
+                }
+                if !publish_last {
+                    outputs.push(output);
+                }
+            }
+            B::Tensor::concatenate(&outputs, -2, context)
+                .map_err(ReplicatedTextSessionError::Architecture)
+        })();
+        self.complete_text_prefill = was_completing;
+        match result {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                if self.ensure_commit_resolved().is_err() {
+                    return Err(error);
+                }
+                self.rollback_complete(checkpoint, context)?;
+                Err(ReplicatedTextSessionError::StateRestored(Box::new(error)))
+            }
+        }
+    }
+
     /// Invokes the composite architecture with an explicit attention visibility.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_composite_attention<O>(

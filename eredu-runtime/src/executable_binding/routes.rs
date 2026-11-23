@@ -11,6 +11,7 @@ pub struct PreparedExecutionRoutes<
     PD = Unavailable,
     PT = Unavailable,
     PX = Unavailable,
+    RX = Unavailable,
 > {
     /// Ordinary replicated text route.
     pub replicated: R,
@@ -24,13 +25,16 @@ pub struct PreparedExecutionRoutes<
     pub partitioned_routed: PT,
     /// Composite rank-local route.
     pub partitioned_composite: PX,
+    /// Retained composite rank route.
+    pub retained_composite_rank: RX,
 }
 
-impl<R, T, X, PD, PT, PX> PreparedExecutionRoutes<R, T, X, PD, PT, PX> {
+impl<R, T, X, PD, PT, PX, RX> PreparedExecutionRoutes<R, T, X, PD, PT, PX, RX> {
     /// Assembles ordinary and partitioned binding capabilities for a prepared model.
-    pub(super) fn from_parts(ordinary: (R, T, X), partitioned: (PD, PT, PX)) -> Self {
+    pub(super) fn from_parts(ordinary: (R, T, X), partitioned: (PD, PT, PX, RX)) -> Self {
         let (replicated, routed, composite) = ordinary;
-        let (partitioned_dense, partitioned_routed, partitioned_composite) = partitioned;
+        let (partitioned_dense, partitioned_routed, partitioned_composite, retained_composite_rank) =
+            partitioned;
         Self {
             replicated,
             routed,
@@ -38,6 +42,7 @@ impl<R, T, X, PD, PT, PX> PreparedExecutionRoutes<R, T, X, PD, PT, PX> {
             partitioned_dense,
             partitioned_routed,
             partitioned_composite,
+            retained_composite_rank,
         }
     }
 }

@@ -473,6 +473,8 @@ pub enum ComponentNormalizationKind {
     Layer,
     /// `x / sqrt(sum(x*x) + epsilon)`, with additive epsilon, not a clamp.
     L2,
+    /// `x / max(sqrt(sum(x*x)), epsilon)`.
+    L2WithFloor,
 }
 
 /// Activation applied before the output projection.
@@ -520,7 +522,8 @@ pub enum ComponentActivation {
     ///
     /// For a key-by-value state matrix, `D = diag(exp(log_decay)) * S`,
     /// `S = D + sigmoid(update) * k * (v - k^T * D)^T`, and `y = q^T * S`.
-    /// `log_decay = -exp(decay_rate) * softplus(decay + decay_bias)`.
+    /// `log_decay = transition * softplus(decay + decay_bias)`, with
+    /// `transition` defined by the learned rate and its encoding.
     /// Decay and update affine dependencies use the corresponding read roles.
     GatedDeltaAttention {
         /// Projected query/key heads before contiguous repetition to value heads.
@@ -533,12 +536,18 @@ pub enum ComponentActivation {
         value_head_width: usize,
         /// Decay broadcast within each state matrix.
         decay_layout: ComponentDeltaDecay,
-        /// Scale following the declared query head normalization.
+        /// Scale on the query contribution before channel normalization.
         query_scale: ComponentScalar,
         /// Scale following the declared key head normalization.
         key_scale: ComponentScalar,
-        /// Learned log transition rate, one scalar per head.
+        /// Learned transition parameter, one scalar per head.
         decay_rate: ComponentTransformParameter,
+        /// Encoding of the learned transition parameter.
+        #[serde(
+            default,
+            skip_serializing_if = "ComponentDeltaTransition::is_log_magnitude"
+        )]
+        decay_rate_encoding: ComponentDeltaTransition,
         /// Learned decay offset, with the declared per-head or per-key layout.
         decay_bias: ComponentTransformParameter,
         /// Normalization of `y`, before its elementwise output gate. This is
@@ -558,6 +567,23 @@ pub enum ComponentDeltaDecay {
     Head,
     /// One decay value per key channel in each value head, multiplying state rows.
     KeyChannel,
+}
+
+/// Conversion of a gated-delta parameter to its negative transition rate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentDeltaTransition {
+    /// The transition rate is the negative exponential of the parameter.
+    #[default]
+    LogMagnitude,
+    /// The parameter already holds the negative transition rate.
+    NegativeRate,
+}
+
+impl ComponentDeltaTransition {
+    fn is_log_magnitude(&self) -> bool {
+        *self == Self::LogMagnitude
+    }
 }
 
 /// Exact family-declared activation convention.

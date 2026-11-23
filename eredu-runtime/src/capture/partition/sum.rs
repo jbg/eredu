@@ -1,8 +1,9 @@
 //! Complete selected floating terms, assembled before nonlinear observation transforms.
 use super::*;
+use eredu_core::capture::host::{transform_f32, CompensatedSum};
 use eredu_core::{
     checkpoint::TensorDtype, ObservationDtype, ObservationPoint, ObservationValueType,
-    TensorObservation, TensorObservationData,
+    TensorObservationData,
 };
 
 fn invalid(message: &str) -> CaptureError {
@@ -121,30 +122,6 @@ pub(super) fn payload_usage(
     )
 }
 
-#[derive(Default)]
-struct Sum {
-    value: f64,
-    correction: f64,
-}
-impl Sum {
-    fn add(&mut self, value: f64) {
-        let next = self.value + value;
-        if self.value.is_finite() && value.is_finite() {
-            self.correction += if self.value.abs() >= value.abs() {
-                (self.value - next) + value
-            } else {
-                (value - next) + self.value
-            };
-        } else {
-            self.correction = 0.0;
-        }
-        self.value = next;
-    }
-    fn finish(self) -> f64 {
-        self.value + self.correction
-    }
-}
-
 pub(super) fn assemble(
     receipt: &PartitionCaptureReceiptPlan,
     fragments: Vec<CapturedPartitionFragment>,
@@ -220,7 +197,7 @@ pub(super) fn assemble(
     let emitted = usize::try_from(emitted).map_err(|_| CaptureError::Overflow)?;
     let mut values = Vec::with_capacity(emitted);
     for index in 0..emitted {
-        let mut sum = Sum::default();
+        let mut sum = CompensatedSum::default();
         for fragment in &fragments {
             let Some(CapturePayload::Tensor(tensor)) = &fragment.record.payload else {
                 unreachable!()
@@ -232,7 +209,7 @@ pub(super) fn assemble(
         }
         values.push(sum.finish() as f32);
     }
-    let payload = transform(values, &slice.shape, &selection.transform)?;
+    let payload = transform_f32(values, &slice.shape, &selection.transform)?;
     let contributions = fragments
         .into_iter()
         .map(|fragment| PartitionCaptureContribution {
@@ -261,96 +238,5 @@ pub(super) fn assemble(
             charged,
         },
         contributions,
-    })
-}
-
-fn transform(
-    values: Vec<f32>,
-    shape: &[u64],
-    transform: &CaptureTransform,
-) -> Result<CapturePayload, CaptureError> {
-    Ok(match transform {
-        CaptureTransform::Slice
-        | CaptureTransform::FullTensor
-        | CaptureTransform::Preview { .. } => {
-            let shape = if matches!(transform, CaptureTransform::Preview { .. }) {
-                vec![values.len()]
-            } else {
-                shape
-                    .iter()
-                    .map(|n| usize::try_from(*n).map_err(|_| CaptureError::Overflow))
-                    .collect::<Result<_, _>>()?
-            };
-            CapturePayload::Tensor(
-                TensorObservation::new(shape, TensorObservationData::F32(values))
-                    .map_err(|error| invalid(&error.to_string()))?,
-            )
-        }
-        CaptureTransform::Summary => {
-            let mut summary = CaptureSummary {
-                elements: values.len() as u64,
-                finite: 0,
-                non_finite: 0,
-                nan: 0,
-                positive_infinity: 0,
-                negative_infinity: 0,
-                min: None,
-                max: None,
-                mean: None,
-                rms: None,
-            };
-            let mut sum = Sum::default();
-            let mut squares = Sum::default();
-            for value in values {
-                if value.is_finite() {
-                    let value = f64::from(value);
-                    summary.finite += 1;
-                    summary.min = Some(summary.min.map_or(value, |min| min.min(value)));
-                    summary.max = Some(summary.max.map_or(value, |max| max.max(value)));
-                    sum.add(value);
-                    squares.add(value * value);
-                } else {
-                    summary.non_finite += 1;
-                    summary.nan += u64::from(value.is_nan());
-                    summary.positive_infinity += u64::from(value == f32::INFINITY);
-                    summary.negative_infinity += u64::from(value == f32::NEG_INFINITY);
-                }
-            }
-            if summary.finite != 0 {
-                summary.mean = Some(sum.finish() / summary.finite as f64);
-                summary.rms = Some((squares.finish() / summary.finite as f64).sqrt());
-            }
-            CapturePayload::Summary(summary)
-        }
-        CaptureTransform::Histogram { edges } => {
-            let mut histogram = CaptureHistogram {
-                edges: edges.clone(),
-                counts: vec![0; edges.len() - 1],
-                below: 0,
-                above: 0,
-                non_finite: 0,
-            };
-            for value in values {
-                if !value.is_finite() {
-                    histogram.non_finite += 1;
-                } else if value < edges[0] {
-                    histogram.below += 1;
-                } else if value > *edges.last().expect("admitted histogram") {
-                    histogram.above += 1;
-                } else {
-                    let index = edges
-                        .partition_point(|edge| *edge <= value)
-                        .saturating_sub(1)
-                        .min(histogram.counts.len() - 1);
-                    histogram.counts[index] += 1;
-                }
-            }
-            CapturePayload::Histogram(histogram)
-        }
-        _ => {
-            return Err(CaptureError::Unsupported(
-                "summed activation transform".into(),
-            ))
-        }
     })
 }

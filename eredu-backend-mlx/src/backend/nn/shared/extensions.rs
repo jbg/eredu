@@ -1,46 +1,6 @@
 use super::*;
 use super::{operators::*, parameters::*};
 
-impl HyperNeuralBackend for MlxNeuralBackend {
-    type HyperConnection = MlxHyperConnection;
-    type HyperHead = MlxHyperHead;
-
-    fn hyper_connection(
-        spec: HyperConnectionSpec,
-        context: &Stream,
-    ) -> Result<Self::HyperConnection, ComputeError> {
-        spec.validate()?;
-        let module = compute(common::hyper_connections::HyperConnection::unloaded(
-            &spec, context,
-        ))?;
-        let topology = exact_parameter_topology(
-            &module,
-            [
-                ("function", spec.function),
-                ("base", spec.base),
-                ("scale", spec.scale),
-            ],
-        )?;
-        Ok(MlxHyperConnection { module, topology })
-    }
-
-    fn hyper_head(spec: HyperHeadSpec, context: &Stream) -> Result<Self::HyperHead, ComputeError> {
-        spec.validate()?;
-        let module = compute(common::hyper_connections::HyperHead::unloaded(
-            &spec, context,
-        ))?;
-        let topology = exact_parameter_topology(
-            &module,
-            [
-                ("function", spec.function),
-                ("base", spec.base),
-                ("scale", spec.scale),
-            ],
-        )?;
-        Ok(MlxHyperHead { module, topology })
-    }
-}
-
 impl GroupedNeuralBackend for MlxNeuralBackend {
     type LinearGroups = super::selected_linear::MlxGroupedLinear;
 
@@ -80,39 +40,8 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
-        let shape = input.as_array();
-        if shape.ndim() != 4 || shape.dim(1) != groups || groups <= 0 || output_per_group <= 0 {
-            return Err(ComputeError::backend(format!(
-                "grouped linear expects [batch, {groups}, tokens, input] and positive output width, got {:?}",
-                shape.shape()
-            )));
-        }
-        let width = groups
-            .checked_mul(output_per_group)
-            .ok_or_else(|| ComputeError::backend("grouped projection width overflow"))?;
-        let projected = linear.forward_with_input_observer(input, context, observer)?;
-        let projected = projected.as_array();
-        if projected.dim(-1) != width {
-            return Err(ComputeError::backend(format!(
-                "grouped linear produced width {}, expected {}",
-                projected.dim(-1),
-                width
-            )));
-        }
-        let mut pieces = Vec::with_capacity(groups as usize);
-        for group in 0..groups {
-            let selected = compute(projected.try_index_device(
-                (
-                    ..,
-                    group,
-                    ..,
-                    group * output_per_group..(group + 1) * output_per_group,
-                ),
-                context,
-            ))?;
-            pieces.push(compute(selected.expand_dims(1, context))?);
-        }
-        compute_tensor(concatenate_axis(&pieces, 1, context))
+        eredu_nn::project_group_diagonal(linear, input, groups, output_per_group, context, observer)
+            .map_err(ComputeError::backend_source)
     }
 
     fn joint_group_selection(
@@ -377,5 +306,24 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
             spec,
             module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
+    }
+}
+
+impl eredu_nn::HyperNeuralBackend for MlxNeuralBackend {
+    type HyperConnection = eredu_nn::hyper::PortableHyperConnection<Self>;
+    type HyperHead = eredu_nn::hyper::PortableHyperHead<Self>;
+
+    fn hyper_connection(
+        spec: eredu_nn::HyperConnectionSpec,
+        context: &Stream,
+    ) -> Result<Self::HyperConnection, eredu_nn::Error> {
+        Self::HyperConnection::new(spec, context)
+    }
+
+    fn hyper_head(
+        spec: eredu_nn::HyperHeadSpec,
+        context: &Stream,
+    ) -> Result<Self::HyperHead, eredu_nn::Error> {
+        Self::HyperHead::new(spec, context)
     }
 }

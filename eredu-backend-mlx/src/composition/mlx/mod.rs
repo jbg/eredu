@@ -1,7 +1,7 @@
 //! Cold-path neutral execution selection and MLX mechanism composition.
 
 pub mod automatic;
-mod capability;
+pub(crate) mod capability;
 pub(crate) mod component_binding;
 pub mod distributed;
 mod inspection;

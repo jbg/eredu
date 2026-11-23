@@ -2,7 +2,7 @@
 
 use eredu_core::speculative::assistant::ExternalAssistantBinder;
 use eredu_core::{
-    capability::{NativeAllocatorObservations, NativePlacementMemory},
+    capability::NativePlacementMemory,
     residency::{
         ParameterConversionRetentionObserver, ParameterConversionRetentionReport,
         ParameterConversionRetentionTrimReport, ParameterConversionRetentionTrimmer,
@@ -15,8 +15,10 @@ use eredu_core::{
 use super::{BoundAssistantDispatch, InstalledExternalDraft};
 use crate::{
     memory_estimation::MemoryBytes,
-    memory_forecast::{ConditionedAssistantMemoryProfile, GenerationForecastError},
-    text_session_driver::forecast::{DraftForecastFacts, IndependentDraftMemoryFacts},
+    memory_forecast::{
+        ConditionedAssistantMemoryProfile, GenerationForecastError, LoadedMemoryProfile,
+    },
+    text_session_driver::forecast::DraftForecastFacts,
     SelectedSpeculativeRealization,
 };
 use eredu_core::backend::TextExecutableTypes;
@@ -33,6 +35,10 @@ impl<B, N> InstalledDraftSession<B, N> {
             native,
             binder: std::marker::PhantomData,
         }
+    }
+
+    pub(super) fn into_resources(self) -> N {
+        self.native
     }
 
     /// Observes the retirement resources paired with the installed draft.
@@ -84,10 +90,6 @@ where
     B: ExternalAssistantBinder,
     E: TextExecutableTypes,
 {
-    fn forecast_topology(&self) -> SpeculativeExecutionTopology {
-        self.topology()
-    }
-
     fn forecast_proposal_capacity(&self) -> u64 {
         self.selected()
             .requirements()
@@ -108,16 +110,12 @@ where
             |upper| MemoryBytes::estimated(0, upper, "native conditioned operator scratch bound"),
         );
         self.installed()
-            .conditioned_memory_profile::<B, N::Memory>(self.native.host_execution(), scratch)
+            .conditioned_memory_profile::<B>(self.native.placement_memory()?, scratch)
     }
 
-    fn independent_forecast(
-        &self,
-    ) -> Result<Option<IndependentDraftMemoryFacts>, GenerationForecastError> {
-        self.installed().autoregressive_memory_facts(
-            self.native.host_execution(),
-            N::Memory::native_memory_facts(),
-        )
+    fn independent_forecast(&self) -> Result<Option<LoadedMemoryProfile>, GenerationForecastError> {
+        self.installed()
+            .autoregressive_memory_facts(self.native.placement_memory()?)
     }
 }
 
@@ -151,5 +149,26 @@ where
         operation
             .settle(Ok(result))
             .map_err(BackendFailure::from_error)?
+    }
+}
+
+/// Installs the selected draft into the portable driver for its native mechanism class.
+pub trait DraftSessionInstallation<B, Binder, N> {
+    /// Draft type consumed by the selected generation driver.
+    type Draft;
+
+    /// Consumes startup resources into the installed driver.
+    fn install(
+        draft: InstalledDraftSession<Binder, N>,
+    ) -> Result<Self::Draft, eredu_core::AutomaticPlanningError>;
+}
+
+impl<B, Binder, N> DraftSessionInstallation<B, Binder, N>
+    for eredu_core::backend::AdvancedTextGeneration
+{
+    type Draft = InstalledDraftSession<Binder, N>;
+
+    fn install(draft: Self::Draft) -> Result<Self::Draft, eredu_core::AutomaticPlanningError> {
+        Ok(draft)
     }
 }

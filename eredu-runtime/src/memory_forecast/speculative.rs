@@ -366,12 +366,45 @@ fn estimate_speculative_inner(
         }
     };
     let mut target = target.clone();
-    normalize(&mut target);
-    let target = &target;
     let mut normalized = plan.clone();
+    // Unified accelerators share the host pool, alongside any independently
+    // budgeted devices. Establish one label before projecting either owner.
+    let domains = target
+        .domains
+        .iter()
+        .chain(plan.draft.iter().flat_map(|draft| &draft.domains));
+    let host_pool = if domains
+        .clone()
+        .any(|pool| matches!(pool.domain, MemoryDomain::Device(_)))
+    {
+        MemoryDomain::Host
+    } else if domains
+        .clone()
+        .any(|pool| pool.domain == MemoryDomain::Unified)
+    {
+        MemoryDomain::Unified
+    } else {
+        MemoryDomain::Host
+    };
+    let normalize_pool = |domain: &mut MemoryDomain| {
+        if matches!(domain, MemoryDomain::Host | MemoryDomain::Unified) {
+            *domain = host_pool.clone();
+        }
+    };
+    let normalize_domains = |request: &mut GenerationMemoryRequest| {
+        normalize(request);
+        for pool in &mut request.domains {
+            normalize_pool(&mut pool.domain);
+        }
+    };
+    normalize_domains(&mut target);
     if let Some(draft) = &mut normalized.draft {
-        normalize(draft);
+        normalize_domains(draft);
     }
+    if let Some(conditioned) = &mut normalized.conditioned {
+        normalize_pool(&mut conditioned.execution_domain);
+    }
+    let target = &target;
     let plan = &normalized;
     if let Some(conditioned) = &plan.conditioned {
         conditioned.validate(plan.draft.as_ref(), plan.max_draft_tokens)?;
@@ -466,12 +499,6 @@ fn estimate_speculative_inner(
             if !pools.iter().any(|p| p.domain == pool.domain) {
                 pools.push(pool.clone());
             }
-        }
-        if pools.len() > 1 && pools.iter().any(|p| p.domain == MemoryDomain::Unified) {
-            return Err(CapabilityError::InvalidConfiguration {
-                field: "speculative pools",
-                detail: "shared backing must use one unified domain for both models".into(),
-            });
         }
     }
     if !pools

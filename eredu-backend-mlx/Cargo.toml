@@ -60,3 +60,4 @@ sha2.workspace = true
 thiserror = "2"
 smallvec = "1"
 ref-cast = "1"
+rayon = "1"

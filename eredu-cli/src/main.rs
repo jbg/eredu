@@ -1,3 +1,6 @@
+#[cfg(not(any(feature = "candle", feature = "mlx")))]
+compile_error!("the eredu CLI requires an mlx or candle backend feature");
+
 #[cfg(feature = "realtime")]
 mod audio;
 mod common;
@@ -47,8 +50,6 @@ use eredu::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
 };
-#[cfg(test)]
-use eredu_backend_mlx::MlxBackendFactory;
 #[cfg(feature = "vision")]
 use eredu_core::MultimodalPreparationSession as TextInputSession;
 #[cfg(test)]
@@ -130,10 +131,28 @@ impl From<CliToolChoice> for ToolChoice {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliBackend {
+    Mlx,
+    Candle,
+}
+
+impl CliBackend {
+    const fn default_available() -> Self {
+        if cfg!(feature = "mlx") {
+            Self::Mlx
+        } else {
+            Self::Candle
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CliDevice {
     Cpu,
     Gpu(usize),
+    Metal(usize),
+    Cuda(usize),
 }
 
 impl fmt::Display for CliDevice {
@@ -141,6 +160,8 @@ impl fmt::Display for CliDevice {
         match self {
             Self::Cpu => formatter.write_str("cpu"),
             Self::Gpu(index) => write!(formatter, "gpu:{index}"),
+            Self::Metal(index) => write!(formatter, "metal:{index}"),
+            Self::Cuda(index) => write!(formatter, "cuda:{index}"),
         }
     }
 }
@@ -152,13 +173,18 @@ impl FromStr for CliDevice {
         if value == "cpu" {
             return Ok(Self::Cpu);
         }
-        let Some(index) = value.strip_prefix("gpu:") else {
-            return Err("expected `cpu` or `gpu:N`".into());
+        let Some((family, index)) = value.split_once(':') else {
+            return Err("expected `cpu`, `gpu:N`, `metal:N`, or `cuda:N`".into());
         };
         let index = index
             .parse::<usize>()
             .map_err(|_| "GPU index must be a non-negative integer".to_string())?;
-        Ok(Self::Gpu(index))
+        match family {
+            "gpu" => Ok(Self::Gpu(index)),
+            "metal" => Ok(Self::Metal(index)),
+            "cuda" => Ok(Self::Cuda(index)),
+            _ => Err("expected `cpu`, `gpu:N`, `metal:N`, or `cuda:N`".into()),
+        }
     }
 }
 
@@ -226,6 +252,10 @@ struct Cli {
     #[command(flatten)]
     common: common::CommonOptions,
 
+    /// Text execution backend. Defaults to MLX when enabled, otherwise Candle.
+    #[arg(long, value_enum)]
+    backend: Option<CliBackend>,
+
     /// Automatically select a single-device execution plan. Defaults to quick.
     #[arg(long, value_enum, value_name = "MODE", default_value = "quick")]
     auto: Option<AutoMode>,
@@ -286,7 +316,7 @@ struct Cli {
     #[arg(long)]
     disable_speculative_adaptive_lookahead: bool,
 
-    /// External assistant placement: `target`, `cpu`, or `gpu:N`.
+    /// External assistant placement: `target`, `cpu`, `gpu:N`, `metal:N`, or `cuda:N`.
     ///
     /// `target` reuses the main execution stream. An explicit device creates
     /// a distinct draft stream even when it names the main physical device.
@@ -1632,6 +1662,8 @@ fn isolated_benchmark_trial(
         let mut child = Command::new(executable)
             .arg("--model")
             .arg(model_path)
+            .arg("--backend")
+            .arg(plan.device().backend().as_str())
             .arg("--auto-trial-plan")
             .arg(&plan_path)
             .arg("--telemetry-json")
@@ -1685,7 +1717,9 @@ fn isolated_benchmark_trial(
         }
         Ok((
             telemetry.timing,
-            telemetry.allocator.map(|allocator| allocator.peak_bytes),
+            telemetry
+                .allocator
+                .and_then(|allocator| allocator.peak_bytes),
         ))
     };
     let result = execute();
@@ -2065,18 +2099,62 @@ fn apply_automatic_report(
 fn main() -> Result<()> {
     let total_started = Instant::now();
     let matches = cli_command().get_matches();
-    let factory = eredu_backend_mlx::MlxBackendFactory::default();
-
     #[cfg(feature = "realtime")]
     if matches.subcommand_name().is_some() {
         return match CliCommand::from_arg_matches(&matches)? {
-            CliCommand::Audio(args) => audio::run(&factory, args, total_started),
+            CliCommand::Audio(args) => audio::run(args, total_started),
         };
     }
     let overrides = AutomaticCliOverrides::from_matches(&matches);
     let args = Cli::from_arg_matches(&matches)?;
-    let factory = factory.with_residency_diagnostics(args.verbose, args.verbose);
-    run_text(&factory, args, overrides, total_started)
+    let trial_plan = args
+        .auto_trial_plan
+        .as_deref()
+        .map(read_trial_plan)
+        .transpose()?;
+    match args.backend.unwrap_or_else(CliBackend::default_available) {
+        #[cfg(feature = "mlx")]
+        CliBackend::Mlx => {
+            let factory = eredu::backends::MlxBackendFactory::default()
+                .with_residency_diagnostics(args.verbose, args.verbose);
+            run_text(&factory, args, overrides, total_started, trial_plan)
+        }
+        #[cfg(not(feature = "mlx"))]
+        CliBackend::Mlx => bail!("this build does not enable the MLX backend"),
+        #[cfg(feature = "candle")]
+        CliBackend::Candle => {
+            let device = match (&trial_plan, args.common.device) {
+                (Some(plan), None) => plan.device().clone(),
+                (_, request) => candle_device(request)?,
+            };
+            let factory = eredu::backends::CandleBackendFactory::for_device(&device)?
+                .with_residency_diagnostics(args.verbose, args.verbose);
+            run_text(&factory, args, overrides, total_started, trial_plan)
+        }
+        #[cfg(not(feature = "candle"))]
+        CliBackend::Candle => bail!("this build does not enable the Candle backend"),
+    }
+}
+
+fn read_trial_plan(path: &Path) -> Result<ExecutionPlan> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse exact trial plan {}", path.display()))
+}
+
+#[cfg(feature = "candle")]
+fn candle_device(request: Option<CliDevice>) -> Result<DevicePlan> {
+    let device = match request.unwrap_or(CliDevice::Cpu) {
+        CliDevice::Cpu => "cpu:0".to_owned(),
+        CliDevice::Gpu(index) if cfg!(all(feature = "candle-metal", target_os = "macos")) => {
+            format!("metal:{index}")
+        }
+        CliDevice::Gpu(index) if cfg!(feature = "candle-cuda") => format!("cuda:{index}"),
+        CliDevice::Gpu(_) => bail!("Candle GPU execution requires candle-metal or candle-cuda"),
+        accelerator => accelerator.to_string(),
+    };
+    Ok(DevicePlan::new("candle", device)?)
 }
 
 fn run_text<F>(
@@ -2084,6 +2162,7 @@ fn run_text<F>(
     mut args: Cli,
     automatic_overrides: AutomaticCliOverrides,
     total_started: Instant,
+    trial_plan: Option<ExecutionPlan>,
 ) -> Result<()>
 where
     F: BackendInspection
@@ -2121,7 +2200,7 @@ where
     let original_args = args.clone();
     validate_args(&args)?;
     let devices = discover_devices(factory)?;
-    let device = if args.auto_trial_plan.is_some() && args.common.device.is_none() {
+    let device = if trial_plan.is_some() && args.common.device.is_none() {
         None
     } else {
         Some(resolve_device(&devices, args.common.device)?)
@@ -2175,14 +2254,8 @@ where
     }
     let automatic_feedback = read_automatic_feedback(&args.auto_feedback)?;
     let mut retained_automatic_inspection = None;
-    let exact_trial_report = args
-        .auto_trial_plan
-        .as_ref()
-        .map(|path| {
-            let bytes = fs::read(path)
-                .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
-            let plan: ExecutionPlan = serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
+    let exact_trial_report = trial_plan
+        .map(|plan| {
             if plan.device().backend() != &devices.backend {
                 bail!(
                     "exact trial plan targets backend {}, selected backend is {}",
@@ -2748,9 +2821,13 @@ where
 
     let allocator_telemetry = if args.verbose || args.telemetry_json.is_some() {
         model.synchronize()?;
-        factory
+        let mut telemetry = factory
             .allocator_observation()?
-            .map(|(_, telemetry)| telemetry)
+            .map_or_else(eredu_core::AllocatorTelemetry::default, |observation| {
+                observation.telemetry
+            });
+        telemetry.process_rss_bytes = eredu_core::host_memory::process_rss_bytes();
+        Some(telemetry)
     } else {
         None
     };
@@ -2808,30 +2885,20 @@ where
                 stats.optimistic_draft_time().as_secs_f64(),
                 stats.verification_in_flight_time().as_secs_f64(),
             );
-            if stats.component_timings_collected() {
-                eprintln!(
-                    "speculative_draft_context_time: {:.3} s, speculative_draft_assistant_time: {:.3} s, speculative_draft_head_time: {:.3} s, speculative_target_verification_time: {:.3} s",
-                    stats.draft_context_time().as_secs_f64(),
-                    stats.draft_assistant_time().as_secs_f64(),
-                    stats.draft_head_time().as_secs_f64(),
-                    stats.target_verification_time().as_secs_f64(),
-                );
-            }
             eprintln!("speculative_accept_lens: {:?}", stats.accept_lens());
         }
         if let Some(allocator) = &allocator_telemetry {
-            eprintln!(
-                "allocator_peak_memory: {}",
-                format_bytes(allocator.peak_bytes)
-            );
-            eprintln!(
-                "allocator_active_memory: {}",
-                format_bytes(allocator.active_bytes)
-            );
-            eprintln!(
-                "allocator_cache_memory: {}",
-                format_bytes(allocator.cache_bytes)
-            );
+            for (label, bytes) in [
+                ("allocator_peak_memory", allocator.peak_bytes),
+                ("allocator_active_memory", allocator.active_bytes),
+                ("allocator_cache_memory", allocator.cache_bytes),
+                ("device_allocated_memory", allocator.device_allocated_bytes),
+                ("process_rss", allocator.process_rss_bytes),
+            ] {
+                if let Some(bytes) = bytes {
+                    eprintln!("{label}: {}", format_bytes(bytes));
+                }
+            }
         }
         if let Some(report) = &residency {
             eprintln!(
@@ -2971,11 +3038,19 @@ fn resolve_device(
     };
     let selected = match request {
         Some(CliDevice::Cpu) => cpu(),
-        Some(CliDevice::Gpu(index)) => {
-            let mut matches = profile
-                .devices
-                .iter()
-                .filter(|device| device.kind == HardwareDeviceKind::Gpu && device.index == index);
+        Some(
+            request @ (CliDevice::Gpu(index) | CliDevice::Metal(index) | CliDevice::Cuda(index)),
+        ) => {
+            let family = match request {
+                CliDevice::Metal(_) => Some("metal"),
+                CliDevice::Cuda(_) => Some("cuda"),
+                _ => None,
+            };
+            let mut matches = profile.devices.iter().filter(|device| {
+                device.kind == HardwareDeviceKind::Gpu
+                    && device.index == index
+                    && family.is_none_or(|family| device.family.eq_ignore_ascii_case(family))
+            });
             let selected = matches.next();
             if matches.next().is_some() {
                 bail!(
@@ -3003,6 +3078,14 @@ fn resolve_device(
         ),
     })?;
     Ok(DevicePlan::new(profile.backend.as_str(), &selected.id)?)
+}
+
+fn resolve_draft_device(profile: &HardwareBackendProfile, device: CliDevice) -> Result<DevicePlan> {
+    #[cfg(feature = "candle")]
+    if profile.backend.as_str() == "candle" {
+        return candle_device(Some(device));
+    }
+    resolve_device(profile, Some(device))
 }
 
 fn cli_execution_plan(
@@ -3039,7 +3122,7 @@ fn cli_execution_plan(
         let placement = match args.speculative_draft_device {
             SpeculativeDraftDevice::Target => DraftPlacementPlan::Target,
             SpeculativeDraftDevice::Device(device) => DraftPlacementPlan::Device {
-                device: resolve_device(devices, Some(device))?,
+                device: resolve_draft_device(devices, device)?,
             },
         };
         DraftingPlan::External {
@@ -3982,9 +4065,12 @@ mod tests {
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
         let device = cpu_plan();
-        let hardware = super::MlxBackendFactory::default()
-            .discover_hardware()
-            .unwrap();
+        let hardware = super::HardwareProfile::observe_host(
+            Observed::unavailable("fixture"),
+            Observed::unavailable("fixture"),
+            super::HardwareMemorySemantics::Unified,
+            vec![test_devices()],
+        );
         let resources = ModelResourceProfile {
             schema_version: eredu_core::AUTOMATIC_SCHEMA_VERSION,
             path: model_path.clone(),

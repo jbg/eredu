@@ -86,7 +86,8 @@ fn declared_gated_product(policy: eredu_nn::GatedProductPolicy) -> Option<Compon
                 multiplier: ComponentScalar::new(policy.sigmoid_multiplier()),
             },
             eredu_nn::GatedProductActivation::Gelu => ComponentNonlinearity::Gelu,
-            eredu_nn::GatedProductActivation::GeluApproximate => {
+            eredu_nn::GatedProductActivation::GeluApproximate
+            | eredu_nn::GatedProductActivation::GeluApproximateF16 => {
                 ComponentNonlinearity::GeluApproximate
             }
             _ => return None,

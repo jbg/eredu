@@ -9,7 +9,7 @@ use std::{ops::DerefMut, sync::Arc};
 
 use eredu_core::{
     capture::{CaptureError, CapturePhase},
-    refinement::{GenerationPhase, RefinementCanvas, RefinementPolicy},
+    refinement::{GenerationPhase, RefinementCanvas},
     BackendError, Completion, ModelRuntime, PendingTextInput, TextOperationOutput,
     TokenSamplingDecision,
 };
@@ -119,10 +119,11 @@ where
                 Context = <Executable<B> as TextExecutable<ExecutableTypes<B>>>::Context,
                 Error: std::error::Error + Send + Sync + 'static,
             > + RefinementFinalizationBackend<
-                Token = BlockToken<B>,
-                Logits = BlockLogits<B>,
-                Context = <Executable<B> as TextExecutable<ExecutableTypes<B>>>::Context,
-                Error = <Refinement<B> as RefinementBackend>::Error,
+                CanvasTokens = BlockToken<B>,
+                CanvasScores = BlockLogits<B>,
+                PositionScores = BlockLogits<B>,
+                FinalizationContext = <Executable<B> as TextExecutable<ExecutableTypes<B>>>::Context,
+                FinalizationError = <Refinement<B> as RefinementBackend>::Error,
             >,
         > + CommittedTokenTensors<TokenTensor = I, BlockToken = BlockToken<B>>
         + TextRefinementNative<
@@ -350,52 +351,12 @@ where
                         )
                         .into());
                     }
-                    let mut random = block.random().clone();
-                    let seeds = if shared_policy.is_some_and(|policy| policy.seed_first())
-                        && state.canvas.is_none()
-                    {
-                        let RefinementPolicy::MaskedUnmasking {
-                            config,
-                            mask_token_id,
-                        } = state.decoding.refinement_policy
-                        else {
-                            return Err(block_error(
-                                "seeded masked context requires a masked policy",
-                            )
-                            .into());
-                        };
-                        let scores = B::block_causal_scores(backend, &submission.output)?;
-                        let canvas =
-                            Refinement::<B>::materialize_tokens(&[mask_token_id], context)?;
-                        let sampled = crate::generation::refinement::masked::step::<Refinement<B>>(
-                            &canvas,
-                            None,
-                            &scores,
-                            mask_token_id,
-                            config,
-                            1,
-                            &mut random,
-                            context,
-                        )
-                        .map_err(BackendFailure::from_error)?;
-                        let seed = *B::block_token_ids(backend, &sampled.canvas)?
-                            .first()
-                            .ok_or_else(|| block_error("masked seed sampling returned no token"))?;
-                        let mut seeds = vec![None; geometry.canvas_length.get() as usize];
-                        seeds[0] = Some(seed);
-                        Some(RefinementCanvas {
-                            seed_tokens: seeds,
-                            pinned_positions: if seed == mask_token_id {
-                                vec![]
-                            } else {
-                                vec![0]
-                            },
-                        })
-                    } else {
-                        None
-                    };
+                    let scores = block
+                        .needs_context_seed(shared_policy.is_some_and(|policy| policy.seed_first()))
+                        .then(|| B::block_causal_scores(backend, &submission.output))
+                        .transpose()?;
                     let progress = block
-                        .accept_context(random, seeds.as_ref(), context)
+                        .accept_context(scores.as_ref(), context)
                         .map_err(NeuralError::backend_source)?;
                     TextOperationOutput::Progress {
                         pending: PendingTextInput::Continue,

@@ -110,8 +110,8 @@ where
     <B::Tensor as Tensor>::Context: Sized + 'static,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + crate::RuntimeStateComponents<B>,
 {
-    /// Shared component realization for local and partitioned execution.
-    type Components: crate::ComponentRankMechanisms<B, S, C> + crate::LocalComponentMechanisms<B, S>;
+    /// Component realization for local execution.
+    type Components: crate::LocalComponentMechanisms<B, S>;
 
     /// Creates the binder for the retained native streams.
     fn components(&self) -> Self::Components;
@@ -139,7 +139,7 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + crate::RuntimeStateComponents<B>,
     N: eredu_core::checkpoint_mechanisms::TextComponentResources<
         Values: eredu_core::backend::NativeTextValues<Context = Q>,
-        Components: crate::ComponentRankMechanisms<B, S, C> + crate::LocalComponentMechanisms<B, S>,
+        Components: crate::LocalComponentMechanisms<B, S>,
     >,
     super::PortableTextTypes<N::Values>: super::retained_executable::RetainedTextMechanisms<
         Tensor = B::Tensor,

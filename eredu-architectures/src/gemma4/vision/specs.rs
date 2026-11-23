@@ -93,12 +93,21 @@ impl MlpSpec {
         up: ClippedLinearSpec,
         down: ClippedLinearSpec,
     ) -> Result<Self, Error> {
+        Self::with_policy(gate, up, down, Self::POLICY)
+    }
+
+    fn with_policy(
+        gate: ClippedLinearSpec,
+        up: ClippedLinearSpec,
+        down: ClippedLinearSpec,
+        policy: eredu_nn::GatedProductPolicy,
+    ) -> Result<Self, Error> {
         let spec = Self {
             product: eredu_nn::SplitGatedProductSpec::new(
                 gate.linear,
                 up.linear,
                 down.linear,
-                Self::POLICY,
+                policy,
             )?,
             gate_bounds: gate.bounds,
             up_bounds: up.bounds,
@@ -136,7 +145,8 @@ impl MlpSpec {
 impl DeclareLogicalParameters for MlpSpec {
     fn logical_parameters(&self) -> Result<Vec<LogicalParameterDeclaration<'_>>, Error> {
         if self.product.gate.input != self.product.down.output
-            || self.product.policy != Self::POLICY
+            || (self.product.policy != Self::POLICY
+                && self.product.policy != eredu_nn::GatedProductPolicy::gelu_approximate_f16())
         {
             return Err(Error::backend(
                 "incompatible Gemma vision MLP residual geometry or policy",
@@ -171,7 +181,12 @@ pub struct BlockSpec {
 }
 impl BlockSpec {
     /// Builds one validated declaration under the family's tower root.
-    pub(super) fn at(config: &VisionPolicy, layer: usize, tower: &str) -> Result<Self, Error> {
+    pub(super) fn at(
+        config: &VisionPolicy,
+        layer: usize,
+        tower: &str,
+        published_gguf: bool,
+    ) -> Result<Self, Error> {
         config.validate().map_err(Error::backend_source)?;
         if layer >= config.num_hidden_layers as usize {
             return Err(Error::backend("vision block outside its declared stack"));
@@ -204,10 +219,15 @@ impl BlockSpec {
                 query_norm: norm(config, format!("{a}.q_norm.weight"), config.head_dim)?,
                 key_norm: norm(config, format!("{a}.k_norm.weight"), config.head_dim)?,
             },
-            mlp: MlpSpec::new(
+            mlp: MlpSpec::with_policy(
                 linear(&m, "gate_proj", hidden, config.intermediate_size)?,
                 linear(&m, "up_proj", hidden, config.intermediate_size)?,
                 linear(&m, "down_proj", config.intermediate_size, hidden)?,
+                if published_gguf {
+                    eredu_nn::GatedProductPolicy::gelu_approximate_f16()
+                } else {
+                    MlpSpec::POLICY
+                },
             )?,
             norms: [
                 norm(config, format!("{root}.input_layernorm.weight"), hidden)?,

@@ -12,7 +12,6 @@ pub(crate) mod gated_convolution;
 pub mod gated_delta;
 pub(crate) mod grouped;
 pub(crate) mod grouping;
-pub(crate) mod hyper_connections;
 pub(crate) mod layer_norm_memory;
 /// Activation functions.
 pub mod layers;
@@ -27,6 +26,8 @@ pub(crate) mod nested;
 pub(crate) mod normalization;
 /// Bounded execution of retained NVFP4 values and exact scale companions.
 pub(crate) mod nvfp4;
+pub(crate) mod ordered_bf16_attention;
+mod ordered_f32;
 pub(crate) mod parameter_conversion;
 pub(crate) mod primitives;
 /// Opt-in capture and isolated replay for native projection diagnostics.

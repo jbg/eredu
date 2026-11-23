@@ -6,6 +6,8 @@ use super::*;
 /// This bundle fixes scores, context, completion, and telemetry. The portable
 /// caller supplies the prompt type separately when erasing the executor.
 pub trait GenerationExecutorTypes: 'static {
+    /// Retained, source-free admission used to allocate each new lane.
+    type Binding;
     /// Opaque logits consumed by backend sampling.
     type Logits: Clone;
     /// Selected execution assignment.
@@ -63,7 +65,11 @@ impl Clone for DynGenerationDraftState {
 /// An executor which can realize a fresh lane cache before scheduling.
 pub trait GenerationExecutorCacheFactory<T: GenerationExecutorTypes>: SpeculativeExecutor {
     /// Realizes one independent authoritative target/prediction lane.
-    fn new_cache<'a>(&mut self, context: Self::Context<'a>) -> Result<Self::Cache, Self::Error>
+    fn new_cache<'a>(
+        &mut self,
+        binding: &T::Binding,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Cache, Self::Error>
     where
         Self: 'a;
 
@@ -205,16 +211,15 @@ pub trait ErasedGenerationExecutor<T: GenerationExecutorTypes, P> {
     /// Whether component telemetry is available.
     fn supports_telemetry(&self) -> bool;
     /// Drains component telemetry.
-    fn take_telemetry(&mut self) -> Result<T::Telemetry, T::Error>;
-    /// Drains telemetry retained in one verification payload.
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut DynGenerationVerification,
-    ) -> Result<T::Telemetry, T::Error>;
+    fn take_telemetry(&mut self) -> T::Telemetry;
     /// Whether an exact cloned branch may be promoted.
     fn supports_exact_optimistic_promotion(&self) -> bool;
     /// Realizes one lane cache.
-    fn new_cache<'a>(&mut self, context: T::Context<'a>) -> Result<DynGenerationCache, T::Error>
+    fn new_cache<'a>(
+        &mut self,
+        binding: &T::Binding,
+        context: T::Context<'a>,
+    ) -> Result<DynGenerationCache, T::Error>
     where
         Self: 'a;
     /// Prefills one lane.
@@ -569,27 +574,23 @@ where
         SpeculativeExecutor::supports_telemetry(self)
     }
 
-    fn take_telemetry(&mut self) -> Result<T::Telemetry, T::Error> {
+    fn take_telemetry(&mut self) -> T::Telemetry {
         SpeculativeExecutor::take_telemetry(self)
-    }
-
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut DynGenerationVerification,
-    ) -> Result<T::Telemetry, T::Error> {
-        let output = erased_mut::<E::Verification, T>(&mut output.0, "verification telemetry")?;
-        SpeculativeExecutor::take_verification_telemetry(self, output)
     }
 
     fn supports_exact_optimistic_promotion(&self) -> bool {
         SpeculativeExecutor::supports_exact_optimistic_promotion(self)
     }
 
-    fn new_cache<'a>(&mut self, context: T::Context<'a>) -> Result<DynGenerationCache, T::Error>
+    fn new_cache<'a>(
+        &mut self,
+        binding: &T::Binding,
+        context: T::Context<'a>,
+    ) -> Result<DynGenerationCache, T::Error>
     where
         Self: 'a,
     {
-        GenerationExecutorCacheFactory::<T>::new_cache(self, E::bind_context(context))
+        GenerationExecutorCacheFactory::<T>::new_cache(self, binding, E::bind_context(context))
             .map(|cache| DynGenerationCache(Box::new(cache)))
     }
 
@@ -754,16 +755,18 @@ impl<'a, T: GenerationExecutorTypes, P> DynGenerationExecutor<'a, T, P> {
     }
 }
 
-impl<T: GenerationExecutorTypes, P> SpeculativeCacheFactory for DynGenerationExecutor<'_, T, P> {
+impl<T: GenerationExecutorTypes, P> SpeculativeCacheFactory<T::Binding>
+    for DynGenerationExecutor<'_, T, P>
+{
     fn create_cache<'b>(
         &mut self,
-        _: &(),
+        binding: &T::Binding,
         context: T::Context<'b>,
     ) -> Result<DynGenerationCache, T::Error>
     where
         Self: 'b,
     {
-        self.inner.new_cache(context)
+        self.inner.new_cache(binding, context)
     }
 }
 
@@ -956,14 +959,8 @@ impl<T: GenerationExecutorTypes, P> SpeculativeExecutor for DynGenerationExecuto
     fn supports_telemetry(&self) -> bool {
         self.inner.supports_telemetry()
     }
-    fn take_telemetry(&mut self) -> Result<Self::Telemetry, Self::Error> {
+    fn take_telemetry(&mut self) -> Self::Telemetry {
         self.inner.take_telemetry()
-    }
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut Self::Verification,
-    ) -> Result<Self::Telemetry, Self::Error> {
-        self.inner.take_verification_telemetry(output)
     }
     fn supports_exact_optimistic_promotion(&self) -> bool {
         self.inner.supports_exact_optimistic_promotion()

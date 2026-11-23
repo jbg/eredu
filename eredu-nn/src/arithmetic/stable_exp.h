@@ -27,23 +27,21 @@
 // ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-#pragma once
-
 // Stable one-ULP exponential for maximum-subtracted scores and activation functions.
 // Explicit rounding keeps rare BF16 halfway cases independent of libm/SIMD ABI.
 inline float stable_exp_f32(float d) {
-  if (!metal::isfinite(d)) return metal::precise::exp(d);
+  if (d != d) return d;
   if (d > 100.0f) return INFINITY;
   if (d < -104.0f) return 0.0f;
-  int q = static_cast<int>(metal::rint(d * 1.44269504088896340736f));
-  float s = metal::fma(float(q), -0.693145751953125f, d);
-  s = metal::fma(float(q), -1.428606765330187045e-06f, s);
+  int q = static_cast<int>(rint(d * 1.44269504088896340736f));
+  float s = fma(float(q), -0.693145751953125f, d);
+  s = fma(float(q), -1.428606765330187045e-06f, s);
   float u = 0.000198527617612853646278381f;
-  u = metal::fma(u, s, 0.00139304355252534151077271f);
-  u = metal::fma(u, s, 0.00833336077630519866943359f);
-  u = metal::fma(u, s, 0.0416664853692054748535156f);
-  u = metal::fma(u, s, 0.166666671633720397949219f);
-  u = metal::fma(u, s, 0.5f);
-  u = 1.0f + metal::fma(s * s, u, s);
-  return metal::ldexp(metal::ldexp(u, q >> 1), q - (q >> 1));
+  u = fma(u, s, 0.00139304355252534151077271f);
+  u = fma(u, s, 0.00833336077630519866943359f);
+  u = fma(u, s, 0.0416664853692054748535156f);
+  u = fma(u, s, 0.166666671633720397949219f);
+  u = fma(u, s, 0.5f);
+  u = 1.0f + fma(s * s, u, s);
+  return ldexp(ldexp(u, q >> 1), q - (q >> 1));
 }

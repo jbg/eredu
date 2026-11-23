@@ -55,7 +55,7 @@ impl eredu_nn::DeclareLogicalParameters for FeedForwardParameters {
 /// Qwen3 top-k router and packed expert bank.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct RoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub struct RoutedGatedProduct<B: GroupedNeuralBackend> {
     /// Global decoder layer used for runtime expert identity.
     #[parameter(skip)]
     pub layer: usize,
@@ -65,7 +65,7 @@ pub struct RoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeu
     pub experts: B::GatedProductGroups,
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedProduct<B> {
+impl<B: GroupedNeuralBackend> RoutedGatedProduct<B> {
     /// Builds one unloaded Qwen3-MoE feed-forward block.
     pub fn new(
         args: &ModelArgs,
@@ -235,9 +235,7 @@ pub fn expert_realization_plan(
         .map_err(Error::backend)
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
-    for RoutedGatedProduct<B>
-{
+impl<B: GroupedNeuralBackend> DecoderProjectionOperator<B> for RoutedGatedProduct<B> {
     fn residual_observation(&self) -> &'static str {
         "feed_forward.contribution"
     }
@@ -297,14 +295,14 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
 /// One Qwen feed-forward policy used by the single decoder block type.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+pub enum FeedForward<B: GroupedNeuralBackend> {
     /// Dense SwiGLU used by Qwen2 and dense Qwen3.
     Dense(Mlp<B>),
     /// Top-k routed gated-product used by Qwen3-MoE.
     Routed(RoutedGatedProduct<B>),
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
+impl<B: GroupedNeuralBackend> FeedForward<B> {
     /// Builds the validated dense or routed policy for one layer.
     pub fn new(
         args: &ModelArgs,
@@ -385,6 +383,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
+        B: eredu_nn::DistributedNeuralBackend,
         P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
@@ -413,9 +412,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
-    for FeedForward<B>
-{
+impl<B: GroupedNeuralBackend> DecoderProjectionOperator<B> for FeedForward<B> {
     fn residual_observation(&self) -> &'static str {
         match self {
             Self::Dense(_) => "feed_forward.output",
@@ -480,9 +477,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
     }
 }
 
-impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
-    crate::decoder::RoutedProjectionOperator<B> for FeedForward<B>
-{
+impl<B: GroupedNeuralBackend> crate::decoder::RoutedProjectionOperator<B> for FeedForward<B> {
     fn forward_observed_with_provider<P>(
         &mut self,
         layer: usize,

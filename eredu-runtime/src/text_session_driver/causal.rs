@@ -6,7 +6,7 @@ use eredu_core::{backend::TextTransactionMechanisms, sampling::SamplingBackend};
 use std::ops::DerefMut;
 
 use eredu_core::{
-    backend::CausalTextSession,
+    backend::{CausalTextSession, NativeTextValues, TextSamplingNative},
     capture::{
         CaptureError, CapturePhase, CapturePrefillSpan, CaptureTensorOperations, CaptureTokenDomain,
     },
@@ -28,7 +28,7 @@ use crate::{
 /// Native input and collector bindings for the portable causal text driver.
 pub trait CausalTextMechanisms<B: super::specialized::TextModeBinding>:
     TextSessionMechanisms<B>
-    + eredu_core::backend::TextSamplingNative<
+    + eredu_core::backend::DeviceTextSampling<
         B,
         Sampling: SamplingBackend<
             RandomState = <B::Refinement as eredu_core::refinement::RefinementBackend>::RandomState,
@@ -53,7 +53,7 @@ impl<B, N> CausalTextMechanisms<B> for N
 where
     B: super::specialized::TextModeBinding,
     N: TextSessionMechanisms<B>
-        + eredu_core::backend::TextSamplingNative<
+        + eredu_core::backend::DeviceTextSampling<
             B,
             Sampling: SamplingBackend<
                 RandomState = <B::Refinement as eredu_core::refinement::RefinementBackend>::RandomState,
@@ -95,21 +95,39 @@ pub(super) fn sample_causal_scores<B, N>(
     temperature: f32,
 ) -> Result<Submission<N::Token, N::SamplingCompletion>, B::Error>
 where
-    B: super::specialized::TextModeBinding,
-    N: CausalTextMechanisms<B>,
+    B: eredu_core::TextGenerationBackend,
+    N: TextSessionMechanisms<B> + eredu_core::backend::DeviceTextSampling<B>,
+{
+    sample_causal_with::<B, N>(model, backend, submission, |scores, context| {
+        sample_text_row::<N::Sampling>(sampler, &scores, filter, temperature, random, context)
+            .map_err(|error| N::preparation_error(eredu_core::BackendFailure::from_error(error)))
+    })
+}
+
+pub(super) fn sample_causal_with<B, N>(
+    model: &N::Model,
+    backend: &B,
+    submission: Submission<N::Output, N::Completion>,
+    sample_row: impl FnOnce(
+        N::ScoreRow,
+        &<N::TextValues as NativeTextValues>::Context,
+    ) -> Result<N::Sample, B::Error>,
+) -> Result<Submission<N::Token, N::SamplingCompletion>, B::Error>
+where
+    B: eredu_core::TextGenerationBackend,
+    N: TextSessionMechanisms<B> + TextSamplingNative<B>,
 {
     use crate::executable_binding::ErasedTextExecutable as _;
 
     let context = N::context(backend);
     let scope = N::begin_sampling(&submission.completion)?;
-    let mut sample = |context, random| {
+    let sample = || {
         let scores = N::last_score_row(&submission.output, context)?.ok_or_else(|| {
             N::preparation_error(eredu_core::BackendFailure::from_error(
                 std::io::Error::other("sampling rank requires its submitted text scores"),
             ))
         })?;
-        sample_text_row::<N::Sampling>(sampler, &scores, filter, temperature, random, context)
-            .map_err(|error| N::preparation_error(eredu_core::BackendFailure::from_error(error)))
+        sample_row(scores, context)
     };
     let token = match model.as_ref().partition_sampling_context() {
         Some((group, authority, exchange_context, rank)) => (|| {
@@ -124,12 +142,10 @@ where
                     )),
                 ));
             }
-            let token = (local == rank)
-                .then(|| sample(context, random))
-                .transpose()?;
+            let token = (local == rank).then(sample).transpose()?;
             N::exchange_sampled_token(token, rank, group, authority, exchange_context)
         })(),
-        None => sample(context, random),
+        None => sample(),
     };
     N::finish_sampling(scope, submission.completion, token, context)
 }
@@ -337,12 +353,6 @@ pub(super) trait CausalPrefillDriver<B: super::specialized::TextModeBinding>:
         max_tokens: std::num::NonZeroUsize,
         state: &mut super::TextRequestFor<B>,
     ) -> Result<bool, B::Error>;
-
-    fn complete_prefill(
-        runtime: &mut ModelRuntime<B, Self>,
-        prompt: crate::text_session_driver::TextPromptFor<B>,
-        state: &mut super::TextRequestFor<B>,
-    ) -> Result<bool, B::Error>;
 }
 
 impl<B, R, N> CausalPrefillDriver<B> for TextSessionDriver<R, N>
@@ -430,18 +440,6 @@ where
             prompt,
             max_tokens,
             state.parameter_epoch,
-        )
-    }
-
-    fn complete_prefill(
-        runtime: &mut ModelRuntime<B, Self>,
-        prompt: crate::text_session_driver::TextPromptFor<B>,
-        state: &mut super::TextRequestFor<B>,
-    ) -> Result<bool, B::Error> {
-        Self::complete_prefill::<B, Prefill<B, N>>(
-            runtime,
-            prompt,
-            causal_state::<B>(state).parameter_epoch,
         )
     }
 }

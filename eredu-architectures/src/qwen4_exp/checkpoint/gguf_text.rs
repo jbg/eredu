@@ -268,7 +268,7 @@ fn entries(parameters: &TargetParameters) -> Result<Vec<Entry>, String> {
                 let declarations = spec.logical_parameters().map_err(|e| e.to_string())?;
                 for (physical, parameter, heads, neg_log) in [
                     ("ssm_dt.bias", &spec.decay_bias, true, false),
-                    ("ssm_a", &spec.transition_log, true, true),
+                    ("ssm_a", &spec.transition, true, true),
                     ("ssm_norm.weight", &spec.normalization_weight, false, false),
                 ] {
                     let declaration = declarations

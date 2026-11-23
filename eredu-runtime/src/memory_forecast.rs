@@ -1,7 +1,10 @@
 //! Shared forecast calibration and loaded execution observations.
 
 use crate::memory_estimation::*;
-use eredu_core::{AvailableMemory, CapabilityError, ModelRuntime, StaticMemoryReport};
+use eredu_core::{
+    capability::ExecutionMemoryPlacement, AvailableMemory, CapabilityError, ModelRuntime, Observed,
+    StaticMemoryReport,
+};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
@@ -73,6 +76,54 @@ impl ForecastCalibration {
                 "forecast calibration v1: allocator-cache limit {limit} bytes, retained cache {retained} bytes; their maximum plus {} bytes graph/driver allowance; planning assumption, not a total-process bound", self.graph_driver_bytes)),
             None => MemoryBytes::unknown("allocator-cache and graph/driver allowance overflow"),
         }
+    }
+
+    /// Interprets placement-specific cache policy and observed occupancy once.
+    pub fn allocator_overhead_from_counters(
+        &self,
+        limit: &Observed<u64>,
+        retained: &Observed<u64>,
+    ) -> MemoryBytes {
+        match (limit, retained) {
+            (
+                Observed::Available {
+                    value: limit,
+                    source,
+                    ..
+                },
+                Observed::Available {
+                    value: retained, ..
+                },
+            ) => {
+                let mut overhead = self.allocator_overhead(*limit, *retained);
+                overhead.detail.push_str("; cache-limit provenance: ");
+                overhead.detail.push_str(source);
+                overhead
+            }
+            (Observed::Unavailable { reason } | Observed::Unsupported { reason }, _)
+            | (_, Observed::Unavailable { reason } | Observed::Unsupported { reason }) => {
+                MemoryBytes::unknown(format!("allocator overhead unavailable: {reason}"))
+            }
+        }
+    }
+
+    /// Projects the same calibration for a cold native allocator observation.
+    pub fn allocator_overhead_from_observation(
+        &self,
+        observation: Option<eredu_core::AllocatorObservation>,
+    ) -> MemoryBytes {
+        let Some(observation) = observation else {
+            return MemoryBytes::unknown("backend allocator observation unavailable");
+        };
+        let limit = observation.cache_policy.map_or_else(
+            || Observed::unavailable("native allocator cache policy unavailable"),
+            |policy| Observed::exact(policy.limit_bytes, format!("{:?}", policy.source)),
+        );
+        let cache = observation.telemetry.cache_bytes.map_or_else(
+            || Observed::unavailable("native allocator cache occupancy unavailable"),
+            |bytes| Observed::exact(bytes, "observed native allocator-cache occupancy"),
+        );
+        self.allocator_overhead_from_counters(&limit, &cache)
     }
 
     /// Applies one shared calibration to every execution in a physical pool.
@@ -148,8 +199,8 @@ pub struct LoadedMemoryProfile {
     pub parameters: StaticMemoryReport,
     /// Point-in-time observed capacity.
     pub available: AvailableMemory,
-    /// Whether execution consumes the host capacity pool.
-    pub host_execution: bool,
+    /// Where execution and the native allocator are retained.
+    pub placement: ExecutionMemoryPlacement,
     /// Current native cache policy, including an explicit unavailable observation.
     pub allocator_cache_limit: eredu_core::Observed<u64>,
 }

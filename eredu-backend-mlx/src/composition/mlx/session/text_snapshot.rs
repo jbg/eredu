@@ -1,7 +1,9 @@
 //! Native copying for the shared ordinary-continuation snapshot driver.
 
 use super::*;
-use eredu_core::execution_control::{SamplingGrowthCosts, TextSnapshotNative};
+use eredu_core::execution_control::{
+    SamplingGrowthCosts, TextModeSnapshotNative, TextSnapshotNative,
+};
 
 fn array_storage(array: &Array) -> Option<u64> {
     u64::try_from(array.nbytes())
@@ -16,11 +18,6 @@ fn copy_array(array: &Array, stream: &Stream) -> Result<Array, Error> {
 }
 
 impl<Dispatch> TextSnapshotNative for MlxBackend<'_, Dispatch> {
-    type CausalScores = Array;
-    type RefinementTokens = crate::MlxTensor;
-    type RefinementScores = crate::MlxTensor;
-    type RefinementMask = crate::MlxTensor;
-
     fn prompt_tensor_identity(tensor: &Array) -> Option<eredu_core::InputTensorIdentity> {
         eredu_core::input::PreparedInputInspector::identity(&input::MlxInputInspector, tensor).ok()
     }
@@ -45,6 +42,14 @@ impl<Dispatch> TextSnapshotNative for MlxBackend<'_, Dispatch> {
     fn complete_prompt_tensors<'a>(tensors: impl Iterator<Item = &'a Array>) -> Result<(), Error> {
         Ok(safemlx::transforms::eval(tensors)?)
     }
+}
+
+impl<Dispatch> TextModeSnapshotNative for MlxBackend<'_, Dispatch> {
+    type CausalScores = Array;
+    type RefinementTokens = crate::MlxTensor;
+    type RefinementScores = crate::MlxTensor;
+    type RefinementMask = crate::MlxTensor;
+
     fn sampling_growth_costs() -> SamplingGrowthCosts {
         SamplingGrowthCosts {
             random_key_bytes: 4096 + 16 + 2 * 8,
@@ -94,12 +99,6 @@ impl<Dispatch> TextSnapshotNative for MlxBackend<'_, Dispatch> {
 
     fn refinement_mask_bytes(value: &Self::RefinementMask) -> Option<u64> {
         array_storage(value.as_array())
-    }
-
-    fn proposal_random_bytes(random: &RandomState) -> Option<u64> {
-        u64::try_from(random.as_array().nbytes())
-            .ok()?
-            .checked_add(4096)
     }
 
     fn copy_random(backend: &Self, random: &RandomState) -> Result<RandomState, Error> {

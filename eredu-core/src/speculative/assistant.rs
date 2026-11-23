@@ -2,11 +2,10 @@
 
 use crate::{
     backend::NativeTextValues,
-    capability::NativeAllocatorObservations,
     capture::SpeculativeCapturePrimitives,
     checkpoint_mechanisms::{CheckpointParameterBackend, ExactParameterMaterializer},
     speculative::SpeculativeQueueMechanisms,
-    BackendFailure, BoundedCompletion, SpeculativeTelemetry,
+    BackendFailure, BoundedCompletion,
 };
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_nn::{NeuralBackend, Tensor};
@@ -30,7 +29,11 @@ pub trait ExternalAssistantOperators: Sized + 'static {
         + eredu_nn::DistributedNeuralBackend
         + Clone;
     /// Checkpoint materialization resources.
-    type Binder;
+    type Binder: ExternalAssistantBinder<
+        Backend = Self::NeuralBackend,
+        Logits = Self::Logits,
+        ObservationError = Self::Error,
+    >;
     /// Tensor storage used to construct the assistant's resident attention cache.
     type Cache: crate::cache::mechanisms::ResidentKeyValueStorage<Value = Self::Tensor>;
     /// Native capture and communication primitives.
@@ -39,16 +42,16 @@ pub trait ExternalAssistantOperators: Sized + 'static {
         InvocationError = Self::Error,
         Queues: SpeculativeQueueMechanisms<Queue = Queue<Self>>,
     >;
-    /// Native allocator facts.
-    type Memory: NativeAllocatorObservations;
+    /// Reads memory on the retained execution queue.
+    fn placement_memory(
+        queue: &Queue<Self>,
+    ) -> Result<crate::capability::ParameterMemoryFacts, crate::BackendFailure>;
     /// Native tensor handle.
     type Tensor: Tensor + Clone;
     /// Native scores consumed by sampling.
     type Logits: Clone;
     /// Native submission completion.
     type Completion: BoundedCompletion<Error = Self::Error>;
-    /// Optional component telemetry.
-    type Telemetry: SpeculativeTelemetry;
     /// Native operation failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -104,13 +107,16 @@ pub trait ExternalAssistantOperators: Sized + 'static {
         end: usize,
         queue: &Queue<Self>,
     ) -> Result<Self::Tensor, Self::Error>;
-    /// Materializes exact token values, with optional transfer to the nominated queue.
+    /// Materializes exact token values for the target queue.
     fn target_tokens(
         tokens: &[u32],
-        destination: Option<&Queue<Self>>,
+        destination: &Queue<Self>,
+        crosses_devices: bool,
     ) -> Result<Self::Tensor, Self::Error>;
     /// Borrows the native value used for queue dependency submission.
     fn tensor_root(value: &Self::Tensor) -> &<<Self::Capture as SpeculativeCapturePrimitives>::Queues as SpeculativeQueueMechanisms>::Root;
+    /// Reports whether the destination queue can use the original tensor storage.
+    fn can_share_tensor(value: &Self::Tensor, destination: &Queue<Self>) -> bool;
     /// Settles a copy on the specified destination.
     fn copy_tensor(
         value: &Self::Tensor,
@@ -127,7 +133,7 @@ pub trait ExternalAssistantOperators: Sized + 'static {
 /// Native operations for binding an admitted assistant.
 pub trait ExternalAssistantBinder: Sized {
     /// Neural operations used by portable assistant construction.
-    type Backend: CheckpointParameterBackend
+    type Backend: CheckpointParameterBackend<Tensor: Tensor<Context: Clone>>
         + eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + Clone;

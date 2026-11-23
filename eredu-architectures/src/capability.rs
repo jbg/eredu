@@ -236,6 +236,8 @@ fn qwen_spec(
             num_key_value_heads: args.num_key_value_heads,
             max_position_embeddings: args.max_position_embeddings,
             rope_theta: args.rope_theta,
+            rotary_arithmetic: eredu_nn::RotaryArithmetic::Native,
+            attention_arithmetic: eredu_nn::AttentionArithmetic::Fused,
             rope_traditional: false,
             head_dim: args.head_dim,
             tie_word_embeddings: args.tie_word_embeddings,

@@ -190,16 +190,11 @@ fn resolve_family(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<String, MetadataValue>>();
-    let vocabulary_key = format!("{}.vocab_size", architecture.metadata_name());
-    if let std::collections::hash_map::Entry::Vacant(entry) = metadata.entry(vocabulary_key) {
-        if let Some(vocabulary) = checkpoint
-            .logical_outputs()
-            .find(|output| output.name == "token_embd.weight")
-            .and_then(|output| output.shape.first().copied())
-        {
-            entry.insert(MetadataValue::Uint64(vocabulary));
-        }
-    }
+    crate::gguf_catalog::supply_embedding_vocabulary(
+        &mut metadata,
+        format!("{}.vocab_size", architecture.metadata_name()),
+        checkpoint,
+    );
     let mut lfm2 = None;
     let mut lfm3 = None;
     let mut kimi = None;

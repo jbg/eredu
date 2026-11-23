@@ -172,7 +172,7 @@ pub struct RoutedQwenBlockFactory;
 
 impl<B> crate::decoder::BlockFactory<B, ModelArgs> for RoutedQwenBlockFactory
 where
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    B: GroupedNeuralBackend,
 {
     type FeedForward = FeedForward<B>;
 
@@ -227,7 +227,7 @@ where
 }
 
 /// Builds a Qwen block for a backend adapter that dynamically admits dense or MoE configuration.
-pub fn new_routed_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
+pub fn new_routed_block<B: GroupedNeuralBackend>(
     args: &ModelArgs,
     layer: usize,
     context: &<B::Tensor as Tensor>::Context,
@@ -243,9 +243,7 @@ pub fn new_routed_block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
 
 /// Builds one partition-local routed block with a global router and the exact
 /// TP/EP-local expert bank selected by architecture geometry.
-pub fn new_partitioned_routed_block<
-    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
->(
+pub fn new_partitioned_routed_block<B: GroupedNeuralBackend>(
     global: &ModelArgs,
     local: &ModelArgs,
     layer: usize,

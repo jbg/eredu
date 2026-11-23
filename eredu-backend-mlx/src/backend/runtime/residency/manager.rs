@@ -521,12 +521,15 @@ impl eredu_core::residency::observations::DenseResidencyMechanisms for MlxReside
 
     fn allocator_memory(
         &self,
-    ) -> Result<eredu_core::residency::AllocatorMemoryMetrics, ResidencyError> {
-        sample_allocator_memory().map_err(|source| ResidencyError::Mlx {
-            id: internal_id(),
-            operation: "allocator memory sampling",
-            source,
-        })
+        _: &Self::Storage,
+    ) -> Result<eredu_core::AllocatorTelemetry, ResidencyError> {
+        sample_allocator_memory()
+            .map(Into::into)
+            .map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "allocator memory sampling",
+                source,
+            })
     }
 
     fn observe_residency(

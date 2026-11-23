@@ -38,7 +38,7 @@ backend factory to infer the backend and installed session types. The same API w
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 use eredu::api::LoadedModel;
 use eredu_core::{DevicePlan, ExecutionPlan};
-use eredu_backend_mlx::MlxBackendFactory;
+use eredu::backends::MlxBackendFactory;
 
 let device = DevicePlan::new("mlx", "cpu:0")?;
 let plan = ExecutionPlan::fully_resident(device);
@@ -51,16 +51,17 @@ let (mut model, drafting) = planned.into_parts();
 # fn main() {}
 ```
 
-Applications can construct an exact `DevicePlan` from a backend ID and a device
-ID or select one from the factory's hardware discovery report. The CLI resolves
-`cpu` and `gpu:N` using reported device kind and index. When omitted, the CLI
-prefers a discovered GPU, then a discovered CPU.
+For Candle, enable the `candle` Cargo feature and pass
+`eredu::backends::CandleBackendFactory::for_device(&device)?`, where
+`device` is a `DevicePlan::new("candle", "cpu:0")?`. Use the same device in
+`ExecutionPlan::fully_resident(device)`. On supported hosts,
+`candle-metal` and `candle-cuda` enable indexed `metal:N` and `cuda:N` plans.
 
 Model-family architecture modules are owned by `eredu-architectures`.
 Reusable MLX tensors, operators, cache storage, and streams live in
 `eredu-backend-mlx`. The portable facade composes model families with the
-chosen backend. Application clients import the backend factory from its crate
-and use the generic facade types in `eredu::api`.
+chosen backend. The `eredu::backends` module exposes the enabled factories,
+and `eredu::api` supplies the generic model and session types.
 
 Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` for
 portable plan-to-backend realization. These entry points return
@@ -179,12 +180,14 @@ same scheduler. Completed transitions commit before host output is delivered.
 ## Cargo features
 
 - `mlx`: the MLX execution backend; enabled by default.
+- `candle`: the unoptimised CPU backend for validating the shared backend contract.
+- `candle-metal` and `candle-cuda`: Metal or CUDA execution for Candle.
 - `metal`: Metal execution with Accelerate on Apple platforms; enabled by
   default and effective only with `mlx`.
 - `cuda`: CUDA execution on supported Linux and Windows hosts; effective only
   with `mlx` and mutually exclusive with `metal`.
-- `image`: image and video preprocessing; effective only with `mlx`.
-- `audio`: audio preprocessing; effective only with `mlx`.
+- `image`: image and video preprocessing and conversion in an enabled backend.
+- `audio`: audio preprocessing and conversion in an enabled backend.
 - `nccl`: NCCL distributed support; effective only with `mlx` and CUDA.
 - `onig`: Oniguruma tokenizer regular expressions; enabled by default.
 - `esaxx_fast`: fast SentencePiece-compatible tokenization; enabled by

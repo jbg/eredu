@@ -384,7 +384,7 @@ pub struct LoadedTextModelConfig {
 /// Backend-specific state remains owned by [`ModelRuntime`].
 pub struct LoadedModel<B: TextGenerationBackend, S: TextExecutionSession<B>> {
     pub(crate) session_identity: String,
-    pub(crate) prompt_cache_store: Option<(String, Box<dyn eredu_core::cache::PromptCacheStore>)>,
+    pub(super) prompt_cache_store: Option<super::prompt_cache::AttachedPromptCache<B, S>>,
     pub(crate) runtime: ModelRuntime<B, S>,
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],

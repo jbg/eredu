@@ -1,5 +1,6 @@
 //! Retained Qwen request geometry. Planning performs no resize, normalization or packing.
 use super::*;
+use eredu_media::image::RgbResample;
 use std::borrow::Cow;
 
 pub(super) struct Request<'a> {
@@ -267,9 +268,7 @@ impl<'a> Request<'a> {
                     let frames = indices
                         .iter()
                         .map(|index| {
-                            mechanisms
-                                .normalize_rgb(&video.frames()[*index], *transform)
-                                .map_err(mechanism_error)
+                            normalize_rgb(&video.frames()[*index], *transform).map_err(media_error)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let (values, shape, grid) = pack_qwen(&frames, *patches, false)?;

@@ -66,7 +66,7 @@ pub fn synthesize_replicated_text_capabilities(
                 && support.supports_direct(&descriptor)
             {
                 Some(WeightLoweringKind::Direct)
-            } else if descriptor.has_valid_transform_geometry()
+            } else if descriptor.supports_word_transform()
                 && support.supports_transform(&descriptor)
             {
                 Some(WeightLoweringKind::Transform)

@@ -4,10 +4,10 @@ use super::*;
 use crate::PreparedInputCacheIdentity;
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-    PromptCacheOptions, PromptCacheStore,
+    PromptCacheOptions, PromptCacheRead, PromptCacheStore, PromptCacheStoreError,
 };
 
-impl<R: 'static, N> TextSessionDriver<R, N> {
+impl<R: 'static, N, G> TextSessionDriver<R, N, G> {
     /// The identity of the cache state owned by this rank.
     pub fn prompt_cache_model_identity<B>(
         &self,
@@ -15,7 +15,7 @@ impl<R: 'static, N> TextSessionDriver<R, N> {
     ) -> Result<PromptCacheModelIdentity, B::Error>
     where
         B: BackendProvider<Error: From<BackendFailure>>,
-        N: TextSessionMechanisms<B, Resources = R>,
+        N: TextSessionMechanisms<B, Resources = R, Generation = G>,
         R: DerefMut<Target = TextSessionResourcesFor<B, N>>,
     {
         self.ensure_parameter_cache_compatible()
@@ -30,18 +30,19 @@ impl<R: 'static, N> TextSessionDriver<R, N> {
             .ok_or_else(|| BackendFailure::from_error(PromptCacheError::StatelessPartition).into())
     }
 
-    /// Opens a compatible persisted prefix in one settled model transaction.
-    pub fn load_prompt_cache<B>(
+    /// Restores a pinned persisted prefix in one settled model transaction.
+    pub fn restore_prompt_cache<B>(
         &mut self,
         backend: &B,
-        store: &dyn PromptCacheStore,
+        read: &dyn PromptCacheRead,
         expected: &PromptCacheDescriptor,
         prefix: &[u32],
         input: Option<PreparedInputCacheIdentity>,
     ) -> Result<PromptCacheManifest, B::Error>
     where
         B: BackendProvider<Error: From<BackendFailure>>,
-        N: TextSessionMechanisms<B, Resources = R> + TextTransactionMechanisms<Error = B::Error>,
+        N: TextSessionMechanisms<B, Resources = R, Generation = G>
+            + TextTransactionMechanisms<Error = B::Error>,
         R: DerefMut<Target = TextSessionResourcesFor<B, N>>,
     {
         self.ensure_parameter_cache_compatible()
@@ -49,13 +50,15 @@ impl<R: 'static, N> TextSessionDriver<R, N> {
         self.native
             .validate_native_target(&self.payload.retained, backend)?;
         self.with_model_transaction(|model| {
-            model
-                .as_mut()
-                .prompt_cache()
-                .ok_or_else(unavailable)?
-                .load(store, expected, prefix, input)
-                .map_err(Into::into)
-        })
+            cache_transaction_outcome(
+                model
+                    .as_mut()
+                    .prompt_cache(N::context(backend))
+                    .ok_or_else(unavailable)
+                    .and_then(|cache| cache.restore(read, expected, prefix, input)),
+            )
+        })?
+        .map_err(Into::into)
     }
 
     /// Persists the committed prefix in one settled model transaction.
@@ -69,7 +72,8 @@ impl<R: 'static, N> TextSessionDriver<R, N> {
     ) -> Result<PromptCacheManifest, B::Error>
     where
         B: BackendProvider<Error: From<BackendFailure>>,
-        N: TextSessionMechanisms<B, Resources = R> + TextTransactionMechanisms<Error = B::Error>,
+        N: TextSessionMechanisms<B, Resources = R, Generation = G>
+            + TextTransactionMechanisms<Error = B::Error>,
         R: DerefMut<Target = TextSessionResourcesFor<B, N>>,
     {
         self.ensure_parameter_cache_compatible()
@@ -77,13 +81,29 @@ impl<R: 'static, N> TextSessionDriver<R, N> {
         self.native
             .validate_native_target(&self.payload.retained, backend)?;
         self.with_model_transaction(|model| {
-            model
-                .as_mut()
-                .prompt_cache()
-                .ok_or_else(unavailable)?
-                .save(store, descriptor, prefix, options)
-                .map_err(Into::into)
-        })
+            cache_transaction_outcome(
+                model
+                    .as_mut()
+                    .prompt_cache(N::context(backend))
+                    .ok_or_else(unavailable)
+                    .and_then(|cache| cache.save(store, descriptor, prefix, options)),
+            )
+        })?
+        .map_err(Into::into)
+    }
+}
+
+// A rejected cache publication or provisional restore can preserve the live
+// executable. Settle the native scope before exposing that rejection.
+fn cache_transaction_outcome<T, E: From<BackendFailure>>(
+    result: Result<T, BackendFailure>,
+) -> Result<Result<T, BackendFailure>, E> {
+    match result {
+        Err(error) if PromptCacheStoreError::publication_declined(&error) => {
+            Ok(Err(error.with_model_state_preserved(true)))
+        }
+        Err(error) if !error.model_state_preserved() => Err(error.into()),
+        outcome => Ok(outcome),
     }
 }
 
@@ -92,17 +112,18 @@ fn unavailable() -> BackendFailure {
         std::io::ErrorKind::Unsupported,
         "this session does not support prompt-cache persistence",
     ))
+    .with_model_state_preserved(true)
 }
 
-impl<B, R, N, M> eredu_core::AutomaticPromptCacheSession<B> for TextSessionDriver<R, N>
+impl<B, R, N, M, G> eredu_core::AutomaticPromptCacheSession<B> for TextSessionDriver<R, N, G>
 where
     B: eredu_core::TextGenerationBackend,
-    B::Error: From<eredu_core::BackendError> + From<BackendFailure>,
+    B::Error: From<BackendFailure>,
     crate::text_session_driver::TextPromptFor<B>: TextPrefillInput,
-    N: TextSessionMechanisms<B, Resources = R, Model = M>
+    N: TextSessionMechanisms<B, Resources = R, Model = M, Generation = G>
         + TextTransactionMechanisms<Error = B::Error>,
     R: DerefMut<Target = TextSessionResourcesFor<B, N>> + 'static,
-    M: InstalledTextState,
+    M: InstalledTextState + AsRef<N::Executable>,
     Self: eredu_core::backend::TextOperationDriver<
         B,
         Prompt = crate::text_session_driver::TextPromptFor<B>,
@@ -112,15 +133,6 @@ where
         runtime: &eredu_core::ModelRuntime<B, Self>,
     ) -> Result<PromptCacheModelIdentity, BackendFailure> {
         let session = runtime.session();
-        if !matches!(
-            session.state_layout().residency(),
-            crate::CacheResidencyPolicy::Paged(_)
-        ) {
-            return Err(BackendFailure::from_error(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "prompt-cache import/export requires a plan with paged execution state",
-            )));
-        }
         if N::control_transport(&session.payload.retained).is_some() {
             return Err(BackendFailure::from_error(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -141,19 +153,42 @@ where
             prefix.to_vec(),
         )
         .map_err(BackendFailure::from_error)?;
-        Ok(input.prompt_cache_identity().map_or_else(
-            || eredu_core::cache::prompt_cache_token_fingerprint(prefix),
-            |identity| identity.prefix_content_fingerprint().to_owned(),
-        ))
+        Ok(runtime
+            .session()
+            .payload
+            .model
+            .as_ref()
+            .prompt_cache_prefix_identity(prefix, input.prompt_cache_identity()))
     }
 
     fn estimate_prompt_cache_state(
         runtime: &eredu_core::ModelRuntime<B, Self>,
     ) -> Result<Option<u64>, BackendFailure> {
-        use eredu_core::execution_control::NativeTextStateSession as _;
-        Self::estimate_native_text_state(runtime, None)
-            .map(|estimate| estimate.map(|e| e.retained_bytes.max(e.copy_bytes)))
-            .map_err(BackendFailure::from_error)
+        let session = runtime.session();
+        session
+            .native
+            .validate_native_target(&session.payload.retained, runtime.backend())
+            .map_err(BackendFailure::from_error)?;
+        session
+            .submission_idle()
+            .map_err(N::submission_authority_error)
+            .map_err(BackendFailure::from_error)?;
+        let model = &session.payload.model;
+        if let Some(bytes) = model.as_ref().prompt_cache_storage_bytes()? {
+            return Ok(Some(bytes));
+        }
+        if let eredu_core::execution_control::ControlSupport::Supported =
+            super::erased_state::state_support(model)
+        {
+            return super::erased_state::supported_state(model)?
+                .estimate_copy(None)
+                .map(|estimate| {
+                    estimate
+                        .and_then(super::erased_state::ErasedTextState::include_slot_cost)
+                        .map(|e| e.retained_bytes.max(e.copy_bytes))
+                });
+        }
+        Ok(None)
     }
 
     fn save_prompt_cache(
@@ -169,9 +204,9 @@ where
             .map_err(BackendFailure::from_error)
     }
 
-    fn load_prompt_cache(
+    fn restore_prompt_cache(
         runtime: &mut eredu_core::ModelRuntime<B, Self>,
-        store: &dyn PromptCacheStore,
+        read: &dyn PromptCacheRead,
         descriptor: &PromptCacheDescriptor,
         prefix: &[u32],
     ) -> Result<PromptCacheManifest, BackendFailure> {
@@ -182,9 +217,9 @@ where
         .map_err(BackendFailure::from_error)?;
         let (backend, session) = runtime.parts_mut();
         session
-            .load_prompt_cache(
+            .restore_prompt_cache(
                 backend,
-                store,
+                read,
                 descriptor,
                 prefix,
                 input.prompt_cache_identity().cloned(),

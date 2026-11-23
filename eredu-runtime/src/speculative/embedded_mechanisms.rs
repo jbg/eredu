@@ -4,7 +4,7 @@ use crate::capture::SpeculativeCaptureMechanisms as _;
 
 use eredu_core::{
     speculative::{GenerationExecutorTypes, SpeculativeControlError},
-    BoundedCompletion, SpeculativeTelemetry,
+    BoundedCompletion,
 };
 
 /// Tensor, token, transfer, and completion mechanisms needed by embedded prediction.
@@ -245,14 +245,12 @@ where
     S: crate::RuntimeState<B>,
     M: SpeculativeTensorMechanisms<Tensor = B::Tensor>,
 {
-    /// Optional backend component telemetry.
-    type Telemetry: SpeculativeTelemetry;
     /// Fixed scheduler-facing type bundle used after architecture pairing.
     type ExecutorTypes: for<'a> GenerationExecutorTypes<
         Context<'a> = M::Context<'a>,
         Logits = M::Logits,
         Completion = M::Completion,
-        Telemetry = Self::Telemetry,
+        Telemetry = (),
         Error = M::Error,
     >;
     /// Returns the ordinary target tensor context selected by composition.
@@ -272,8 +270,6 @@ where
     fn session_error(error: impl std::fmt::Display) -> M::Error;
     /// Preserves an owned native/session cause across the prediction error domain.
     fn session_failure(error: eredu_core::BackendFailure) -> M::Error;
-    /// Drains native component telemetry.
-    fn take_telemetry() -> Result<Self::Telemetry, M::Error>;
 }
 
 use eredu_core::speculative::embedded::EmbeddedPredictionOperators;
@@ -283,10 +279,11 @@ use eredu_nn::Tensor as _;
 pub struct PortableEmbeddedExecutor<M>(std::marker::PhantomData<fn() -> M>);
 
 impl<M: EmbeddedPredictionOperators> GenerationExecutorTypes for PortableEmbeddedExecutor<M> {
+    type Binding = ();
     type Logits = M::Logits;
     type Context<'a> = crate::capture::SpeculativeContextFor<'a, M::Capture>;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
+    type Telemetry = ();
     type Error = M::Error;
 
     fn erased_type_mismatch(value: &'static str) -> Self::Error {
@@ -369,7 +366,8 @@ where
     }
 
     fn sequence_len(value: &M::Tensor) -> Result<usize, M::Error> {
-        M::sequence_len(value)
+        eredu_nn::sequence::length(value)
+            .map_err(|error| M::failure(eredu_core::BackendFailure::from_error(error)))
     }
 
     fn logits_row<'a>(
@@ -385,7 +383,8 @@ where
         row: usize,
         context: Self::Context<'a>,
     ) -> Result<M::Tensor, M::Error> {
-        M::tensor_row(value, row, context.target())
+        eredu_nn::sequence::row(value, row, true, context.target())
+            .map_err(|error| M::failure(eredu_core::BackendFailure::from_error(error)))
     }
 
     fn tensor_prefix<'a>(
@@ -393,7 +392,7 @@ where
         end: usize,
         context: Self::Context<'a>,
     ) -> Result<M::Tensor, M::Error> {
-        M::tensor_prefix(value, end, context.target())
+        Self::token_range(value, 0, end, context)
     }
 
     fn token_range<'a>(
@@ -402,7 +401,8 @@ where
         end: usize,
         context: Self::Context<'a>,
     ) -> Result<M::Tensor, M::Error> {
-        M::token_range(value, start, end, context.target())
+        eredu_nn::sequence::span(value, start..end, context.target())
+            .map_err(|error| M::failure(eredu_core::BackendFailure::from_error(error)))
     }
 
     fn token_prefix<'a>(
@@ -410,14 +410,14 @@ where
         end: usize,
         context: Self::Context<'a>,
     ) -> Result<M::Tensor, M::Error> {
-        M::token_range(value, 0, end, context.target())
+        Self::token_range(value, 0, end, context)
     }
 
     fn target_tokens<'a>(
         tokens: &[u32],
         context: Self::Context<'a>,
     ) -> Result<M::Tensor, M::Error> {
-        M::target_tokens(tokens, context.crosses_devices().then(|| context.target()))
+        M::target_tokens(tokens, context.target(), context.crosses_devices())
     }
 
     fn fused_logits_row<'a>(
@@ -457,7 +457,6 @@ where
     >,
     S: crate::state::PortableTextState<B, N::ModelCacheStorage>,
 {
-    type Telemetry = M::Telemetry;
     type ExecutorTypes = PortableEmbeddedExecutor<M>;
     type TargetState = super::PortablePredictionTargetState<B, N::ModelCacheStorage, N::Error>;
 
@@ -492,9 +491,5 @@ where
         error: eredu_core::BackendFailure,
     ) -> <M as SpeculativeTensorMechanisms>::Error {
         M::failure(error)
-    }
-
-    fn take_telemetry() -> Result<Self::Telemetry, <M as SpeculativeTensorMechanisms>::Error> {
-        M::take_telemetry()
     }
 }

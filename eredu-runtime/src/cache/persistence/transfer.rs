@@ -151,9 +151,11 @@ pub fn publish_prompt_cache(
             n.checked_add((inventory.blocks.len() + inventory.states.len()) as u64 * 4096)
         })
         .ok_or_else(|| invalid("cache staging byte overflow"))?;
+    options.check_publication()?;
     let mut publication = store.begin(reserved, options)?;
     let mut blocks = Vec::with_capacity(inventory.blocks.len());
     for (index, block) in inventory.blocks.iter().enumerate() {
+        options.check_publication()?;
         let shard = format!("block-{index:08}.safetensors");
         let names = prompt_cache_array_names(block.id.representation);
         let encoded = encode(
@@ -186,6 +188,7 @@ pub fn publish_prompt_cache(
     }
     let mut states = Vec::with_capacity(inventory.states.len());
     for (index, state) in inventory.states.iter().enumerate() {
+        options.check_publication()?;
         let shard = format!("state-{index:08}.safetensors");
         let encoded = encode(
             &[&state.tensor],
@@ -232,6 +235,7 @@ pub fn publish_prompt_cache(
         stream_frontiers,
     };
     manifest.validate_compatibility(&descriptor, prefix)?;
+    options.check_publication()?;
     publication.commit(&manifest)?;
     source.record_publication(payload);
     Ok(manifest)
@@ -278,26 +282,42 @@ impl<'a> PromptCacheRestore<'a> {
         target: &mut impl PromptCacheBlockRestore,
     ) -> Result<(), PromptCacheStoreError> {
         for block in &self.manifest().blocks {
-            let source = Arc::new(
-                RetainedCacheShard::from_block_reader(
-                    Path::new(&block.shard),
-                    self.read.open_shard(&block.shard)?,
-                    block,
-                )
-                .map_err(PromptCacheStoreError::from_error)?,
-            );
-            let pinned = !matches!(
-                block.representation,
-                CacheRepresentation::AppendStream { .. }
-            ) && block.end <= self.manifest().sink_tokens as i64;
-            if let Some(path) = self.read.shard_path(&block.shard) {
-                target.retain_block(block, pinned, source, path)
-            } else {
-                target.transfer_block(block, pinned, source.as_ref())
-            }
-            .map_err(PromptCacheStoreError::Storage)?;
+            self.restore_block(block, target)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn restore_block(
+        &self,
+        block: &PromptCacheBlock,
+        target: &mut impl PromptCacheBlockRestore,
+    ) -> Result<(), PromptCacheStoreError> {
+        let source = Arc::new(
+            RetainedCacheShard::from_block_reader(
+                Path::new(&block.shard),
+                self.read.open_shard(&block.shard)?,
+                block,
+            )
+            .map_err(PromptCacheStoreError::from_error)?,
+        );
+        let pinned = !matches!(
+            block.representation,
+            CacheRepresentation::AppendStream { .. }
+        ) && block.end <= self.manifest().sink_tokens as i64;
+        if let Some(path) = self.read.shard_path(&block.shard) {
+            target.retain_block(block, pinned, source, path)
+        } else {
+            target.transfer_block(block, pinned, source.as_ref())
+        }
+        .map_err(PromptCacheStoreError::Storage)
+    }
+
+    pub(crate) fn restore_state(
+        &self,
+        state: &PromptCacheStateTensor,
+        target: &mut impl PromptCacheStateRestore,
+    ) -> Result<(), PromptCacheStoreError> {
+        transfer_state(self.read, state, target)
     }
 }
 /// Restores fixed state from the same pinned generation; geometry and payload
@@ -313,17 +333,25 @@ pub fn restore_prompt_cache_states(
         ));
     }
     for state in &manifest.state_tensors {
-        let source = RetainedCacheShard::from_state_reader(
-            Path::new(&state.shard),
-            read.open_shard(&state.shard)?,
-            state,
-        )
-        .map_err(PromptCacheStoreError::from_error)?;
-        target
-            .transfer_state(state, &source)
-            .map_err(PromptCacheStoreError::Storage)?;
+        transfer_state(read, state, target)?;
     }
     Ok(())
+}
+
+fn transfer_state(
+    read: &dyn PromptCacheRead,
+    state: &PromptCacheStateTensor,
+    target: &mut impl PromptCacheStateRestore,
+) -> Result<(), PromptCacheStoreError> {
+    let source = RetainedCacheShard::from_state_reader(
+        Path::new(&state.shard),
+        read.open_shard(&state.shard)?,
+        state,
+    )
+    .map_err(PromptCacheStoreError::from_error)?;
+    target
+        .transfer_state(state, &source)
+        .map_err(PromptCacheStoreError::Storage)
 }
 
 /// Applies canonical rank scoping without exposing store-medium decisions to a
@@ -333,17 +361,17 @@ pub(crate) fn with_rank_prompt_cache_store<T>(
     topology: &eredu_core::cache::PromptCacheTopology,
     operation: impl FnOnce(&dyn PromptCacheStore) -> T,
 ) -> T {
-    let scoped = store.directory().map(|root| {
-        super::DirectoryPromptCacheStore::new(
-            super::prompt_cache_rank_path(root, topology),
-            store.max_bytes(),
-        )
-    });
-    operation(
-        scoped
-            .as_ref()
-            .map_or(store, |store| store as &dyn PromptCacheStore),
-    )
+    let Some(root) = store
+        .directory()
+        .filter(|_| topology.cache_rank_identity().is_some())
+    else {
+        return operation(store);
+    };
+    let scoped = super::DirectoryPromptCacheStore::new(
+        super::prompt_cache_rank_path(root, topology),
+        store.max_bytes(),
+    );
+    operation(&scoped)
 }
 
 /// Portable staging/publication owner for the existing all-rank commit protocol.

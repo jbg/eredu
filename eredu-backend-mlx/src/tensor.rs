@@ -340,6 +340,10 @@ impl Tensor for MlxTensor {
     fn sign(&self, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::sign(self.as_array(), context))
     }
+    fn reciprocal_sqrt(&self, context: &Self::Context) -> Result<Self, Error> {
+        tensor(safemlx::ops::rsqrt(self.as_array(), context))
+    }
+
     fn sqrt(&self, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::sqrt(self.as_array(), context))
     }
@@ -963,6 +967,26 @@ impl Tensor for MlxTensor {
         }
     }
 
+    fn linear_f16_fused_accumulation(
+        input: &Self,
+        weight: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        eredu_nn::arithmetic::linear_binary16_lanes(
+            input,
+            weight,
+            context,
+            |x, y, lanes, stream| {
+                tensor(crate::backend::nn::arithmetic::fused_binary16_lane(
+                    x.as_array(),
+                    y.as_array(),
+                    lanes.as_array(),
+                    stream,
+                ))
+            },
+        )
+    }
+
     fn layer_norm(
         input: &Self,
         weight: Option<&Self>,
@@ -971,12 +995,13 @@ impl Tensor for MlxTensor {
         arithmetic: eredu_nn::LayerNormalizationArithmetic,
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        if arithmetic == eredu_nn::LayerNormalizationArithmetic::CascadedMoments {
-            return tensor(crate::backend::nn::normalization::cascaded_layer_norm(
+        if arithmetic != eredu_nn::LayerNormalizationArithmetic::Native {
+            return tensor(crate::backend::nn::normalization::ordered_layer_norm(
                 input.as_array(),
                 weight.map(MlxTensor::as_array),
                 bias.map(MlxTensor::as_array),
                 epsilon,
+                arithmetic,
                 context,
             ));
         }
@@ -1068,29 +1093,27 @@ impl Tensor for MlxTensor {
                 let half = backend(concatenate_axis(&axis_angles, -1, context))?;
                 backend(concatenate_axis(&[half.clone(), half], -1, context))?
             }
-            MultiAxisRotaryLayout::RoundRobinSections => {
+            MultiAxisRotaryLayout::RoundRobinSections
+            | MultiAxisRotaryLayout::RoundRobinSectionsWithZeroOverflow => {
                 let half = dimensions / 2;
-                let axis_count = spec.axes.len();
                 let mut selected = Vec::with_capacity(half as usize);
                 for frequency in 0..half {
-                    let candidate = frequency as usize % axis_count;
-                    let section = spec.axes[candidate].dimensions / 2;
-                    let axis = if candidate != 0 && frequency < section * axis_count as i32 {
-                        candidate
-                    } else {
-                        0
+                    let value = match spec.round_robin_axis(frequency as usize) {
+                        Some(axis) => {
+                            let lane =
+                                backend(positions.try_index_device((.., axis as i32), context))?;
+                            let lane = backend(
+                                lane.add(Array::from_int(spec.axes[axis].position_offset), context),
+                            )?;
+                            backend(maximum(
+                                lane,
+                                Array::from_int(spec.minimum_position),
+                                context,
+                            ))?
+                        }
+                        None => MlxTensor::full_i32(0, &[rows], context)?.into_array(),
                     };
-                    let positions =
-                        backend(positions.try_index_device((.., axis as i32), context))?;
-                    let positions = backend(
-                        positions.add(Array::from_int(spec.axes[axis].position_offset), context),
-                    )?;
-                    let positions = backend(maximum(
-                        positions,
-                        Array::from_int(spec.minimum_position),
-                        context,
-                    ))?;
-                    selected.push(backend(positions.expand_dims(-1, context))?);
+                    selected.push(backend(value.expand_dims(-1, context))?);
                 }
                 let selected = backend(concatenate_axis(&selected, -1, context))?;
                 let inv = (0..half)

@@ -857,8 +857,9 @@ where
     }
 
     fn hold_fork_retention(
+        context: &Context<B>,
         retention: SnapshotRetainedGrowth,
-    ) -> Result<impl Sized, BackendFailure> {
-        H::hold_fork_retention(retention)
+    ) -> Result<impl Sized + 'static + use<B, H>, BackendFailure> {
+        H::hold_fork_retention(context, retention)
     }
 }

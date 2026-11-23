@@ -272,21 +272,19 @@ impl<M: PoolingCacheStorage> PoolingCache<M> {
         stream: &Queue<M>,
     ) -> Result<Option<Storage<M>>, PoolingStateError> {
         let pooled_tokens = self.pooled_tokens();
-        if pooled_tokens == 0 || query_tokens == 1 {
+        if pooled_tokens == 0 {
             return Ok(None);
         }
-        let first_end = offset
-            .checked_add(1)
-            .ok_or_else(|| invalid("pooling query offset overflowed"))?;
-        let last_end = first_end
-            .checked_add(query_tokens)
-            .ok_or_else(|| invalid("pooling query extent overflowed"))?;
-        Ok(Some(M::pooled_visibility(
-            first_end..last_end,
+        let geometry = eredu_nn::attention_mask::PooledWindowVisibility::new(
+            query_tokens,
+            offset,
             pooled_tokens,
             self.ratio,
-            stream,
-        )?))
+        )?;
+        if query_tokens == 1 && geometry.all_keys_visible() {
+            return Ok(None);
+        }
+        Ok(Some(M::pooled_visibility(geometry, stream)?))
     }
 
     /// Clears all complete and partial compressed state.

@@ -946,7 +946,15 @@ pub fn select_speculative_realization(
             issues.push(format!("missing speculative mechanism {mechanism:?}"));
         }
     }
-    if let Some(mechanism) = request.placement.required_mechanism() {
+    // Independent external models exchange committed token IDs and score rows.
+    // Their split placement carries no target-feature tensor handoff.
+    let independent = requirements.strategy.class == SpeculativeStrategyClass::External
+        && requirements.capture.entries().is_empty();
+    if let Some(mechanism) = request
+        .placement
+        .required_mechanism()
+        .filter(|_| !independent)
+    {
         if !capabilities.supports(mechanism) {
             issues.push(format!(
                 "placement {:?} requires speculative mechanism {mechanism:?}",

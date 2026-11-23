@@ -37,14 +37,13 @@ impl StateSnapshotMemoryCosts {
 
     /// Native bytes to retain and copy one tensor with the supplied shape rank.
     pub fn tensor_bytes(&self, payload: u64, dimensions: usize) -> Option<u64> {
-        payload
-            .checked_mul(self.copy_buffers)?
-            .checked_add(self.array_metadata)?
-            .checked_add(
-                u64::try_from(dimensions)
-                    .ok()?
-                    .checked_mul(self.dimension_metadata)?,
-            )
+        eredu_core::cache::mechanisms::CacheSnapshotTensorCosts {
+            tensor_metadata: self.array_metadata,
+            dimension_metadata: self.dimension_metadata,
+            copy_buffers: self.copy_buffers,
+            floating_width: self.floating_width,
+        }
+        .bytes(payload, dimensions)
     }
 
     /// Accounts for all declared slots and the exact retained native backing.

@@ -327,12 +327,10 @@ impl<Dispatch> eredu_core::input::PlainTextTokens<Array> for MlxBackend<'_, Disp
 impl<'a, Dispatch> eredu_core::backend::TextSessionNative<MlxBackend<'a, Dispatch>>
     for MlxSessionMechanisms
 {
+    type Generation = eredu_core::backend::AdvancedTextGeneration;
     type Target = crate::backend::MlxPreparedTarget;
     type Communication = MlxDistributedSession;
-
-    fn native_memory() -> eredu_core::capability::NativeMemoryFacts {
-        super::super::capability::native_memory_facts()
-    }
+    type LocalCollector<'s> = super::bounded_capture::NativeCapture<'s>;
 
     fn check_native_health(&self) -> Result<(), Error> {
         self.ensure_healthy()
@@ -494,8 +492,8 @@ impl<'a, Dispatch> eredu_core::backend::TextSamplingNative<MlxBackend<'a, Dispat
 {
     type SamplingCompletion = MlxTextCompletion;
 
-    type Sampling = MlxSamplingBackend;
-    type SamplingError = Exception;
+    type ScoreRow = MlxTensor;
+    type Sample = MlxTensor;
     type SamplingScope = super::recovery::ResourceOperation;
 
     fn begin_sampling(completion: &MlxSessionCompletion) -> Result<Self::SamplingScope, Error> {
@@ -545,6 +543,13 @@ impl<'a, Dispatch> eredu_core::backend::TextSamplingNative<MlxBackend<'a, Dispat
     }
 }
 
+impl<'a, Dispatch> eredu_core::backend::DeviceTextSampling<MlxBackend<'a, Dispatch>>
+    for MlxSessionMechanisms
+{
+    type Sampling = MlxSamplingBackend;
+    type SamplingError = Exception;
+}
+
 impl<Dispatch> eredu_core::sampling::SeededRandomKey for MlxBackend<'_, Dispatch> {
     type Key = RandomState;
 
@@ -588,7 +593,7 @@ impl<Dispatch> eredu_core::backend::TextMediaNative<MlxBackend<'_, Dispatch>>
 {
     type ProcessorScope = crate::composition::mlx::processor::MlxProcessorScope;
 
-    fn begin_processor() -> Result<Self::ProcessorScope, Error> {
+    fn begin_processor(&self) -> Result<Self::ProcessorScope, Error> {
         Self::ProcessorScope::begin()
     }
 }

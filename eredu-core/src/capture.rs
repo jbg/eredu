@@ -5,7 +5,10 @@
 //! allocation ceiling is a separate capability and must never be inferred from these
 //! logical bounds. Backends must reserve before retaining or materializing a value.
 
+/// Host reductions and score transformations.
+pub mod host;
 mod workspace;
+
 pub use workspace::{CaptureWorkspaceModel, RoutedCaptureWorkspace};
 
 use serde::{Deserialize, Serialize};
@@ -1642,6 +1645,28 @@ pub struct PartitionCaptureNativeEstimate {
     pub generated_creation_bytes: u64,
 }
 
+/// Type erasure for a speculative invocation, independent of collector availability.
+pub trait SpeculativeCaptureTypes {
+    /// Native queue and dependency types.
+    type Queues: crate::speculative::SpeculativeQueueMechanisms;
+    /// Native transport type.
+    type Transport;
+    /// Tensor seen by the invocation observer.
+    type InvocationTensor;
+    /// Error seen by the invocation observer.
+    type ObserverError;
+    /// Retained score handle.
+    type Scores;
+}
+
+impl<P: SpeculativeCapturePrimitives> SpeculativeCaptureTypes for P {
+    type Queues = P::Queues;
+    type Transport = P::Transport;
+    type InvocationTensor = P::InvocationTensor;
+    type ObserverError = P::ObserverError;
+    type Scores = P::Scores;
+}
+
 /// Native transformation primitives used by the portable speculative observer.
 pub trait SpeculativeCapturePrimitives: CaptureWorkspace + 'static {
     /// Queue identity and dependency submission for this invocation.
@@ -1691,6 +1716,15 @@ pub trait SpeculativeCapturePrimitives: CaptureWorkspace + 'static {
 pub trait CaptureWorkspace {
     /// Returns native size limits, retained storage costs, and scratch bounds.
     fn capture_workspace() -> CaptureWorkspaceModel;
+
+    /// Prices the selected transformation, including any host staging.
+    fn estimate_capture(
+        source: &[u64],
+        selection: &CaptureSelection,
+        slice: &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Self::capture_workspace().estimate(source, selection, slice)
+    }
 }
 
 /// Native intervention support and exact retained transport for capture.

@@ -206,11 +206,11 @@ impl<C: PipelineCommunication>
     fn pipeline_mechanisms(
         &self,
         groups: Vec<crate::backend::runtime::distributed::Group>,
-    ) -> (Self::PipelineAllocator, Self::PipelineExecution) {
-        (
+    ) -> Result<(Self::PipelineAllocator, Self::PipelineExecution), BackendFailure> {
+        Ok((
             crate::backend::runtime::distributed::boundary::MlxPartitionTensorAllocator,
             MlxPipelineMechanisms { groups },
-        )
+        ))
     }
 }
 
@@ -230,11 +230,16 @@ impl eredu_core::realtime_mechanisms::RealtimeGraphResources for MlxComponentBin
         &self.execution
     }
 
-    fn open_input_recovery() -> Result<impl Sized, BackendFailure> {
+    fn open_input_recovery(
+        _context: &Stream,
+    ) -> Result<impl Sized + 'static + use<>, BackendFailure> {
         Recovery::begin(Vec::<safemlx::Array>::new()).map_err(failure)
     }
 
-    fn hold_fork_retention(retention: SnapshotRetention) -> Result<impl Sized, BackendFailure> {
+    fn hold_fork_retention(
+        _context: &Stream,
+        retention: SnapshotRetention,
+    ) -> Result<impl Sized + 'static + use<>, BackendFailure> {
         Recovery::begin(retention).map_err(failure)
     }
 }
@@ -257,7 +262,8 @@ impl eredu_core::checkpoint_mechanisms::CheckpointEncodingMaterializer for MlxCo
         recipe: eredu_checkpoint::recipe::DerivedWeightRecipe,
         source: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<eredu_checkpoint::recipe::DerivedWeightRecipe, BackendFailure> {
-        crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
+        recipe
+            .lower_mxfp4_words(source)
             .map_err(BackendFailure::from_error)
     }
 

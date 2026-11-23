@@ -74,8 +74,8 @@ pub struct ConditionedAssistantMemoryProfile {
     pub topology: ConditionedPredictionTopology,
     /// Authoritative parameter/allocator observations; conversion payload is included once.
     pub parameters: eredu_core::speculative::SpeculativeParameterMemoryObservation,
-    /// Whether native execution consumes the host pool.
-    pub host_execution: bool,
+    /// Retained assistant execution and allocator placement.
+    pub placement: eredu_core::capability::ExecutionMemoryPlacement,
     /// Selected immutable parameter policy.
     pub residency: crate::LayerWeightResidency,
     /// Complete managed-pool bounds from retained exact units and native host
@@ -160,7 +160,7 @@ impl ConditionedAssistantMemoryProfile {
         if let Some(loading) = &self.parameter_loading {
             loading.validate()?;
         }
-        let mut parameters = self.parameters.parameters;
+        let parameters = self.parameters.parameters;
         if let Some(bounds) = &self.parameter_bounds {
             if bounds.residency() != self.residency {
                 return Err(invalid(
@@ -189,36 +189,21 @@ impl ConditionedAssistantMemoryProfile {
                 }
             }
         }
-        let unified = parameters.physical_semantics == eredu_core::PhysicalMemorySemantics::Unified;
-        if self.host_execution {
-            parameters.physical_semantics = eredu_core::PhysicalMemorySemantics::Unified;
-        }
-        let separate =
-            parameters.physical_semantics == eredu_core::PhysicalMemorySemantics::SeparateTiers;
-        let execution_domain = if self.host_execution && !unified {
-            MemoryDomain::Host
-        } else if separate {
-            MemoryDomain::Device("default".into())
-        } else {
-            MemoryDomain::Unified
-        };
+        let (execution_domain, placements) =
+            static_parameter_placement(&parameters, &self.placement, None)?;
         let overhead = options.backend_overhead.clone().unwrap_or_else(|| {
-            match (
-                self.parameters.allocator_cache_limit.value(),
-                parameters.backend_allocator_cache_bytes.value(),
-            ) {
-                (Some(&limit), Some(&retained)) => {
-                    options.calibration.allocator_overhead(limit, retained)
-                }
-                _ => MemoryBytes::unknown("assistant allocator policy or retention unavailable"),
-            }
+            options.calibration.allocator_overhead_from_counters(
+                &self.parameters.allocator_cache_limit,
+                &parameters.backend_allocator_cache_bytes,
+            )
         });
         let mut domains = Vec::new();
-        for (mut domain, mut resident) in static_parameter_placement(&parameters, None)? {
-            let parameter_domain = domain.clone();
-            if self.host_execution && !unified {
-                domain = MemoryDomain::Host;
-            }
+        for (domain, mut resident) in placements {
+            let parameter_domain = if self.placement.host_execution {
+                MemoryDomain::Unified
+            } else {
+                domain.clone()
+            };
             let baseline = resident.lower_bytes;
             if !self.residency.is_fully_resident() {
                 resident.upper_bytes = match &self.parameter_bounds {
@@ -262,19 +247,7 @@ impl ConditionedAssistantMemoryProfile {
                 resident.upper_bytes = None;
             }
             let executes = domain == execution_domain;
-            let mut budget = if executes {
-                options.budget.clone()
-            } else {
-                options.host_budget.clone()
-            };
-            if budget.available_bytes.is_none() && (!separate || !executes) {
-                budget.available_bytes = self
-                    .parameters
-                    .available
-                    .available_memory_bytes
-                    .value()
-                    .copied();
-            }
+            let budget = options.pool_budget(&self.parameters.available, &domain, executes);
             domains.push(DomainMemoryPlan {
                 domain,
                 resident_parameters: resident,

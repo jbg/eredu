@@ -1,17 +1,15 @@
 //! Portable forecasting over installed executable facts and native memory observations.
 
 use eredu_core::{
-    capability::{
-        NativeAllocatorObservations, NativeExecutionMemory, NativeMemoryFacts,
-        NativeWorkspaceEstimate,
-    },
+    capability::{NativeExecutionMemory, NativeWorkspaceEstimate, ParameterMemoryFacts},
     capture::CaptureWorkspace,
 };
 
 use super::TextExecutable;
 use super::{
     capability::{
-        static_memory_from_residency_and_components, BankMemoryFacts, TextCapabilityMechanisms,
+        installed_parameter_memory, static_memory_from_residency_and_components,
+        TextCapabilityMechanisms,
     },
     InstalledTextState, TextPromptFor, TextSessionDriver,
 };
@@ -20,7 +18,7 @@ use crate::memory_estimation::{LogitsWorkspace, MemoryBytes};
 use crate::memory_forecast::*;
 use eredu_core::{
     backend::TextOperationDriver, BackendFailure, CapabilityError, ModelCapabilitySession,
-    ModelRuntime, Observed, TextGenerationBackend,
+    ModelRuntime, TextGenerationBackend,
 };
 
 fn workspace_bytes(estimate: NativeWorkspaceEstimate) -> MemoryBytes {
@@ -29,8 +27,6 @@ fn workspace_bytes(estimate: NativeWorkspaceEstimate) -> MemoryBytes {
 
 /// Retained facts of a separately loaded speculative drafter.
 pub trait DraftForecastFacts {
-    /// Realized placement topology.
-    fn forecast_topology(&self) -> eredu_core::SpeculativeExecutionTopology;
     /// Retained proposal limit.
     fn forecast_proposal_capacity(&self) -> u64;
     /// Projection for a conditioned assistant, when selected.
@@ -38,26 +34,44 @@ pub trait DraftForecastFacts {
         &self,
     ) -> Result<Option<ConditionedAssistantMemoryProfile>, GenerationForecastError>;
     /// Projection for an independent decoder, when selected.
-    fn independent_forecast(
-        &self,
-    ) -> Result<Option<IndependentDraftMemoryFacts>, GenerationForecastError>;
+    fn independent_forecast(&self) -> Result<Option<LoadedMemoryProfile>, GenerationForecastError>;
 }
 
-/// Observations for the independent draft's own executable and placement.
-pub struct IndependentDraftMemoryFacts {
-    /// Retained state and workspace geometry.
-    pub geometry: LoadedMemoryGeometry,
-    /// Ordinary weight residency.
-    pub residency: Option<crate::ResidencyReport>,
-    /// Separately owned parameter bank storage.
-    pub banks: Vec<BankMemoryFacts>,
-    /// Native allocator counters and physical pool relationship.
-    pub native: NativeMemoryFacts,
-    /// Whether the draft executes on the host.
-    pub host_execution: bool,
+/// Projects an independent decoder from its own executable and retained queue.
+pub(crate) fn independent_draft_profile<E: eredu_core::backend::TextExecutableTypes>(
+    model: &dyn crate::speculative::IndependentDraftModel<E>,
+    memory: ParameterMemoryFacts,
+) -> Result<LoadedMemoryProfile, GenerationForecastError> {
+    let model_exec = model.executable();
+    let residency = model_exec
+        .residency_report()
+        .map_err(BackendFailure::from_error)?;
+    let geometry = model.memory_geometry(residency.as_ref())?;
+    let parameter_conversions = residency
+        .as_ref()
+        .and_then(|report| report.device_parameter_conversions().map(<[_]>::to_vec));
+    let banks = super::capability::bank_memory_facts(
+        model_exec
+            .parameter_bank_report()
+            .map_err(BackendFailure::from_error)?,
+    );
+    let parameters = static_memory_from_residency_and_components(
+        residency,
+        std::iter::empty(),
+        banks,
+        memory.native,
+    )?;
+    Ok(LoadedMemoryProfile {
+        geometry,
+        parameter_conversions,
+        parameters,
+        available: memory.available,
+        placement: memory.placement,
+        allocator_cache_limit: memory.allocator_cache_limit,
+    })
 }
 
-impl<B, N> GenerationForecastSession<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> GenerationForecastSession<B> for TextSessionDriver<N::Resources, N, G>
 where
     Self: TextOperationDriver<B, Prompt = TextPromptFor<B>>,
     B: TextGenerationBackend + eredu_core::input::PlainTextTokens<B::InputTensor>,
@@ -68,13 +82,25 @@ where
         runtime: &ModelRuntime<B, Self>,
         policy: Option<eredu_core::refinement::RefinementPolicy>,
     ) -> Result<Option<crate::memory_forecast::RefinementMemoryPlan>, GenerationForecastError> {
-        let model = runtime.session().resources().model.as_ref();
+        let session = runtime.session();
+        if !session.supports_block_refinement() {
+            return Ok(None);
+        }
+        let model = session.resources().model.as_ref();
+        let mut workspace = N::refinement_workspace();
+        if session.native().supports_host_refinement() {
+            // Full host readback, retained rows, confidence, draws and the next score
+            // matrix are simultaneously live during the portable refinement transition.
+            workspace.upper = workspace.upper.saturating_add(64);
+            workspace.evidence =
+                "native score staging plus portable host refinement working storage";
+        }
         Ok(model.block_refinement_geometry().map(|geometry| {
             crate::memory_forecast::RefinementMemoryPlan {
                 canvas_positions: geometry.canvas_length,
                 vocabulary_size: geometry.vocabulary_size,
                 stability_history: policy.unwrap_or_default().stability_history_length(),
-                bytes_per_vocabulary_entry: workspace_bytes(N::refinement_workspace()),
+                bytes_per_vocabulary_entry: workspace_bytes(workspace),
             }
         }))
     }
@@ -100,7 +126,7 @@ where
             auxiliary_bytes_per_position: crate::memory_estimation::MemoryBytes::exact(0),
             sampling_bytes_per_vocabulary_entry: workspace_bytes(N::sampling_workspace()),
             proposal_capacity: policy.proposal_capacity().get() as u64,
-            shared_allocator: N::shares_allocator(),
+            shared_allocator: false,
         }))
     }
 
@@ -125,9 +151,7 @@ where
                 if selection.path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
                     return Ok(None);
                 }
-                N::capture_workspace()
-                    .estimate(shape, selection, slice)
-                    .map(Some)
+                N::estimate_capture(shape, selection, slice).map(Some)
             },
         )
         .map_err(|e| CapabilityError::Observation(e.to_string()).into())
@@ -140,7 +164,7 @@ where
     fn loaded_memory_profile(
         runtime: &ModelRuntime<B, Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-        memory_profile::<B, N>(runtime, false)
+        memory_profile::<B, N, G>(runtime, false)
     }
 
     fn forecast_execution_contract(
@@ -184,14 +208,14 @@ where
     }
 }
 
-fn memory_profile<B, N>(
-    runtime: &ModelRuntime<B, TextSessionDriver<N::Resources, N>>,
+fn memory_profile<B, N, G>(
+    runtime: &ModelRuntime<B, TextSessionDriver<N::Resources, N, G>>,
     continuation: bool,
 ) -> Result<LoadedMemoryProfile, GenerationForecastError>
 where
     B: TextGenerationBackend,
     N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + CaptureWorkspace,
-    TextSessionDriver<N::Resources, N>: ModelCapabilitySession<B>,
+    TextSessionDriver<N::Resources, N, G>: ModelCapabilitySession<B>,
 {
     let session = runtime.session();
     let mut geometry = session
@@ -214,16 +238,12 @@ where
         geometry.execution_topology = None;
         geometry.assumptions.push("existing or unavailable session state is not projected; reset before forecasting a fresh request".into());
     }
-    let host_execution =
-        N::host_execution(runtime.backend()).map_err(BackendFailure::from_error)?;
-    let allocator_cache_limit = N::Allocator::allocator_cache_limit();
-    if let Observed::Available { source, .. } = &allocator_cache_limit {
-        geometry.assumptions.push(source.clone());
-    }
-    let parameters = TextSessionDriver::<N::Resources, N>::static_memory(runtime)?;
+    let memory = N::placement_memory(runtime.backend())?;
     let residency = session
         .residency_report()
         .map_err(BackendFailure::from_error)?;
+    let parameters =
+        installed_parameter_memory::<B, N, G>(session, residency.clone(), memory.native)?;
     geometry.apply_resident_storage(
         N::control_transport(&session.resources().retained).is_none()
             && session.parameter_overlay_identity().is_none(),
@@ -235,12 +255,12 @@ where
         parameter_conversions,
         geometry,
         parameters,
-        available: N::Allocator::available_memory()?,
-        host_execution,
-        allocator_cache_limit,
+        available: memory.available,
+        placement: memory.placement,
+        allocator_cache_limit: memory.allocator_cache_limit,
     })
 }
-impl<B, N> ContinuationForecastSession<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> ContinuationForecastSession<B> for TextSessionDriver<N::Resources, N, G>
 where
     Self: TextOperationDriver<B, Prompt = TextPromptFor<B>>,
     B: TextGenerationBackend + eredu_core::input::PlainTextTokens<B::InputTensor>,
@@ -281,7 +301,7 @@ where
         let growth = state.estimate_installed_growth(additional_input_tokens);
         let peak = growth.and_then(|n| current.retained_bytes.checked_add(n));
         Ok(Some(crate::memory_forecast::ContinuationMemoryProfile {
-            loaded: memory_profile::<B, N>(runtime, true)?,
+            loaded: memory_profile::<B, N, G>(runtime, true)?,
             plan: crate::memory_forecast::ContinuationMemoryPlan {
                 current_positions: position,
                 additional_input_tokens,
@@ -311,7 +331,7 @@ where
         }))
     }
 }
-impl<B, N, D> SpeculativeForecastSession<B, D> for TextSessionDriver<N::Resources, N>
+impl<B, N, G, D> SpeculativeForecastSession<B, D> for TextSessionDriver<N::Resources, N, G>
 where
     Self: TextOperationDriver<B, Prompt = TextPromptFor<B>>,
     B: TextGenerationBackend + eredu_core::input::PlainTextTokens<B::InputTensor>,
@@ -324,7 +344,7 @@ where
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
         // Independent speculative lanes realize isolated caches. Retain selected
         // geometry even when an unrelated ordinary session has advanced.
-        memory_profile::<B, N>(runtime, true)
+        memory_profile::<B, N, G>(runtime, true)
     }
 
     fn speculative_memory_profile(
@@ -346,7 +366,7 @@ where
                 auxiliary_bytes_per_position: crate::memory_estimation::MemoryBytes::exact(0),
                 sampling_bytes_per_vocabulary_entry: workspace_bytes(N::sampling_workspace()),
                 proposal_capacity: 0,
-                shared_allocator: N::shares_allocator(),
+                shared_allocator: false,
             }));
         }
         if matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone) {
@@ -376,43 +396,23 @@ where
                 auxiliary_bytes_per_position: crate::memory_estimation::MemoryBytes::exact(0),
                 sampling_bytes_per_vocabulary_entry: workspace_bytes(N::sampling_workspace()),
                 proposal_capacity: topology.proposal_capacity as u64,
-                shared_allocator: N::shares_allocator(),
+                shared_allocator: false,
             }));
         };
-        let target = Self::loaded_memory_profile(runtime)?;
-        if drafter.forecast_topology() == eredu_core::SpeculativeExecutionTopology::CrossDeviceSplit
-            && target.parameters.physical_semantics != eredu_core::PhysicalMemorySemantics::Unified
-        {
-            // Cross-device copies need exact separate-pool identities/placement.
-            return Ok(None);
-        }
         let conditioned = drafter.conditioned_forecast()?;
-        let draft = drafter
-            .independent_forecast()?
-            .map(|facts| {
-                let parameter_conversions = facts
-                    .residency
-                    .as_ref()
-                    .and_then(|report| report.device_parameter_conversions().map(<[_]>::to_vec));
-                let parameters = static_memory_from_residency_and_components(
-                    facts.residency,
-                    std::iter::empty(),
-                    facts.banks,
-                    facts.native,
-                )?;
-                Ok::<_, GenerationForecastError>(LoadedMemoryProfile {
-                    geometry: facts.geometry,
-                    parameter_conversions,
-                    parameters,
-                    host_execution: facts.host_execution,
-                    ..target
-                })
-            })
-            .transpose()?;
+        let draft = drafter.independent_forecast()?;
         if draft.is_none() && conditioned.is_none() {
             // This selected assistant has no retained architecture resource projection.
             return Ok(None);
         }
+        let target = N::placement_memory(runtime.backend())?;
+        let draft_placement = draft
+            .as_ref()
+            .map(|profile| &profile.placement)
+            .or_else(|| conditioned.as_ref().map(|profile| &profile.placement));
+        let shared_allocator = target.placement.allocator.as_ref().is_some_and(|id| {
+            draft_placement.and_then(|placement| placement.allocator.as_ref()) == Some(id)
+        });
         Ok(Some(crate::memory_forecast::SpeculativeMemoryProfile {
             conditioned,
             refinement: Self::refinement_memory_plan(runtime, None)?,
@@ -423,7 +423,7 @@ where
             auxiliary_bytes_per_position: crate::memory_estimation::MemoryBytes::exact(0),
             sampling_bytes_per_vocabulary_entry: workspace_bytes(N::sampling_workspace()),
             proposal_capacity: drafter.forecast_proposal_capacity(),
-            shared_allocator: N::shares_allocator(),
+            shared_allocator,
         }))
     }
 }

@@ -27,7 +27,6 @@ mod prediction;
 mod session;
 
 pub(crate) use capability::GROUPED_OPERATION_CAPABILITIES;
-pub(super) use capability::*;
 pub(super) use lowering::*;
 pub(super) use prediction::*;
 pub(super) use session::binding::*;

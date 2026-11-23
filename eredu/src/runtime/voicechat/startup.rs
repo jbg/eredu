@@ -12,8 +12,10 @@ use eredu_architectures::voicechat::{
     state::NeuralStateGeometryError,
     tts_prompt::PreparedTtsPrompt,
 };
-use eredu_core::realtime_mechanisms::{RealtimeQueue, RealtimeStartupMechanisms};
-use eredu_core::{BackendFailure, RealtimeDecisionDiagnostics};
+use eredu_core::realtime_mechanisms::{RealtimeQueue, SpeechRealtimeNative};
+use eredu_core::{
+    sampling::host_random::HostRandomState, BackendFailure, RealtimeDecisionDiagnostics,
+};
 use eredu_nn::{RetainedTensorRoots, Tensor, TensorElementType};
 use eredu_runtime::{
     JointRealtimeState, JointStateError, RealtimeCopyLimits, SelectedStateRealization,
@@ -87,8 +89,8 @@ impl<T> RetainedTensorRoots<T> for Silence<T> {
 type SessionGeneration<T, M> = Generation<
     T,
     SpeechRealtimeState<M>,
-    <M as RealtimeStartupMechanisms>::Random,
-    <M as RealtimeStartupMechanisms>::Completion,
+    HostRandomState,
+    <<M as SpeechRealtimeNative>::Queue as RealtimeQueue>::Completion,
 >;
 
 impl PreparedVoiceChatSession<'_> {
@@ -175,9 +177,7 @@ impl PreparedVoiceChatSession<'_> {
             mechanisms.state_copy_queue(),
             selection.copy_limits,
         )?;
-        let random = mechanisms
-            .realize_random(selection.seed)
-            .map_err(VoiceChatStartError::Backend)?;
+        let random = HostRandomState::with_seed(selection.seed);
         let state = parts.generation.initialize(input, neural, random)?;
         Ok(BoundVoiceChatSession::start(
             state,

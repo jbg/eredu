@@ -31,7 +31,7 @@ impl DecoderDeclaration {
     ) -> Result<Self, Error> {
         config.validate_config()?;
         let layers = usize::try_from(config.num_hidden_layers()).map_err(Error::backend)?;
-        let statics = StaticModuleSpec::from_config(config).construction_specs()?;
+        let statics = StaticModuleSpec::construction_from_config(config)?;
         let blocks = (0..layers)
             .map(|layer| block(config, layer))
             .collect::<Result<Vec<_>, _>>()?;

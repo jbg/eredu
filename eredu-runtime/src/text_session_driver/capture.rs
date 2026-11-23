@@ -3,13 +3,11 @@
 use eredu_core::communication::CommunicationSessionIdentity;
 use std::{cell::OnceCell, sync::Arc};
 
-use eredu_core::{
-    capture::*,
-    intervention::{
-        AdmittedInterventionPlan, InterventionBackend, InterventionDiscovery, InterventionEstimator,
-    },
-    BackendFailure, Completion,
+#[cfg(feature = "tensor-capture")]
+use eredu_core::intervention::{
+    AdmittedInterventionPlan, InterventionDiscovery, InterventionEstimator,
 };
+use eredu_core::{capture::*, intervention::InterventionBackend, BackendFailure, Completion};
 
 use crate::{
     capture::{
@@ -298,11 +296,8 @@ where
     /// Projects intervention support for the exact installed model and collector.
     #[cfg(feature = "tensor-capture")]
     pub fn text_intervention_discovery(&self) -> Result<InterventionDiscovery, CaptureError> {
-        let prepared = self.model_discovery().ok_or_else(|| {
-            CaptureError::Unsupported("session has no retained intervention catalog".into())
-        })?;
         let mechanisms = N::intervention_mechanisms();
-        let mut discovery = prepared.intervention(&mechanisms)?;
+        let mut discovery = self.retained_intervention_discovery(&mechanisms)?;
         if let Some(partition) = self.loaded_partition_capture()? {
             discovery = crate::inspection::intervention_support(
                 discovery.points,
@@ -369,58 +364,6 @@ where
         }
         *slot = admitted;
         Ok(())
-    }
-
-    fn capture_frontier(&self) -> Result<u64, CaptureError> {
-        let frontier = self.resources().model.capture_frontier()?.ok_or_else(|| {
-            CaptureError::Unsupported("execution has no exact context frontier".into())
-        })?;
-        u64::try_from(frontier)
-            .map_err(|_| CaptureError::Invalid("negative context frontier".into()))
-    }
-
-    /// Invocation geometry for the next retained decoder or refinement operation.
-    pub fn text_capture_shape(
-        &self,
-        sequence: u64,
-    ) -> Result<CaptureInvocationShape, CaptureError> {
-        Ok(CaptureInvocationShape {
-            media: None,
-            batch: 1,
-            sequence,
-            context: Some(
-                self.capture_frontier()?
-                    .checked_add(sequence)
-                    .ok_or(CaptureError::Overflow)?,
-            ),
-        })
-    }
-
-    /// Maximum capture extent needed for the selected refinement run.
-    pub fn text_capture_invocation_bounds(
-        &self,
-        request: CaptureRequestShape,
-    ) -> Result<Option<CaptureInvocationBounds>, CaptureError> {
-        let Some(canvas) = self
-            .resources()
-            .model
-            .capture_canvas_length()
-            .map(u64::from)
-        else {
-            return Ok(None);
-        };
-        Ok(Some(CaptureInvocationBounds {
-            batch: request.batch,
-            max_sequence: request.prompt_tokens.max(canvas),
-            max_context: Some(
-                self.capture_frontier()?
-                    .checked_add(request.prompt_tokens)
-                    .and_then(|n| n.checked_add(request.max_predictions))
-                    .and_then(|n| n.checked_add(canvas))
-                    .ok_or(CaptureError::Overflow)?,
-            ),
-            max_predictions: request.max_predictions,
-        }))
     }
 
     /// Prepares the local or partitioned observer against the retained provenance.
@@ -491,4 +434,77 @@ fn estimate_partition_workspace<T: 'static, N: CaptureTensorOperations<T>>(
         capture: N::capture_workspace().estimate(shape, selection, slice)?,
         generated_creation_bytes: N::generated_creation_bytes(shape)?,
     })
+}
+
+#[cfg(feature = "tensor-capture")]
+impl<R: 'static, N, Generation> TextSessionDriver<R, N, Generation> {
+    pub(super) fn retained_intervention_discovery(
+        &self,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+    ) -> Result<InterventionDiscovery, CaptureError> {
+        let prepared = self.model_discovery().ok_or_else(|| {
+            CaptureError::Unsupported("session has no retained intervention catalog".into())
+        })?;
+        let mut discovery = prepared.intervention(mechanisms)?;
+        discovery.session_identity = Some(self.intervention_identity().to_owned());
+        Ok(discovery)
+    }
+}
+
+impl<R, N, Model, Retained, Value, Processor, Generation> TextSessionDriver<R, N, Generation>
+where
+    R: std::ops::Deref<Target = TextSessionResources<Model, Retained, Value, Processor>> + 'static,
+    Model: TextCaptureGeometry,
+{
+    fn capture_frontier(&self) -> Result<u64, CaptureError> {
+        let frontier = self.resources().model.capture_frontier()?.ok_or_else(|| {
+            CaptureError::Unsupported("execution has no exact context frontier".into())
+        })?;
+        u64::try_from(frontier)
+            .map_err(|_| CaptureError::Invalid("negative context frontier".into()))
+    }
+
+    /// Invocation geometry for the next retained decoder or refinement operation.
+    pub fn text_capture_shape(
+        &self,
+        sequence: u64,
+    ) -> Result<CaptureInvocationShape, CaptureError> {
+        Ok(CaptureInvocationShape {
+            media: None,
+            batch: 1,
+            sequence,
+            context: Some(
+                self.capture_frontier()?
+                    .checked_add(sequence)
+                    .ok_or(CaptureError::Overflow)?,
+            ),
+        })
+    }
+
+    /// Maximum capture extent needed for the selected refinement run.
+    pub fn text_capture_invocation_bounds(
+        &self,
+        request: CaptureRequestShape,
+    ) -> Result<Option<CaptureInvocationBounds>, CaptureError> {
+        let Some(canvas) = self
+            .resources()
+            .model
+            .capture_canvas_length()
+            .map(u64::from)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CaptureInvocationBounds {
+            batch: request.batch,
+            max_sequence: request.prompt_tokens.max(canvas),
+            max_context: Some(
+                self.capture_frontier()?
+                    .checked_add(request.prompt_tokens)
+                    .and_then(|n| n.checked_add(request.max_predictions))
+                    .and_then(|n| n.checked_add(canvas))
+                    .ok_or(CaptureError::Overflow)?,
+            ),
+            max_predictions: request.max_predictions,
+        }))
+    }
 }

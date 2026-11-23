@@ -62,15 +62,23 @@ fn profile(cached: Observed<u64>, resident: u64) -> LoadedMemoryProfile {
             planned_disk_backed_bytes: Observed::exact(0, "resident"),
             backend_active_allocation_bytes: Observed::exact(999999, "unrelated global activity"),
             backend_allocator_cache_bytes: Observed::exact(0, "disabled"),
+            backend_device_allocated_bytes: eredu_core::Observed::unavailable(
+                "device total was not measured",
+            ),
             physical_semantics: PhysicalMemorySemantics::Unified,
             currently_cached_shards: Observed::exact(0, "none"),
         },
         available: AvailableMemory {
             physical_memory_bytes: Observed::exact(1 << 30, "fixture"),
             available_memory_bytes: Observed::exact(1 << 30, "fixture"),
+            device: None,
             physical_semantics: PhysicalMemorySemantics::Unified,
         },
-        host_execution: false,
+        placement: eredu_core::capability::ExecutionMemoryPlacement {
+            device: eredu_core::DevicePlan::new("mock", "gpu:0").unwrap(),
+            host_execution: false,
+            allocator: None,
+        },
         allocator_cache_limit: Observed::exact(0, "disabled"),
     }
 }

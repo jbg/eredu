@@ -60,10 +60,6 @@ where
     fn state_failure(error: BackendFailure) -> Self::NativeError {
         error.into()
     }
-
-    fn observe_state_allocation() {
-        F::observe_text_state_allocation();
-    }
 }
 
 impl<B, S, W, F> ReplicatedTextPrimitives<B> for TextRouteWeights<B, S, W, F>
@@ -92,7 +88,7 @@ where
     }
 
     fn parameter_memory_facts(&self) -> Result<Option<ParameterMemoryFacts>, Self::Error> {
-        F::text_parameter_memory()
+        F::text_parameter_memory(self.storage.unit_executor())
     }
 
     fn index_text_output(

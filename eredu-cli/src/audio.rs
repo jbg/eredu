@@ -18,10 +18,13 @@ use eredu::api::{
     },
 };
 
-use crate::{resolve_model, CachedGgufRole, CliDevice};
+use crate::{resolve_model, CachedGgufRole, CliBackend, CliDevice};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
+    /// Select the backend used for audio execution.
+    #[arg(long, global = true, value_enum)]
+    backend: Option<CliBackend>,
     /// Report audio timing statistics to stderr.
     #[arg(long, global = true)]
     timing: bool,
@@ -101,7 +104,7 @@ struct ModelArgs {
     /// Local model asset directory, required for split GGUF.
     #[arg(long)]
     assets: Option<PathBuf>,
-    /// Execution device: cpu or gpu:N.
+    /// Execution device: cpu, gpu:N, metal:N, or cuda:N.
     #[arg(long)]
     device: Option<CliDevice>,
     /// Maximum committed text tokens and speech frames in the response.
@@ -168,16 +171,51 @@ fn positive_seconds(value: &str) -> Result<f64, &'static str> {
     }
 }
 
-pub fn run(
-    factory: &(impl eredu::api::BackendInspection
-          + RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>),
-    args: Args,
+pub fn run(args: Args, total_started: Instant) -> Result<()> {
+    let Args {
+        backend,
+        timing,
+        command,
+    } = args;
+    match backend.unwrap_or_else(CliBackend::default_available) {
+        #[cfg(feature = "mlx")]
+        CliBackend::Mlx => run_with_factory(
+            |_| Ok(eredu::backends::MlxBackendFactory::default()),
+            command,
+            timing,
+            total_started,
+        ),
+        #[cfg(not(feature = "mlx"))]
+        CliBackend::Mlx => bail!("this build does not enable the MLX backend"),
+        #[cfg(feature = "candle")]
+        CliBackend::Candle => run_with_factory(
+            |device| {
+                let device = crate::candle_device(device)?;
+                Ok(eredu::backends::CandleBackendFactory::for_device(&device)?)
+            },
+            command,
+            timing,
+            total_started,
+        ),
+        #[cfg(not(feature = "candle"))]
+        CliBackend::Candle => bail!("this build does not enable the Candle backend"),
+    }
+}
+
+fn run_with_factory<F>(
+    create_factory: impl FnOnce(Option<crate::CliDevice>) -> Result<F>,
+    command: Command,
+    timing: bool,
     total_started: Instant,
-) -> Result<()> {
-    let Args { timing, command } = args;
+) -> Result<()>
+where
+    F: eredu::api::BackendInspection
+        + eredu_core::BackendHardware
+        + RealtimeBackendFactory<Mechanisms: MediaGraphMechanisms>,
+{
     match command {
         Command::Transcribe(args) => run_turn(
-            factory,
+            &create_factory(args.model.device)?,
             AudioTask::Transcribe,
             args.model,
             Some(args.input),
@@ -186,7 +224,7 @@ pub fn run(
             total_started,
         ),
         Command::Translate(args) => run_turn(
-            factory,
+            &create_factory(args.audio.model.device)?,
             AudioTask::Translate {
                 source_language: &args.source_language,
                 language: &args.language,
@@ -198,7 +236,7 @@ pub fn run(
             total_started,
         ),
         Command::Speak(args) => run_turn(
-            factory,
+            &create_factory(args.model.device)?,
             AudioTask::Speak { text: &args.text },
             args.model,
             None,
@@ -207,7 +245,7 @@ pub fn run(
             total_started,
         ),
         Command::Respond(args) => run_turn(
-            factory,
+            &create_factory(args.audio.model.device)?,
             AudioTask::Respond {
                 instruction: args.text.as_deref().unwrap_or(""),
             },
@@ -217,7 +255,9 @@ pub fn run(
             timing,
             total_started,
         ),
-        Command::Realtime(args) => crate::realtime::run(factory, args, timing, total_started),
+        Command::Realtime(args) => {
+            crate::realtime::run(create_factory, args, timing, total_started)
+        }
     }
 }
 

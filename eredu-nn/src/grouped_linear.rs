@@ -170,3 +170,41 @@ mod tests {
         assert!(global.with_group_count(-1).is_err());
     }
 }
+
+/// Runs a packed block-diagonal projection and selects each group's own output
+/// slice. The underlying projection owns input observation and precision.
+pub fn project_group_diagonal<T: crate::Tensor>(
+    linear: &mut impl crate::LinearOperator<T>,
+    input: &T,
+    groups: i32,
+    output_per_group: i32,
+    context: &T::Context,
+    observer: Option<&mut dyn crate::ProjectionInputObserver<T>>,
+) -> Result<T, Error> {
+    use crate::Index;
+    if groups <= 0 || output_per_group <= 0 || input.shape().len() != 4 || input.dim(1) != groups {
+        return Err(Error::backend("invalid grouped projection geometry"));
+    }
+    let width = groups
+        .checked_mul(output_per_group)
+        .ok_or_else(|| Error::backend("grouped projection width overflows"))?;
+    let projected = linear.forward_with_input_observer(input, context, observer)?;
+    if projected.shape().last() != Some(&width) {
+        return Err(Error::backend("invalid grouped projection output width"));
+    }
+    let pieces = (0..groups)
+        .map(|group| {
+            let start = group * output_per_group;
+            projected.index(
+                &[
+                    Index::Full,
+                    Index::Range(group, group + 1),
+                    Index::Full,
+                    Index::Range(start, start + output_per_group),
+                ],
+                context,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    T::concatenate(&pieces, 1, context)
+}

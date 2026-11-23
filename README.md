@@ -9,9 +9,10 @@ realtime speech models.
 
 The `eredu` crate provides the application-facing operations. Its default
 backend is built on [MLX](https://github.com/ml-explore/mlx), with Metal support on Apple silicon
-and CPU or CUDA support on x86-64 Linux and Windows. The runtime contracts,
-artifact inspection, planning, scheduling, and generation orchestration remain
-backend-neutral and can be built without MLX.
+and CPU or CUDA support on x86-64 Linux and Windows. The optional Candle backend
+runs on CPU and supports Metal on macOS through the same application API.
+It is unoptimised and serves primarily to validate the shared backend contract.
+Artifact inspection, planning, scheduling, and generation remain backend-neutral.
 
 Eredu is independent of Apple and is not an official MLX project.
 
