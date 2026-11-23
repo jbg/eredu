@@ -885,6 +885,23 @@ impl Tensor for MlxTensor {
         .map(|result| result.map(|(output, history)| (output.into(), history.into())))
     }
 
+    fn gated_causal_depthwise_block(
+        projected: &Self,
+        history: Option<&Self>,
+        weight: &Self,
+        context: &Stream,
+    ) -> Result<Option<(Self, Self)>, Error> {
+        backend(
+            crate::backend::nn::gated_convolution::causal_depthwise_block(
+                projected.as_array(),
+                history.map(Self::as_array),
+                weight.as_array(),
+                context,
+            ),
+        )
+        .map(|result| result.map(|(output, history)| (output.into(), history.into())))
+    }
+
     fn conv1d(
         input: &Self,
         weight: &Self,
