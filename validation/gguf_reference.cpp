@@ -59,9 +59,11 @@ static void write_tokens(std::ostream & output, const std::vector<llama_token> &
 
 int main(int argc, char ** argv) {
     try {
-        if (argc < 5 || argc > 7 || (argc == 7 && std::string(argv[6]) != "--single-row")) {
-            throw std::runtime_error("usage: gguf_reference MODEL OUTPUT.safetensors PROMPT_IDS DECODE_IDS [cpu|gpu] [--single-row]");
+        const std::string mode = argc == 7 ? argv[6] : "";
+        if (argc < 5 || argc > 7 || (argc == 7 && mode != "--single-row" && mode != "--all-prefill")) {
+            throw std::runtime_error("usage: gguf_reference MODEL OUTPUT.safetensors PROMPT_IDS DECODE_IDS [cpu|gpu] [--single-row|--all-prefill]");
         }
+        const bool all_prefill = mode == "--all-prefill";
         const std::string device = argc >= 6 ? argv[5] : "cpu";
         if (device != "cpu" && device != "gpu") throw std::runtime_error("device must be cpu or gpu");
         auto prompt = tokens(argv[3]);
@@ -82,7 +84,7 @@ int main(int argc, char ** argv) {
         auto context_params = llama_context_default_params();
         context_params.n_ctx = static_cast<uint32_t>(prompt.size() + decode.size() + 8);
         context_params.n_batch = static_cast<uint32_t>(prompt.size());
-        context_params.n_ubatch = argc == 7 ? 1 : context_params.n_batch;
+        context_params.n_ubatch = mode == "--single-row" ? 1 : context_params.n_batch;
         context_params.n_threads = 8;
         context_params.n_threads_batch = 8;
         context_params.type_k = GGML_TYPE_F32;
@@ -92,24 +94,32 @@ int main(int argc, char ** argv) {
         Context context(llama_init_from_model(model.get(), context_params), llama_free);
         if (!context) throw std::runtime_error("llama.cpp could not create a context");
         std::vector<float> rows;
-        const auto append = [&](std::vector<llama_token> & input) {
+        const auto append = [&](std::vector<llama_token> & input, bool all_rows) {
             auto batch = llama_batch_get_one(input.data(), static_cast<int32_t>(input.size()));
+            std::vector<int8_t> requested_logits;
+            if (all_rows) {
+                requested_logits.resize(input.size(), 1);
+                batch.logits = requested_logits.data();
+            }
             if (llama_decode(context.get(), batch) != 0) {
                 throw std::runtime_error("llama.cpp decode failed");
             }
-            const float * row = llama_get_logits_ith(context.get(), -1);
-            if (!row) throw std::runtime_error("llama.cpp did not return logits");
-            rows.insert(rows.end(), row, row + vocabulary);
+            for (size_t index = 0; index < (all_rows ? input.size() : 1); ++index) {
+                const float * row = llama_get_logits_ith(context.get(), all_rows ? static_cast<int32_t>(index) : -1);
+                if (!row) throw std::runtime_error("llama.cpp did not return logits");
+                rows.insert(rows.end(), row, row + vocabulary);
+            }
         };
-        append(prompt);
+        append(prompt, all_prefill);
         for (const auto token : decode) {
             std::vector<llama_token> input{token};
-            append(input);
+            append(input, false);
         }
-        const uint64_t first_bytes = uint64_t(vocabulary) * sizeof(float);
+        const auto prefill_rows = all_prefill ? prompt.size() : 1;
+        const uint64_t first_bytes = uint64_t(vocabulary) * prefill_rows * sizeof(float);
         const uint64_t total_bytes = uint64_t(rows.size()) * sizeof(float);
         std::ostringstream metadata;
-        metadata << "{\"prefill.logits\":{\"dtype\":\"F32\",\"shape\":[1," << vocabulary
+        metadata << "{\"prefill.logits\":{\"dtype\":\"F32\",\"shape\":[" << prefill_rows << "," << vocabulary
                  << "],\"data_offsets\":[0," << first_bytes
                  << "]},\"decode.logits\":{\"dtype\":\"F32\",\"shape\":[" << decode.size()
                  << "," << vocabulary << "],\"data_offsets\":[" << first_bytes << ","

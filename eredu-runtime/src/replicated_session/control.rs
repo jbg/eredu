@@ -70,6 +70,7 @@ pub struct ReplicatedTextControlState<S> {
     owner: Arc<()>,
     state: S,
     prompt_input_identity: Option<PreparedInputCacheIdentity>,
+    local_token_prefix: Option<eredu_core::cache::PromptCacheTokenDigest>,
 }
 
 impl<A, B, M, D> ReplicatedTextSession<A, B, M, D>
@@ -133,6 +134,7 @@ where
             owner: Arc::clone(&self.control_identity),
             state,
             prompt_input_identity: None,
+            local_token_prefix: Some(Default::default()),
         })
     }
 
@@ -146,6 +148,7 @@ where
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.validate_control_state(slot)?;
         std::mem::swap(&mut self.state, &mut slot.state);
+        std::mem::swap(&mut self.local_token_prefix, &mut slot.local_token_prefix);
         std::mem::swap(
             &mut self.committed_prompt_input_identity,
             &mut slot.prompt_input_identity,
@@ -232,6 +235,7 @@ where
             owner: Arc::clone(&self.control_identity),
             state,
             prompt_input_identity: self.committed_prompt_input_identity.clone(),
+            local_token_prefix: self.local_token_prefix.clone(),
         })
     }
 
@@ -262,6 +266,7 @@ where
             owner: Arc::clone(&self.control_identity),
             state,
             prompt_input_identity: saved.prompt_input_identity.clone(),
+            local_token_prefix: saved.local_token_prefix.clone(),
         })
     }
 
@@ -333,6 +338,7 @@ where
             context,
         )?;
         std::mem::swap(&mut self.state, &mut slot.state);
+        std::mem::swap(&mut self.local_token_prefix, &mut slot.local_token_prefix);
         std::mem::swap(
             &mut self.committed_prompt_input_identity,
             &mut slot.prompt_input_identity,

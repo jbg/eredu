@@ -150,6 +150,39 @@ impl<P> AdmittedCompositeInput<P> {
         }
     }
 
+    pub(crate) fn slice_parts(&self, range: std::ops::Range<usize>) -> Option<Self>
+    where
+        P: Clone + Into<crate::executable_binding::retained_session::PreparedInputPartPlan>,
+    {
+        let identity =
+            PreparedInputIdentity::new(self.identity.parts().get(range.clone())?.to_vec()).ok()?;
+        let parts = self.parts.get(range)?.to_vec();
+        let decoder_positions = parts.iter().cloned().try_fold(0_u64, |total, part| {
+            total.checked_add(part.into().decoder_positions())
+        })?;
+        let mut active_modalities = InputModalities {
+            text: false,
+            image: false,
+            audio: false,
+            video: false,
+        };
+        for part in identity.parts() {
+            match part.modality() {
+                InputModality::Text => active_modalities.text = true,
+                InputModality::Image => active_modalities.image = true,
+                InputModality::Audio => active_modalities.audio = true,
+                InputModality::Video => active_modalities.video = true,
+                _ => {}
+            }
+        }
+        Some(Self {
+            identity,
+            parts,
+            decoder_positions,
+            active_modalities,
+        })
+    }
+
     /// Identity recomputed from the exact tensor handles admitted by the architecture.
     pub const fn identity(&self) -> &PreparedInputIdentity {
         &self.identity
@@ -613,6 +646,15 @@ where
     /// This does not authorize splitting prepared media or observed invocations.
     fn supports_chunked_text_prefill() -> bool {
         false
+    }
+
+    /// Ordered input-part boundaries for resident prefill, including the final
+    /// part count. An empty list keeps the prepared request in one invocation.
+    fn resident_prefill_boundaries(
+        _config: &Self::AdmissionConfig,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Vec<usize> {
+        Vec::new()
     }
 
     /// One architecture-specific plan for each ordered input part, with a neutral

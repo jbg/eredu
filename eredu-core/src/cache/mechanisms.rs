@@ -253,8 +253,8 @@ pub trait LiveCacheBackend:
     type Tensor: Clone + std::fmt::Debug + Send + Sync + 'static;
     /// Immutable completed host transfer storage.
     type Host: Clone + std::fmt::Debug + Send + Sync + 'static;
-    /// Device identity retained by an admitted cache.
-    type Device: Copy + Eq + std::fmt::Debug + Send + Sync + 'static;
+    /// Device binding retained by an admitted cache, including native context identity when needed.
+    type Device: Clone + Eq + std::fmt::Debug + Send + Sync + 'static;
     /// Exact native execution context.
     type Queue: Clone;
     /// Native dependency retained until the consumer is ordered after it.
@@ -400,10 +400,35 @@ pub enum CacheAttentionInput {
     Transient,
 }
 
+/// Ordered sweeps required by the selected numerical kernel.
+#[derive(Clone, Copy)]
+pub enum AttentionScan {
+    /// Merge unnormalized values and row masses online.
+    Online,
+    /// Merge normalizers online, then accumulate rounded probabilities.
+    OnlineThenValues,
+    /// Compute global maxima, then masses, then normalized value products.
+    MaximumThenMassThenValues,
+}
+
+impl AttentionScan {
+    /// Number of scans over the same admitted page ranges.
+    pub const fn passes(self) -> usize {
+        match self {
+            Self::Online => 1,
+            Self::OnlineThenValues => 2,
+            Self::MaximumThenMassThenValues => 3,
+        }
+    }
+}
+
 /// Native numerical operations over the exact blocks supplied by a cache scan.
 pub trait CacheAttentionAccumulator<T, Q> {
-    /// Starts the value pass for kernels with a separate input-score pass.
-    fn begin_value_pass(&mut self) -> Result<(), BackendFailure>;
+    /// Returns the fixed numerical sweep plan.
+    fn scan(&self) -> AttentionScan;
+
+    /// Prepares the next sweep of the same page ranges.
+    fn begin_pass(&mut self, index: usize, queue: &Q) -> Result<(), BackendFailure>;
 
     /// Accumulates one selected block and reports its native scratch usage.
     /// Takes ownership of any source lease until native work settles.
@@ -430,6 +455,7 @@ pub trait CacheReadSubmission: Sized {
 pub trait LiveCacheReadSubmissionBackend: LiveCacheBackend {
     /// Retains the opaque source owner through native completion or teardown.
     fn begin_cache_read(
+        queue: &Self::Queue,
         retention: impl Sized + 'static,
     ) -> Result<impl CacheReadSubmission, BackendFailure>;
 }
@@ -444,6 +470,20 @@ pub struct CacheSnapshotTensorCosts {
     pub copy_buffers: u64,
     /// Maximum byte width of the backend's selected floating types.
     pub floating_width: u64,
+}
+
+impl CacheSnapshotTensorCosts {
+    /// Conservative bytes needed to retain and independently copy the tensor.
+    pub fn bytes(&self, payload: u64, rank: usize) -> Option<u64> {
+        payload
+            .checked_mul(self.copy_buffers)?
+            .checked_add(self.tensor_metadata)?
+            .checked_add(
+                u64::try_from(rank)
+                    .ok()?
+                    .checked_mul(self.dimension_metadata)?,
+            )
+    }
 }
 
 /// Native tensor storage shared by resident attention cache owners.
@@ -518,7 +558,7 @@ pub trait CacheCopySubmission: CacheTensorStorage {
         resources: R,
     ) -> Result<Self::CopyScope<R>, BackendFailure>;
 
-    /// Reclaims native copy scopes that have reached terminal completion.
+    /// Reclaims terminal native owners that retain cache-copy authority.
     fn reclaim_copies();
 }
 
@@ -682,17 +722,13 @@ pub trait PagedKeyValueStorage:
 pub trait PoolingCacheStorage: ResidentKeyValueStorage + PagedKeyValueStorage {
     /// Computes visibility for local keys within the admitted causal window.
     fn local_visibility(
-        queries: std::ops::Range<i32>,
-        keys: std::ops::Range<i32>,
-        window: i32,
+        geometry: eredu_nn::attention_mask::LocalWindowVisibility,
         queue: &Self::Queue,
     ) -> Result<Self::Value, BackendFailure>;
 
     /// Compares pooled positions to their complete source-window frontier.
     fn pooled_visibility(
-        query_ends: std::ops::Range<i32>,
-        pooled_tokens: i32,
-        ratio: i32,
+        geometry: eredu_nn::attention_mask::PooledWindowVisibility,
         queue: &Self::Queue,
     ) -> Result<Self::Tensor, BackendFailure>;
 }

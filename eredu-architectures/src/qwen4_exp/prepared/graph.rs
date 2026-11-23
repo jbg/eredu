@@ -640,6 +640,7 @@ impl Graph {
         self.edge(&sum, &output, E::Data);
         self.edge(&residual, &output, E::Residual);
     }
+    #[cfg(feature = "tensor-capture")]
     pub fn join(
         mut self,
         catalog: ObservationCatalog,

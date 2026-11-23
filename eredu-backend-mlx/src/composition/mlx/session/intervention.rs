@@ -69,7 +69,7 @@ impl InterventionEstimator for NativeInterventionEstimator {
                 "MLX sparse partition edit exceeds signed indexing".into(),
             ));
         }
-        routed::usage(routes, units, action)
+        eredu_core::intervention::estimate_routed_unit_edit(routes, units, action)
     }
     fn routed_unit_usage(
         &self,
@@ -78,27 +78,7 @@ impl InterventionEstimator for NativeInterventionEstimator {
         slice: &ResolvedCaptureSlice,
         action: &InterventionAction,
     ) -> Result<CaptureUsage, CaptureError> {
-        if source.len() != 2 || source[1] != geometry.components()? {
-            return Err(CaptureError::Invalid(
-                "invalid sparse edit virtual shape".into(),
-            ));
-        }
-        // The virtual expert axis is never allocated. Native indexing applies to
-        // participating values; lowering and exact payload gathers are host work.
-        let routes = mul(source[0], geometry.routes_per_token)?;
-        let values = mul(routes, geometry.units_per_expert)?;
-        if values > i32::MAX as u64 || source[0] > i32::MAX as u64 {
-            return Err(CaptureError::Unsupported(
-                "MLX sparse edit indexing exceeds i32".into(),
-            ));
-        }
-        action.validate_activation_region(
-            action
-                .dtype()
-                .ok_or_else(|| CaptureError::Invalid("sparse routing action".into()))?,
-            &slice.shape,
-        )?;
-        routed::usage(routes, geometry.units_per_expert, action)
+        eredu_core::intervention::estimate_local_routed_unit_edit(geometry, source, slice, action)
     }
 
     fn validate_geometry(
@@ -250,7 +230,12 @@ impl InterventionBackend for NativeCapture<'_> {
         source: &RoutedUnitCaptureSource<'_, MlxTensor>,
         geometry: RoutedUnitGeometry,
     ) -> Option<Result<RoutedUnitLocations, Error>> {
-        Some(routed::locations(source, geometry, self.stream))
+        Some(routed_unit_locations(
+            &super::bounded_capture::routed::NativeRoutedReadout(self.stream),
+            source,
+            geometry,
+            None,
+        ))
     }
     fn select_elements(
         &mut self,
@@ -258,7 +243,7 @@ impl InterventionBackend for NativeCapture<'_> {
         indices: &[u64],
     ) -> Option<Result<MlxTensor, Error>> {
         Some((|| {
-            let indices = routed::indices(indices)?;
+            let indices = super::bounded_capture::routed::native_indices(indices)?;
             Ok(MlxTensor::from_array(
                 source
                     .as_array()
@@ -274,7 +259,7 @@ impl InterventionBackend for NativeCapture<'_> {
         replacement: &MlxTensor,
     ) -> Option<Result<MlxTensor, Error>> {
         Some((|| {
-            let indices = routed::indices(indices)?;
+            let indices = super::bounded_capture::routed::native_indices(indices)?;
             let mut flat = source.as_array().reshape(&[-1], self.stream)?;
             flat.try_index_mut_device(indices, replacement.as_array(), self.stream)?;
             Ok(MlxTensor::from_array(

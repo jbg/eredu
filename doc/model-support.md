@@ -923,8 +923,8 @@ SafeTensors vision and explicit GGUF projectors support architecture-default med
 original token IDs and rotary positions. Raw preparation uses processor JSON or projector
 metadata; optional coarse host-processing limits apply before expensive host work.
 
-`prepare_observed_input` accepts a prepared backend prompt plus its explicit original decoder
-IDs. Ordinary and controlled generation share the retained request cursor. A controlled step
+`prepare_observed_input` derives decoder IDs from the prepared prompt. Observed and
+controlled generation share the alignment check and the retained request cursor. A controlled step
 commits one nonfinal chunk without sampling, and captures retain absolute prompt spans.
 Snapshots, restore and fork preserve cursor/model state and immutable encoder products.
 Partial-chunk interventions return a typed rejection; single-invocation interventions work.

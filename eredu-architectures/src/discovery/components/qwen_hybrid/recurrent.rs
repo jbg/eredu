@@ -1,5 +1,6 @@
 //! Gated-delta reads, fused causal convolution and consumed output channels.
 use super::*;
+use crate::gated_delta::GatedDeltaArithmetic;
 
 pub(super) fn declare(
     g: &mut Builder,
@@ -32,7 +33,12 @@ pub(super) fn declare(
             head_width: key_dim,
             independent_gains: false,
             normalization: ComponentNormalization {
-                kind: ComponentNormalizationKind::L2,
+                kind: match declaration.arithmetic {
+                    GatedDeltaArithmetic::LogTransition => ComponentNormalizationKind::L2,
+                    GatedDeltaArithmetic::NegativeTransition => {
+                        ComponentNormalizationKind::L2WithFloor
+                    }
+                },
                 epsilon: ComponentScalar::new(declaration.l2_epsilon),
                 gain: None,
                 gain_offset: ComponentScalar::new(0.0),
@@ -174,7 +180,11 @@ pub(super) fn declare(
             decay_layout: ComponentDeltaDecay::Head,
             query_scale: ComponentScalar::new((key_dim as f32).sqrt().recip()),
             key_scale: ComponentScalar::new(1.0),
-            decay_rate: declared_transform_parameter(&declaration.transition_log, group.clone()),
+            decay_rate: declared_transform_parameter(&declaration.transition, group.clone()),
+            decay_rate_encoding: match declaration.arithmetic {
+                GatedDeltaArithmetic::LogTransition => ComponentDeltaTransition::LogMagnitude,
+                GatedDeltaArithmetic::NegativeTransition => ComponentDeltaTransition::NegativeRate,
+            },
             decay_bias: declared_transform_parameter(&declaration.decay_bias, group.clone()),
             channel_normalization: ComponentHeadNormalization {
                 output_scale: ComponentScalar::new(1.0),

@@ -266,6 +266,7 @@ fn kda(
             query_scale: ComponentScalar::new(1.0 / dim as f32),
             key_scale: ComponentScalar::new((dim as f32).sqrt().recip()),
             decay_rate: declared_transform_parameter(&spec.a_log, format!("parameters:{prefix}")),
+            decay_rate_encoding: ComponentDeltaTransition::LogMagnitude,
             decay_bias: declared_transform_parameter(&spec.dt_bias, format!("parameters:{prefix}")),
             channel_normalization: ComponentHeadNormalization {
                 output_scale: ComponentScalar::new(1.0),

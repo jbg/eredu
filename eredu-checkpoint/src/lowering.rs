@@ -170,11 +170,39 @@ impl WeightLoweringDescriptor {
         }
     }
 
-    /// Validates an unpacked source and the selected transform's packing geometry.
-    pub fn has_valid_transform_geometry(&self) -> bool {
-        self.physical_shape() == self.logical_shape()
+    /// Whether the source and packing geometry admit a load-time word transform.
+    /// Native callers still check their placement and tile limits.
+    pub fn supports_word_transform(&self) -> bool {
+        self.has_floating_transform_source()
+            && self.physical_shape() == self.logical_shape()
             && self.packed_axis() == self.logical_shape().len().checked_sub(1)
-            && self.has_valid_packed_geometry()
+            && self
+                .executable()
+                .weight_quantization()
+                .is_some_and(|format| {
+                    self.packed_extent().is_some_and(|width| {
+                        crate::word_quantization::geometry(format, width).is_ok()
+                    })
+                })
+    }
+
+    /// Whether the input can be read as a dense floating recipe without decoding.
+    fn has_floating_transform_source(&self) -> bool {
+        match self.source() {
+            SourceTensorEncoding::Safetensors(dtype)
+            | SourceTensorEncoding::RecipeOutput(dtype) => {
+                matches!(
+                    dtype,
+                    StoredDtype::F16 | StoredDtype::BF16 | StoredDtype::F32 | StoredDtype::F64
+                )
+            }
+            SourceTensorEncoding::Gguf { ggml_type, .. } => {
+                matches!(
+                    ggml_type,
+                    crate::GgmlType::F16 | crate::GgmlType::Bf16 | crate::GgmlType::F32
+                )
+            }
+        }
     }
 
     fn has_valid_packed_geometry(&self) -> bool {

@@ -154,19 +154,18 @@ where
         plan: AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
         crate::speculative::autoregressive::validate_control_capture(&plan)?;
-        self.capture = Some(std::rc::Rc::new(std::cell::RefCell::new(LogitCapture {
-            session: crate::capture::CaptureSession::new(plan),
-            records: Vec::new(),
-        })));
+        self.capture = Some(std::rc::Rc::new(std::cell::RefCell::new(
+            LogitCapture::new(plan),
+        )));
         Ok(())
     }
 
     fn take_control_captures(
         &mut self,
     ) -> Vec<eredu_core::speculative::SpeculativePredictionCapture> {
-        self.capture.as_ref().map_or_else(Vec::new, |capture| {
-            std::mem::take(&mut capture.borrow_mut().records)
-        })
+        self.capture
+            .as_ref()
+            .map_or_else(Vec::new, |capture| capture.borrow_mut().drain())
     }
 
     fn control_intervene(
@@ -484,7 +483,7 @@ where
     }
 }
 
-struct LogitCapture {
+pub(super) struct LogitCapture {
     session: CaptureSession,
     records: Vec<SpeculativePredictionCapture>,
 }
@@ -497,6 +496,57 @@ struct PredictionObservation<'a> {
 }
 
 impl LogitCapture {
+    pub(super) fn new(plan: AdmittedCapturePlan) -> Self {
+        Self {
+            session: CaptureSession::new(plan),
+            records: Vec::new(),
+        }
+    }
+
+    pub(super) fn drain(&mut self) -> Vec<SpeculativePredictionCapture> {
+        std::mem::take(&mut self.records)
+    }
+
+    fn begin(&mut self, position: u64) -> Result<(), CaptureError> {
+        let phase = if position == 0 {
+            CapturePhase::Prefill
+        } else {
+            CapturePhase::Decode
+        };
+        self.session.begin_step(phase, position)
+    }
+
+    fn record(&mut self, role: SpeculativeCaptureRole, position: u64, kind: PredictionScoreKind) {
+        if let Some(capture) = self.session.take_step() {
+            self.records.push(SpeculativePredictionCapture {
+                role,
+                position,
+                score_kind: kind,
+                capture,
+            });
+        }
+    }
+
+    #[cfg(feature = "tensor-capture")]
+    pub(super) fn observe_read_only<
+        B: eredu_core::capture::CaptureBackend<Error = eredu_core::BackendFailure>,
+    >(
+        &mut self,
+        backend: &mut B,
+        scores: &B::Tensor,
+        role: SpeculativeCaptureRole,
+        position: u64,
+        kind: PredictionScoreKind,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        self.begin(position)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let result = self
+            .session
+            .observe(backend, MODEL_LOGITS_OBSERVATION_PATH, scores);
+        self.record(role, position, kind);
+        result.map_err(crate::capture::CaptureExecutionError::into_operation_error)
+    }
+
     fn observe<M: SpeculativeSamplingPrimitives>(
         &mut self,
         logits: &Logits<M>,
@@ -504,20 +554,13 @@ impl LogitCapture {
         domain: Option<CaptureTokenDomain<'_>>,
         observation: PredictionObservation<'_>,
     ) -> Result<Logits<M>, M::Error> {
-        let phase = if observation.position == 0 {
-            CapturePhase::Prefill
-        } else {
-            CapturePhase::Decode
-        };
         self.session
             .select_prediction_interventions(
                 observation.intervention.cloned(),
                 M::intervention_estimator(),
             )
             .map_err(M::from_error)?;
-        self.session
-            .begin_step(phase, observation.position)
-            .map_err(M::from_error)?;
+        self.begin(observation.position).map_err(M::from_error)?;
         let tensor = M::capture_scores(logits, queue)?;
         let mut backend = M::score_capture(queue, domain);
         self.session
@@ -528,14 +571,7 @@ impl LogitCapture {
             .intervene(&mut backend, MODEL_LOGITS_OBSERVATION_PATH, &tensor)
             .map_err(M::from_error)?;
         self.session.finish_interventions().map_err(M::from_error)?;
-        if let Some(capture) = self.session.take_step() {
-            self.records.push(SpeculativePredictionCapture {
-                role: observation.role,
-                position: observation.position,
-                score_kind: observation.kind,
-                capture,
-            });
-        }
+        self.record(observation.role, observation.position, observation.kind);
         effective.map_or_else(
             || Ok(logits.clone()),
             |value| M::restore_scores(value, logits, queue),

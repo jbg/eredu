@@ -1,18 +1,24 @@
 //! Admission and discovery for the installed speculative target.
 
 use super::{BatchSession, ExternalBatchMechanisms, SpeculativeBatchBinding};
+#[cfg(feature = "tensor-capture")]
+use crate::text_session_driver::{
+    speculative_partition_binding, TextExecutable, TextSessionDriver, TextSessionMechanisms,
+};
 use crate::{
     capture::partition::PartitionCaptureHookTransport,
-    text_session_driver::{
-        capture::TextCaptureMechanisms, speculative_partition_binding, TextExecutable,
-        TextSessionDriver, TextSessionMechanisms,
-    },
+    text_session_driver::capture::TextCaptureMechanisms,
 };
+#[cfg(feature = "tensor-capture")]
 use eredu_core::{
-    capture::{AdmittedCapturePlan, CaptureError, TextCaptureNative},
+    capture::TextCaptureNative,
     intervention::{AdmittedInterventionPlan, InterventionDiscovery},
     speculative::{AdmittedSpeculativeActivations, SpeculativeActivationDiscovery},
-    ModelRuntime, MODEL_LOGITS_OBSERVATION_PATH,
+    ModelRuntime,
+};
+use eredu_core::{
+    capture::{AdmittedCapturePlan, CaptureError},
+    MODEL_LOGITS_OBSERVATION_PATH,
 };
 
 /// Reports observation support on the installed session and names its draft source type.

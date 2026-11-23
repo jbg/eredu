@@ -41,7 +41,7 @@ pub trait ParameterBank<B: NeuralBackend> {
         >,
     >;
     /// Admitted compact order and the storage retained across consuming operations.
-    type Acquisition: From<BankTransfer<<Self::Residency as ResidencyAccess>::Transfer>>;
+    type Acquisition;
     /// Generic bank telemetry snapshot.
     type Report;
     /// Storage, transfer, lowering, or construction failure.
@@ -50,12 +50,18 @@ pub trait ParameterBank<B: NeuralBackend> {
     /// Returns the selected byte geometry for one admitted bank member.
     fn member_bytes(&self, key: ParameterBankKey) -> Option<u64>;
 
+    /// Opens the consumer loan before any work can read the ordered transfer.
+    fn begin_consumption(
+        &self,
+        acquisition: BankTransfer<<Self::Residency as ResidencyAccess>::Transfer>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Acquisition, Self::Error>;
+
     /// Retains acquired storage until the consuming output is natively complete.
     fn complete(
         &mut self,
         acquisition: Self::Acquisition,
         output: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error>;
 
     /// Returns generic key, byte, tier, acquisition, and eviction telemetry.

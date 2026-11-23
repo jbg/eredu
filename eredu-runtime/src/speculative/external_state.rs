@@ -103,7 +103,7 @@ impl<C> ExternalAssistantCache<C> {
             .requirements()
             .capture()
             .instantiate(shapes.iter().cloned())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("{error}; received {shapes:?}"))?;
         let values = vec![(); schema.entries().len()];
         let envelope = SpeculativeCaptureEnvelope::new(
             SpeculativeCaptureMetadata::new(schema, self.frontier),

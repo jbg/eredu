@@ -358,6 +358,47 @@ impl RefinementBackend for MlxSamplingBackend {
 }
 
 impl eredu_core::refinement::RefinementFinalizationBackend for MlxSamplingBackend {
+    type CanvasScores = MlxTensor;
+    type CanvasTokens = MlxTensor;
+    type PositionScores = MlxTensor;
+    type FinalizationContext = Stream;
+    type FinalizationError = Exception;
+
+    fn canvas_score_shape(scores: &MlxTensor) -> Option<[usize; 2]> {
+        <Self as RefinementBackend>::masked_score_shape(scores)
+    }
+
+    fn position_scores(
+        scores: &MlxTensor,
+        position: usize,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Exception> {
+        scores
+            .as_array()
+            .try_index_device((position as i32..position as i32 + 1, ..), stream)
+            .map(MlxTensor::from_array)
+    }
+
+    fn filter_position_scores(
+        scores: &MlxTensor,
+        filter: &eredu_core::TokenFilter,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Exception> {
+        <Self as SamplingBackend>::apply_token_filter(scores, filter, stream)
+    }
+
+    fn greedy_position(scores: &MlxTensor, stream: &Stream) -> Result<MlxTensor, Exception> {
+        <Self as SamplingBackend>::sample_processed(scores, 0.0, None, stream)
+    }
+
+    fn validate_candidate(
+        token: &MlxTensor,
+        domain: TokenDomain,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Exception> {
+        <Self as SamplingBackend>::validate_token(token, domain, stream)
+    }
+
     fn candidate_at(
         candidates: &MlxTensor,
         position: usize,

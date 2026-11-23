@@ -16,17 +16,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('provenance', type=Path)
     parser.add_argument('output', type=Path)
-    parser.add_argument('--f32-checkpoint', type=Path, required=True)
+    parser.add_argument('--dtype', choices=('float32', 'bfloat16'), default='float32')
+    parser.add_argument('--f32-checkpoint', type=Path)
+    parser.add_argument('--all-prefill-positions', action='store_true')
     parser.add_argument('--tokens', default='1,3,2,5,8,13,21,34,55')
     parser.add_argument('--decode', default='5,8,13')
     parser.add_argument('--trust-remote-code', action='store_true')
     args = parser.parse_args()
     provenance = json.loads(args.provenance.read_text())
     source = Path(provenance['path'])
-    checkpoint = args.f32_checkpoint.resolve()
-    if checkpoint.is_relative_to(source.resolve()) or checkpoint.is_relative_to(Path(__file__).resolve().parents[2]):
-        parser.error('derived checkpoint must be outside the source checkpoint and repository')
-    checkpoint.mkdir(parents=True, exist_ok=True)
+    checkpoint = source
+    if args.dtype == 'float32':
+        if args.f32_checkpoint is None:
+            parser.error('--f32-checkpoint is required for float32')
+        checkpoint = args.f32_checkpoint.resolve()
+        if checkpoint.is_relative_to(source.resolve()) or checkpoint.is_relative_to(Path(__file__).resolve().parents[2]):
+            parser.error('derived checkpoint must be outside the source checkpoint and repository')
+        checkpoint.mkdir(parents=True, exist_ok=True)
+    elif args.f32_checkpoint is not None:
+        parser.error('--f32-checkpoint applies only to float32')
     expected = provenance['weights_sha256']
     if isinstance(expected, str):
         expected = {'model.safetensors': expected}
@@ -34,35 +42,43 @@ def main():
     for name, digest in expected.items():
         with (source / name).open('rb') as stream:
             assert hashlib.file_digest(stream, 'sha256').hexdigest() == digest
-        tensors = load_file(str(source / name))
-        save_file({key: value.float() if value.is_floating_point() else value
-                   for key, value in tensors.items()}, str(checkpoint / name),
-                  metadata={'format': 'pt'})
-        with (checkpoint / name).open('rb') as stream:
-            derived[name] = hashlib.file_digest(stream, 'sha256').hexdigest()
-    for sidecar in source.iterdir():
-        if sidecar.suffix in ('.json', '.jinja') or (args.trust_remote_code and sidecar.suffix == '.py'):
-            shutil.copyfile(sidecar, checkpoint / sidecar.name)
+        if args.dtype == 'float32':
+            tensors = load_file(str(source / name))
+            save_file({key: value.float() if value.is_floating_point() else value
+                       for key, value in tensors.items()}, str(checkpoint / name),
+                      metadata={'format': 'pt'})
+            with (checkpoint / name).open('rb') as stream:
+                derived[name] = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if args.dtype == 'float32':
+        for sidecar in source.iterdir():
+            if sidecar.suffix in ('.json', '.jinja') or (args.trust_remote_code and sidecar.suffix == '.py'):
+                shutil.copyfile(sidecar, checkpoint / sidecar.name)
     torch.set_num_threads(4)
     model = AutoModelForCausalLM.from_pretrained(checkpoint, local_files_only=True,
-                                                dtype=torch.float32, attn_implementation='eager',
+                                                dtype=getattr(torch, args.dtype), attn_implementation='eager',
                                                 trust_remote_code=args.trust_remote_code).eval()
     prompt = [int(value) for value in args.tokens.split(',')]
     decode = [int(value) for value in args.decode.split(',')]
     logits = []
+    prefill_logits = None
     cache = None
     with torch.inference_mode():
         for tokens in [prompt, *[[token] for token in decode]]:
             output = model(input_ids=torch.tensor([tokens]), past_key_values=cache, use_cache=True)
             cache = output.past_key_values
+            if args.all_prefill_positions and not logits:
+                prefill_logits = output.logits[0].float().tolist()
             logits.append(output.logits[0, -1].float().tolist())
-    args.output.write_text(json.dumps({
+    result = {
         'provenance': provenance, 'model_path': str(checkpoint),
         'derived_weights_sha256': derived, 'prompt': prompt,
         'decode_tokens': decode, 'logits': logits,
         'torch': torch.__version__, 'transformers': transformers.__version__,
-        'dtype': 'float32', 'attention': 'eager',
-    }) + '\n')
+        'dtype': args.dtype, 'attention': 'eager',
+    }
+    if prefill_logits is not None:
+        result['all_prefill_logits'] = prefill_logits
+    args.output.write_text(json.dumps(result) + '\n')
     print(f'Wrote {len(logits)} full-vocabulary predictions to {args.output}')
 
 

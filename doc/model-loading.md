@@ -130,11 +130,11 @@ Registered MoE families can combine any supported non-expert policy with a
 separate routed-expert cache. The cache has its own device, host, scratch, and
 prefill-bank budgets and deterministic eviction policy.
 
-Routing has one unavoidable host boundary: Eredu reduces the route tensor to
-a compact demand histogram, reads that metadata, and then selects the exact
-checkpoint experts. Route rows and weights remain on-device. Missing experts
-are acquired as one residency batch; the execution stream waits on an
-aggregate completion event before constructing the compact bank.
+The portable runtime reads routing demand, selects the exact expert members,
+and acquires missing members as a residency batch. MLX reads a compact
+device-computed histogram. Candle CPU and Metal read selected indices for host
+counting and remapping. Both retain each acquisition through compact-bank
+execution and exact completion.
 
 The scratch limit is a hard bound for one compact bank. Multi-token prefill may
 be split to stay within the configured prefill-bank target and scratch bound.
@@ -225,15 +225,20 @@ prompt caches.
 
 ## Reusable prompt caches
 
-A prompt cache is a completed immutable prefix. Saving seals partial tails and
-publishes a manifest plus bounded SafeTensors shards atomically. Loading first
-validates the entire manifest and owned layer layout, then attaches compatible
-shards as read-only disk blocks and promotes them only on demand.
+A prompt cache is a completed immutable prefix. Saving exports resident KV
+in bounded slices or seals partial tails for paged KV. It publishes a manifest
+and bounded SafeTensors shards atomically. Restore validates the manifest and
+owned layer layout. It assembles fresh resident storage one layer at a time or
+attaches compatible directory-backed paged shards for on-demand promotion.
 
-Prompt-cache persistence is a backend/tooling facility, not an `eredu` facade
-operation. Its portable identity and manifest types use their canonical
-`eredu_core::cache` paths; MLX persistence operations are owned by
-`eredu-backend-mlx`.
+`LoadedModel::set_prompt_cache_store` attaches a memory or directory store to a
+session with admitted prompt-cache persistence. Request that support with
+`with_prompt_cache_persistence(true)` on the execution plan or normalized load
+request. Supply the exact checkpoint fingerprint when attaching the store and
+the full prompt on every request. The facade shares eligible
+prefix lookup, restore, and publication across Candle and MLX. See
+[automatic prompt-cache reuse](execution-control.md#automatic-prompt-cache-reuse).
+Portable identity and manifest types live in `eredu_core::cache`.
 
 Callers obtain one complete `PromptCacheModelIdentity` from the prepared
 session and pass it to `PromptCacheDescriptor::from_model_identity`. Only the
@@ -247,7 +252,7 @@ ordinary prefill also advances prediction state to its architecture-declared
 prefix-relative frontier. Callers do not need to enter speculative generation
 before saving a complete prompt cache.
 
-Schema version 9 records:
+Schema version 10 records the following.
 
 - model family, effective type, checkpoint identity, and an architecture
   fingerprint;
@@ -258,11 +263,8 @@ Schema version 9 records:
 - block ranges, shapes, dtypes, and payload digests; and
 - exact prefix token identity plus the caller's processed-prefix fingerprint.
 
-Load accepts schema version 9 only. Version 8 and earlier cannot distinguish
-the former affine companion cast from source-precision-preserving materialization;
-rebuild those persisted prefixes by replaying their exact token IDs. This schema
-boundary applies to all persisted caches, including unquantized models.
-Model family, architecture fingerprint,
+Load requires schema version 10 and preserves the admitted source precision
+for affine companions. Model family, architecture fingerprint,
 prefix identity, layer ownership, topology, state representation, tensor
 geometry, and payload digests must match before arrays become live. Multimodal
 applications should include media bytes and processor settings in the

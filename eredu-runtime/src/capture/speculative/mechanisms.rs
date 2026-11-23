@@ -129,12 +129,12 @@ pub trait SpeculativeCaptureMechanisms {
 /// Portable assignment and observer derived from capture primitives.
 pub type SpeculativeContextFor<'a, P> = crate::speculative::SpeculativeExecutionContext<
     'a,
-    <P as SpeculativeCapturePrimitives>::Queues,
-    <P as SpeculativeCapturePrimitives>::Transport,
+    <P as eredu_core::capture::SpeculativeCaptureTypes>::Queues,
+    <P as eredu_core::capture::SpeculativeCaptureTypes>::Transport,
     dyn crate::speculative::autoregressive::SpeculativeTargetObserver<
-            <P as SpeculativeCapturePrimitives>::InvocationTensor,
-            <P as SpeculativeCapturePrimitives>::ObserverError,
-            <P as SpeculativeCapturePrimitives>::Scores,
+            <P as eredu_core::capture::SpeculativeCaptureTypes>::InvocationTensor,
+            <P as eredu_core::capture::SpeculativeCaptureTypes>::ObserverError,
+            <P as eredu_core::capture::SpeculativeCaptureTypes>::Scores,
         > + 'a,
 >;
 

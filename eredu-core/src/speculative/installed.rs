@@ -2,7 +2,7 @@
 
 use crate::{
     backend::NativeTextValues, execution_control::SnapshotEstimate, refinement::RefinementBackend,
-    BoundedCompletion, SpeculativeTelemetry,
+    BoundedCompletion,
 };
 
 type Text<M> = <M as InstalledSpeculationOperators>::Text;
@@ -36,12 +36,12 @@ pub trait InstalledSpeculationOperators: Sized + 'static {
     >;
     /// Native completion retaining submitted tensor roots.
     type Completion: BoundedCompletion<Error = Self::Error>;
-    /// Native component telemetry.
-    type Telemetry: SpeculativeTelemetry;
     /// Error at the numerical boundary.
     type Error: std::error::Error + Send + Sync + 'static;
-    /// Native allocator observations for portable memory reporting.
-    type Memory: crate::capability::NativeAllocatorObservations;
+    /// Reads memory on the retained execution queue.
+    fn placement_memory(
+        queue: &Queue<Self>,
+    ) -> Result<crate::capability::ParameterMemoryFacts, crate::BackendFailure>;
 
     /// Materializes exact causal token rows for an invocation.
     fn causal_tokens(tokens: &[u32]) -> Result<InvocationTensor<Self>, Self::Error>;
@@ -139,6 +139,4 @@ pub trait ResidentSpeculation<B: crate::TextGenerationBackend>:
 
     /// Retains the selected target queue.
     fn target_queue(backend: &B) -> Queue<Self>;
-    /// Reports whether the native timing facility has been enabled.
-    fn collect_component_timings() -> bool;
 }

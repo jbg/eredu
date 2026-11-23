@@ -279,6 +279,14 @@ pub enum DraftPlacementPlan {
 }
 
 impl DraftPlacementPlan {
+    /// Returns the draft device, resolving target reuse against the selected target.
+    pub fn execution_device<'a>(&'a self, target: &'a DevicePlan) -> &'a DevicePlan {
+        match self {
+            Self::Target => target,
+            Self::Device { device } => device,
+        }
+    }
+
     /// Resolves target/draft topology from the portable plan before queue construction.
     pub fn execution_topology(&self, target: &DevicePlan) -> crate::SpeculativeExecutionTopology {
         match self {

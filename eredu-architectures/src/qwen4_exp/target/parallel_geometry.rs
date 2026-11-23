@@ -201,7 +201,7 @@ impl Selections {
                     )?;
                 }
                 self.linear(&r.output, 1, vec![0..r.output.input as usize], rank, ranks)?;
-                for parameter in [&r.decay_bias, &r.transition_log] {
+                for parameter in [&r.decay_bias, &r.transition] {
                     self.raw(
                         parameter.id.as_str(),
                         0,

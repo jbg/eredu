@@ -360,9 +360,13 @@ impl<P: PreparationMechanismProvider> ArchitectureLoadAdmission<P> {
         self,
         inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     ) -> eredu_core::CandidateAdmission {
-        let rejection = select_preparation(inspection, &self.request, &self.mechanisms)
-            .err()
-            .map(|error| error.to_string());
+        let rejection = project_text_inspection(inspection.clone(), &self.mechanisms)
+            .map_err(|error| error.to_string())
+            .and_then(|inspection| {
+                select_preparation(&inspection, &self.request, &self.mechanisms)
+                    .map_err(|error| error.to_string())
+            })
+            .err();
         eredu_core::CandidateAdmission {
             supported: rejection.is_none(),
             rejection,
@@ -374,8 +378,15 @@ impl<P: PreparationMechanismProvider> ArchitectureLoadAdmission<P> {
         self,
         inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     ) -> Result<eredu_core::BoundedResidencyRequirement, eredu_core::AutomaticPlanningError> {
+        let inspection =
+            project_text_inspection(inspection.clone(), &self.mechanisms).map_err(|error| {
+                eredu_core::AutomaticPlanningError::Backend {
+                    operation: "select_checkpoint_representation",
+                    message: error.to_string(),
+                }
+            })?;
         let selected =
-            select_preparation(inspection, &self.request, &self.mechanisms).map_err(|error| {
+            select_preparation(&inspection, &self.request, &self.mechanisms).map_err(|error| {
                 eredu_core::AutomaticPlanningError::Backend {
                     operation: "select_model_preparation",
                     message: error.to_string(),
@@ -397,12 +408,50 @@ impl<P: PreparationMechanismProvider> eredu_core::ModelLoadAdmission<ArtifactArc
     type SourcePreparation = SelectedPreparation;
     type Error = PreparationSelectionError;
 
+    fn project_inspection(
+        &self,
+        inspection: ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> Result<ArtifactInspection<ArtifactArchitecturePlan>, eredu_core::artifact::ArtifactError>
+    {
+        project_text_inspection(inspection, &self.mechanisms)
+    }
+
     fn select(
         self,
         inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     ) -> Result<Self::SourcePreparation, Self::Error> {
         select_preparation(inspection, &self.request, &self.mechanisms)
     }
+}
+
+pub(crate) fn project_text_inspection(
+    inspection: ArtifactInspection<ArtifactArchitecturePlan>,
+    mechanisms: &impl PreparationMechanismProvider,
+) -> Result<ArtifactInspection<ArtifactArchitecturePlan>, eredu_core::artifact::ArtifactError> {
+    let Some(gguf) = inspection.validated_gguf() else {
+        return Ok(inspection);
+    };
+    let names = eredu_runtime::select_packed_gguf_tensors(
+        mechanisms,
+        gguf.checkpoint(),
+        gguf.requested_representation().is_none(),
+    );
+    if names.is_empty() {
+        return Ok(inspection);
+    }
+
+    let ids = inspection.architecture_plan().gguf_special_token_ids();
+    let mut projected =
+        inspection.with_encoded_gguf_tensors(names, &crate::configuration::MODEL_CONFIGURATIONS)?;
+    if let Some(ids) = ids {
+        projected
+            .architecture_plan_mut()
+            .bind_gguf_special_token_ids(ids)
+            .map_err(|error| {
+                eredu_core::artifact::ArtifactError::InvalidArchitecturePlan(error.to_string())
+            })?;
+    }
+    Ok(projected)
 }
 
 /// Selects complete neutral preparation exactly once before native construction.

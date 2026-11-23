@@ -200,9 +200,6 @@ pub enum ChatInputPreparationError {
     /// Exact input accounting failed.
     #[error(transparent)]
     Capability(#[from] CapabilityError),
-    /// Native alignment observation failed, retaining the original source.
-    #[error(transparent)]
-    Backend(#[from] BackendFailure),
     /// Prepared input belongs to another loaded model.
     #[error("typed chat input belongs to another loaded session")]
     SessionMismatch,
@@ -212,14 +209,6 @@ pub enum ChatInputPreparationError {
     /// A text-only entry point received decoded media.
     #[error("typed chat contains media; use materialize_chat_input with a multimodal backend")]
     MediaRequiresBackend,
-    /// Backend semantic IDs do not cover the counted decoder positions.
-    #[error("prepared decoder alignment has {actual} IDs for {expected} model positions")]
-    Alignment {
-        /// Counted decoder positions.
-        expected: u64,
-        /// Observed semantic token IDs.
-        actual: usize,
-    },
     /// Existing capture/control admission failed.
     #[error(transparent)]
     Generation(#[from] super::PreparedChatError),
@@ -522,7 +511,6 @@ impl<
         if prepared.payload.session_identity != self.session_identity {
             return Err(ChatInputPreparationError::SessionMismatch);
         }
-        let count = prepared.count();
         match prepared.payload.prompt {
             Prompt::Tokens(ids) => Ok(self.prepare_observed_token_ids(
                 &prepared.chat,
@@ -531,23 +519,13 @@ impl<
                 plan,
                 trace_limits,
             )?),
-            Prompt::Prepared(prompt) => {
-                let ids = S::prepared_input_token_ids(&self.runtime, &prompt)?;
-                if u64::try_from(ids.len()).ok() != Some(count.model_positions) {
-                    return Err(ChatInputPreparationError::Alignment {
-                        expected: count.model_positions,
-                        actual: ids.len(),
-                    });
-                }
-                Ok(self.prepare_observed_input(
-                    &prepared.chat,
-                    prompt,
-                    ids,
-                    settings,
-                    plan,
-                    trace_limits,
-                )?)
-            }
+            Prompt::Prepared(prompt) => Ok(self.prepare_observed_input(
+                &prepared.chat,
+                prompt,
+                settings,
+                plan,
+                trace_limits,
+            )?),
         }
     }
 }

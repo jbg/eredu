@@ -254,6 +254,10 @@ impl<B: eredu_core::TextGenerationBackend, I: eredu_core::TextExecutionSession<B
     /// `None` starts the source in causal mode unless the request selects another
     /// mode. Explicit options supply speculative defaults and resource ceilings.
     /// Native pairing validates compatibility.
+    ///
+    /// A new request can inherit the installed target prefix. Call
+    /// [`Self::reset`] before each independent run, including when comparing
+    /// speculative and target-only generation on the same prompt.
     pub fn drafting_session<'a, D>(
         &'a mut self,
         drafting: SpeculativeDraft<'a, D>,
@@ -765,38 +769,14 @@ where
                     )?;
                     prepared
                 }
-                PreparedChatInput::PreparedInput { prompt, .. } => {
-                    let count = model.count_prepared_input(&prompt)?;
-                    let ids = I::prepared_input_token_ids(&model.runtime, &prompt)
-                        .map_err(PreparedChatError::Backend)?;
-                    if u64::try_from(ids.len()).ok() != Some(count.model_positions) {
-                        return Err(PreparedChatError::Alignment {
-                            expected: count.model_positions,
-                            actual: ids.len(),
-                        });
-                    }
+                PreparedChatInput::PreparedInput { prompt, .. } => model.prepare_generation_input(
+                    &chat,
+                    prompt,
+                    request.settings,
+                    options.trace_limits,
                     #[cfg(feature = "tensor-capture")]
-                    let prepared = model.prepare_observed_input(
-                        &chat,
-                        prompt,
-                        ids,
-                        request.settings,
-                        options.capture,
-                        options.trace_limits,
-                    )?;
-                    #[cfg(not(feature = "tensor-capture"))]
-                    let prepared = {
-                        let mut prepared = model.prepare_controlled_token_ids(
-                            &chat,
-                            ids,
-                            request.settings,
-                            options.trace_limits,
-                        )?;
-                        prepared.prompt = Some(prompt);
-                        prepared
-                    };
-                    prepared
-                }
+                    options.capture,
+                )?,
                 PreparedChatInput::SessionBound { .. } => {
                     unreachable!("validated input was unbound")
                 }
@@ -854,7 +834,10 @@ where
             session.token_ids().to_vec(),
             session.finish_reason().expect("settled controlled request"),
             session.timing(),
-            GenerationStats::default(),
+            GenerationStats {
+                prompt_cache: session.prompt_cache_stats().cloned(),
+                ..GenerationStats::default()
+            },
         ))
     }
 }

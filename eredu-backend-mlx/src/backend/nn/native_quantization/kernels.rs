@@ -1205,6 +1205,14 @@ pub(super) fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool
                 "return iq_half(w,p)*float(int(x<16u?q&15u:q>>4u)-8);}\n"
             ));
         }
+        NativeQuantizationFormat::GgufQ5_0 => {
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint p=r+(c/32u)*22u;uint i=c%32u;uint packed=uint(w[p+6u+(i&15u)]);",
+                "uint q=(i<16u?(packed&15u):(packed>>4u))|(((iq_u32(w,p+2u)>>i)&1u)<<4u);",
+                "return iq_half(w,p)*float(int(q)-16);}\n"
+            ));
+        }
         NativeQuantizationFormat::GgufNvFp4 => {
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",

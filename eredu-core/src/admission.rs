@@ -144,6 +144,30 @@ impl PreparationMechanismCapabilities {
         self
     }
 
+    /// Projects the coarse preparation summary from exact text mechanism facts.
+    pub fn with_replicated_text_facts(
+        mut self,
+        facts: &crate::preparation::BackendMechanismFacts,
+    ) -> Self {
+        use crate::preparation::WeightResidencyMechanism;
+
+        self.residency = [false; 4];
+        for residency in &facts.weight_residencies {
+            let request = match residency {
+                WeightResidencyMechanism::Resident => ResidencyRequest::FullyResident,
+                WeightResidencyMechanism::Windowed => ResidencyRequest::LayerwiseHost,
+                WeightResidencyMechanism::DiskStreamed => ResidencyRequest::DenseDiskStream,
+            };
+            self = self.with_residency(request, true);
+        }
+        self.with_residency(
+            ResidencyRequest::AddressableParameterBanks,
+            facts.addressable_storage.is_some(),
+        )
+        .with_exact_completion(facts.exact_completion)
+        .with_session(facts.session)
+    }
+
     /// Exact session facilities available after realization.
     pub const fn session(self) -> SessionCapabilities {
         self.session

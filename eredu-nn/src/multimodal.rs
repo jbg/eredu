@@ -296,6 +296,8 @@ pub enum MultiAxisRotaryLayout {
     /// explicit section width; exhausted secondary sections fall back to the
     /// first axis, and the completed half is repeated.
     RoundRobinSections,
+    /// Round-robin sections with unassigned frequencies left unrotated.
+    RoundRobinSectionsWithZeroOverflow,
 }
 
 /// One explicit position axis in a multi-axis rotary layout.
@@ -322,6 +324,20 @@ pub struct MultiAxisRotarySpec {
 }
 
 impl MultiAxisRotarySpec {
+    /// Resolves a global frequency to its position lane after validating the rotary spec.
+    /// An unassigned frequency in a zero-overflow layout has no lane and is unrotated.
+    pub fn round_robin_axis(&self, frequency: usize) -> Option<usize> {
+        let count = std::num::NonZeroUsize::new(self.axes.len())?.get();
+        let candidate = frequency % count;
+        if frequency / count < self.axes[candidate].dimensions as usize / 2 {
+            Some(candidate)
+        } else if self.layout == MultiAxisRotaryLayout::RoundRobinSections {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
     /// Validates the policy and returns the total rotated width.
     pub fn dimensions(&self) -> Result<i32, Error> {
         if self.axes.is_empty() || !self.base.is_finite() || self.base <= 0.0 {
@@ -578,6 +594,73 @@ pub fn reference_masked_output_projection(
     Ok(output)
 }
 
+/// One axis of a half-pixel triangle filter. Each target position retains
+/// consecutive source indices and unnormalized weights.
+pub fn antialiased_linear_weights(
+    source: i32,
+    target: i32,
+) -> Result<Vec<(usize, Vec<f32>)>, Error> {
+    if source <= 0 || target <= 0 {
+        return Err(Error::backend(
+            "resampling requires positive axis dimensions",
+        ));
+    }
+    let scale = target as f32 / source as f32;
+    let support = scale.recip().max(1.0);
+    let inverse_support = support.recip();
+    Ok((0..target)
+        .map(|coordinate| {
+            let center = (coordinate as f32 + 0.5) / scale;
+            let start = ((center - support + 0.5) as i32).max(0);
+            let end = ((center + support + 0.5) as i32).min(source);
+            let weights = (start..end)
+                .map(|sample| {
+                    (1.0 - ((sample as f32 - center + 0.5) * inverse_support).abs()).max(0.0)
+                })
+                .collect();
+            (start as usize, weights)
+        })
+        .collect())
+}
+
+pub(crate) fn resize_bilinear_antialiased<T: Tensor>(
+    table: &T,
+    height: i32,
+    width: i32,
+    context: &T::Context,
+) -> Result<T, Error> {
+    let [source_height, source_width, channels] = *table.shape() else {
+        return Err(Error::backend(
+            "resampling expects [height, width, channels]",
+        ));
+    };
+    if height == source_height && width == source_width {
+        return Ok(table.clone());
+    }
+    let coefficients = |source, target| {
+        let rows = antialiased_linear_weights(source, target)?;
+        let mut matrix = vec![0.0f32; source as usize * target as usize];
+        for (i, (start, weights)) in rows.into_iter().enumerate() {
+            let sum: f32 = weights.iter().sum();
+            let offset = i * source as usize + start;
+            for (out, weight) in matrix[offset..].iter_mut().zip(weights) {
+                *out = weight / sum;
+            }
+        }
+        T::from_f32_slice(&matrix, &[target, source], context)
+    };
+    let x = coefficients(source_width, width)?;
+    let y = coefficients(source_height, height)?;
+    let horizontal = table
+        .transpose_axes(&[0, 2, 1], context)?
+        .reshape(&[-1, source_width], context)?;
+    let horizontal = T::matmul(&horizontal, &x.transpose_axes(&[1, 0], context)?, context)?
+        .reshape(&[source_height, channels, width], context)?
+        .transpose_axes(&[0, 2, 1], context)?
+        .reshape(&[source_height, -1], context)?;
+    T::matmul(&y, &horizontal, context)?.reshape(&[height, width, channels], context)
+}
+
 /// Scalar reference for explicit multi-axis rotary cosine and sine values.
 pub fn reference_multi_axis_rotary_embeddings(
     positions: &[i32],
@@ -615,21 +698,16 @@ pub fn reference_multi_axis_rotary_embeddings(
                 let half = axis_angles.into_iter().flatten().collect::<Vec<_>>();
                 half.clone().into_iter().chain(half).collect()
             }
-            MultiAxisRotaryLayout::RoundRobinSections => {
+            MultiAxisRotaryLayout::RoundRobinSections
+            | MultiAxisRotaryLayout::RoundRobinSectionsWithZeroOverflow => {
                 let half_width = dimensions / 2;
                 let mut half = Vec::with_capacity(half_width);
                 for frequency in 0..half_width {
-                    let candidate = frequency % axis_count;
-                    let section = usize::try_from(spec.axes[candidate].dimensions / 2)
-                        .map_err(|_| Error::backend("negative rotary section"))?;
-                    let axis = if candidate != 0 && frequency < section * axis_count {
-                        candidate
-                    } else {
-                        0
-                    };
-                    let position = positions[row * axis_count + axis]
-                        .saturating_add(spec.axes[axis].position_offset)
-                        .max(spec.minimum_position) as f32;
+                    let position = spec.round_robin_axis(frequency).map_or(0.0, |axis| {
+                        positions[row * axis_count + axis]
+                            .saturating_add(spec.axes[axis].position_offset)
+                            .max(spec.minimum_position) as f32
+                    });
                     half.push(
                         position / spec.base.powf(2.0 * frequency as f32 / dimensions as f32),
                     );

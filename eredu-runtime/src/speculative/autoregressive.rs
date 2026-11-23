@@ -8,8 +8,15 @@ use eredu_core::{
     SpeculativePrefill, Submission,
 };
 
+mod causal_invocation;
+mod local_batch;
+pub use local_batch::{
+    execute_local_causal_batch, execute_local_embedded_batch, execute_local_shared_batch,
+    LocalCausalBackend, LocalCausalDraft, LocalCausalSession,
+};
 mod installed;
-mod memory_observation;
+pub(crate) mod local_causal;
+pub(crate) mod memory_observation;
 pub use installed::{
     InstalledSpeculationPrimitives, MappedSpeculativeTargetObserver, SpeculativeTargetObserver,
 };
@@ -116,10 +123,13 @@ pub trait AutoregressiveMechanisms {
     type Context<'a>: Copy;
     /// Exact verification completion.
     type Completion: BoundedCompletion<Error = Self::Error>;
-    /// Optional backend timing and resource measurements.
-    type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Whether the invocation finishes before return and can be timed on the host.
+    fn eager_component_timing() -> bool {
+        false
+    }
 
     /// Retained native bytes for an immutable verification output.
     fn verification_output_bytes(_output: &Self::Output) -> Option<u64> {
@@ -272,6 +282,8 @@ pub struct AutoregressiveExecutor<'a, M: AutoregressiveMechanisms, R: TargetRefi
     draft: &'a mut M::Model,
     capacity: std::num::NonZeroUsize,
     refinement: R,
+    timing_enabled: bool,
+    timings: eredu_core::speculative::timing::SpeculativeComponentTimings,
 }
 
 impl<'a, M: AutoregressiveMechanisms, R: TargetRefinement<M>> AutoregressiveExecutor<'a, M, R> {
@@ -287,6 +299,8 @@ impl<'a, M: AutoregressiveMechanisms, R: TargetRefinement<M>> AutoregressiveExec
             draft,
             capacity,
             refinement,
+            timing_enabled: false,
+            timings: Default::default(),
         }
     }
 }
@@ -403,8 +417,20 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
     where
         Self: 'a;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
+    type Telemetry = eredu_core::speculative::timing::SpeculativeComponentTimings;
     type Error = M::Error;
+
+    fn supports_telemetry(&self) -> bool {
+        M::eager_component_timing()
+    }
+
+    fn set_telemetry_enabled(&mut self, enabled: bool) {
+        self.timing_enabled = enabled && M::eager_component_timing();
+    }
+
+    fn take_telemetry(&mut self) -> Self::Telemetry {
+        std::mem::take(&mut self.timings)
+    }
 
     fn max_proposals(&self) -> usize {
         self.capacity.get()
@@ -435,6 +461,7 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
                 "independent drafting requires a nonempty prompt",
             ));
         }
+        let started = self.timing_enabled.then(std::time::Instant::now);
         let (_, draft_count) = M::prefill(
             self.draft,
             &input.input,
@@ -442,6 +469,9 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
             AutoregressivePass::DraftPrefill,
             context,
         )?;
+        if let Some(started) = started {
+            self.timings.draft_context += started.elapsed();
+        }
         if draft_count != count {
             return Err(M::invalid("draft and target prompt lengths differ"));
         }
@@ -489,6 +519,7 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         Self: 'context,
     {
         let mut state = M::restore(&proposal.saved, context)?;
+        let started = self.timing_enabled.then(std::time::Instant::now);
         let output = M::decode(
             self.draft,
             &[last_token],
@@ -496,6 +527,9 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
             AutoregressivePass::Proposal,
             context,
         )?;
+        if let Some(started) = started {
+            self.timings.draft_assistant += started.elapsed();
+        }
         proposal.saved = M::checkpoint(&state)?;
         M::logits(&output, 0, context)
             .map(eredu_core::speculative::SpeculativeProposalStep::CausalLogits)
@@ -536,7 +570,13 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
         if tokens.is_empty() || tokens.len() > self.capacity.get().saturating_add(1) {
             return Err(M::invalid("invalid independent draft verification width"));
         }
-        causal_verification::submit::<M>(self.target, tokens, &mut cache.target, context)
+        let started = self.timing_enabled.then(std::time::Instant::now);
+        let result =
+            causal_verification::submit::<M>(self.target, tokens, &mut cache.target, context);
+        if let Some(started) = started {
+            self.timings.target_verification += started.elapsed();
+        }
+        result
     }
 
     fn verification_logits<'context>(
@@ -567,7 +607,9 @@ impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
             return Err(M::invalid("invalid independent verification commitment"));
         }
         let tokens = &output.inputs[..verified];
-        let replayed = if verified < output.inputs.len() {
+        let replayed = if verified < output.inputs.len()
+            && !M::retain_verified_prefix(&mut cache.target, &saved.target, verified, context)?
+        {
             let mut state = M::restore(&saved.target, context)?;
             M::decode(
                 self.target,

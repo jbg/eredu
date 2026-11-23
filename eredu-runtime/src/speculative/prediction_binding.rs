@@ -449,20 +449,6 @@ where
             }
         })
     }
-
-    /// Complete durable-copy bound for the declared model-state profile.
-    fn model_snapshot_estimate(
-        _state: &Self::ModelState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        None
-    }
-    /// Copies the complete declared model-state profile after reservation.
-    fn model_snapshot(
-        _state: &Self::ModelState,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Option<Self::ModelState>, eredu_core::BackendFailure> {
-        Ok(None)
-    }
 }
 
 impl<B, M> PredictionExtensionMaterializer<B> for M

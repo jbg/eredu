@@ -1,6 +1,5 @@
 //! Portable policy and progress records for iterative token-block generation.
 
-use crate::sampling::SamplingBackend;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 
@@ -441,24 +440,60 @@ pub enum DraftEvent {
 }
 
 /// Native candidate validation for position-wise constrained finalization.
-pub trait RefinementFinalizationBackend: SamplingBackend {
+pub trait RefinementFinalizationBackend {
+    /// Complete canvas scores.
+    type CanvasScores;
+    /// Selected canvas or a scalar candidate with the same representation.
+    type CanvasTokens;
+    /// One sliced and optionally filtered position row.
+    type PositionScores;
+    /// Selected execution context.
+    type FinalizationContext: ?Sized;
+    /// Numerical or transfer failure.
+    type FinalizationError;
+
+    /// Returns [positions, vocabulary] for a valid canvas score matrix.
+    fn canvas_score_shape(scores: &Self::CanvasScores) -> Option<[usize; 2]>;
+    /// Takes a single row without dropping its position axis.
+    fn position_scores(
+        scores: &Self::CanvasScores,
+        position: usize,
+        context: &Self::FinalizationContext,
+    ) -> Result<Self::PositionScores, Self::FinalizationError>;
+    /// Applies the exact allowed-token domain to one position.
+    fn filter_position_scores(
+        scores: &Self::PositionScores,
+        filter: &crate::TokenFilter,
+        context: &Self::FinalizationContext,
+    ) -> Result<Self::PositionScores, Self::FinalizationError>;
+    /// Chooses the highest finite score, returning a single canonical token.
+    fn greedy_position(
+        scores: &Self::PositionScores,
+        context: &Self::FinalizationContext,
+    ) -> Result<Self::CanvasTokens, Self::FinalizationError>;
+    /// Validates the returned scalar against the retained vocabulary.
+    fn validate_candidate(
+        token: &Self::CanvasTokens,
+        domain: crate::sampling::TokenDomain,
+        context: &Self::FinalizationContext,
+    ) -> Result<Self::CanvasTokens, Self::FinalizationError>;
     /// Borrows one already selected canvas position as an immutable scalar token.
     fn candidate_at(
-        candidates: &Self::Token,
+        candidates: &Self::CanvasTokens,
         position: usize,
-        context: &Self::Context,
-    ) -> Result<Self::Token, Self::Error>;
+        context: &Self::FinalizationContext,
+    ) -> Result<Self::CanvasTokens, Self::FinalizationError>;
     /// Tests whether the score indexed by this token is finite.
     fn candidate_score_is_finite(
-        candidate: &Self::Token,
-        scores: &Self::Logits,
-        context: &Self::Context,
-    ) -> Result<bool, Self::Error>;
+        candidate: &Self::CanvasTokens,
+        scores: &Self::PositionScores,
+        context: &Self::FinalizationContext,
+    ) -> Result<bool, Self::FinalizationError>;
     /// Reports finite and invalid score classes for the supplied position.
     fn classify_position_scores(
-        scores: &Self::Logits,
-        context: &Self::Context,
-    ) -> Result<PositionScoreClass, Self::Error>;
+        scores: &Self::PositionScores,
+        context: &Self::FinalizationContext,
+    ) -> Result<PositionScoreClass, Self::FinalizationError>;
 }
 
 /// Numeric classification of one score row.

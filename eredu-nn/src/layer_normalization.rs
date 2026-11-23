@@ -37,6 +37,13 @@ impl DeclareLogicalParameters for LayerNormalizationConstructionSpec {
                 "layer normalization epsilon must be positive",
             ));
         }
+        if self.arithmetic == LayerNormalizationArithmetic::BlockedFloat32
+            && self.dimensions % 32 != 0
+        {
+            return Err(Error::backend(
+                "blocked layer normalization requires a width divisible by 32",
+            ));
+        }
         let mut parameters = Vec::new();
         for (parameter, role) in [
             (&self.weight, LogicalParameterRole::Normalization),

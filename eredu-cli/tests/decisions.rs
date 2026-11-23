@@ -1,8 +1,11 @@
 //! Native CLI reads and facade pinning share the ordinary operation driver.
-#![cfg(feature = "mlx")]
+#![cfg(any(feature = "mlx", feature = "candle"))]
 use eredu::api::*;
+#[cfg(not(feature = "mlx"))]
+use eredu::backends::CandleBackendFactory;
+#[cfg(feature = "mlx")]
+use eredu::backends::MlxBackendFactory;
 use eredu::runtime::chat::ChatTemplateRequest;
-use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{refinement::*, ExecutionPlan, GenerationConfigOverrides};
 use serde_json::{json, Value};
 use std::{
@@ -161,11 +164,20 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
 fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
-    let plan = ExecutionPlan::fully_resident(eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap());
-    let (mut model, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), root.path(), &plan, None)
-            .unwrap()
-            .into_parts();
+    let backend = if cfg!(feature = "mlx") {
+        "mlx"
+    } else {
+        "candle"
+    };
+    let device = eredu_core::DevicePlan::new(backend, "cpu:0").unwrap();
+    #[cfg(feature = "mlx")]
+    let factory = MlxBackendFactory::default();
+    #[cfg(not(feature = "mlx"))]
+    let factory = CandleBackendFactory::for_device(&device).unwrap();
+    let plan = ExecutionPlan::fully_resident(device);
+    let (mut model, _) = LoadedModel::load_execution_plan(&factory, root.path(), &plan, None)
+        .unwrap()
+        .into_parts();
     let chat = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![json!({"role":"user","content":"evidence"})],

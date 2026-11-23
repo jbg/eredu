@@ -164,9 +164,10 @@ pub fn inspect_artifact_metadata<R: ModelConfigurationResolver>(
                 selected,
                 configuration,
                 plan,
-                &metadata.sidecars,
+                Arc::new(metadata.sidecars.clone()),
                 resolver,
                 provenance,
+                None,
             )
         }
     }

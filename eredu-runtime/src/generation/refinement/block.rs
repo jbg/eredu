@@ -8,7 +8,7 @@ use eredu_core::refinement::RefinementBackend;
 use eredu_core::refinement::RefinementFinalizationBackend;
 use eredu_core::sampling::TokenDomain;
 use eredu_core::{
-    refinement::{GenerationPhase, RefinementPolicy},
+    refinement::{GenerationPhase, RefinementCanvas, RefinementPolicy},
     TextProgress, TokenFilter,
 };
 use std::num::NonZeroU32;
@@ -196,6 +196,15 @@ where
         context: &B::Context,
         seeds: Option<&eredu_core::refinement::RefinementCanvas>,
     ) -> Result<(), BlockRefinementError<B::Error>> {
+        self.initialize_context(self.random.clone(), seeds, context)
+    }
+
+    fn initialize_context(
+        &mut self,
+        random: B::RandomState,
+        seeds: Option<&RefinementCanvas>,
+        context: &B::Context,
+    ) -> Result<(), BlockRefinementError<B::Error>> {
         if self.phase != GenerationPhase::Context {
             return Err(BlockRefinementError::Phase);
         }
@@ -204,10 +213,11 @@ where
             self.canvas_length,
             self.domain,
             self.conditioning_format.clone(),
-            self.random.clone(),
+            random.clone(),
             seeds.or(self.canvas_layout.as_deref()),
             context,
         )?;
+        self.random = random;
         self.refinement = Some(refinement);
         self.authoritative.clear();
         self.position = 0;
@@ -235,15 +245,58 @@ where
         Ok(())
     }
 
-    /// Applies a completed context encoding and describes the progress event.
+    /// Whether the selected architecture seeds its first position from context scores.
+    pub fn needs_context_seed(&self, seed_first: bool) -> bool {
+        seed_first && self.canvas_layout.is_none()
+    }
+
+    /// Applies one context encoding, optionally seeding position zero from causal scores.
+    /// The masked seed uses the exact same numerical policy and random stream as the block.
     pub fn accept_context(
         &mut self,
-        random: B::RandomState,
-        seeds: Option<&eredu_core::refinement::RefinementCanvas>,
+        seed_scores: Option<&B::Logits>,
         context: &B::Context,
     ) -> Result<TextProgress, BlockRefinementError<B::Error>> {
-        self.replace_random(random);
-        self.context_encoded(context, seeds)?;
+        let mut random = self.random.clone();
+        let seeds = if let Some(scores) = seed_scores {
+            let RefinementPolicy::MaskedUnmasking {
+                config,
+                mask_token_id,
+            } = self.config
+            else {
+                return Err(BlockRefinementError::Phase);
+            };
+            let canvas = B::materialize_tokens(&[mask_token_id], context)
+                .map_err(RefinementError::Backend)?;
+            let sampled = super::masked::step::<B>(
+                &canvas,
+                None,
+                scores,
+                mask_token_id,
+                config,
+                1,
+                &mut random,
+                context,
+            )?;
+            let tokens =
+                B::read_tokens(&sampled.canvas, context).map_err(RefinementError::Backend)?;
+            let [token] = tokens.as_slice() else {
+                return Err(RefinementError::Geometry.into());
+            };
+            let mut seed_tokens = vec![None; self.canvas_length.get() as usize];
+            seed_tokens[0] = Some(*token);
+            Some(RefinementCanvas {
+                seed_tokens,
+                pinned_positions: if *token == mask_token_id {
+                    vec![]
+                } else {
+                    vec![0]
+                },
+            })
+        } else {
+            None
+        };
+        self.initialize_context(random, seeds.as_ref(), context)?;
         Ok(TextProgress {
             phase: GenerationPhase::Context,
             block: self.block,
@@ -275,18 +328,16 @@ where
         filter: &TokenFilter,
         context: &<B as RefinementBackend>::Context,
     ) -> Result<
-        FinalizedPosition<<B as RefinementBackend>::Token, <B as RefinementBackend>::Logits>,
+        FinalizedPosition<<B as RefinementBackend>::Token, B::PositionScores>,
         BlockRefinementError<<B as RefinementBackend>::Error>,
     >
     where
         B: RefinementFinalizationBackend<
-            Token = <B as RefinementBackend>::Token,
-            Logits = <B as RefinementBackend>::Logits,
-            Context = <B as RefinementBackend>::Context,
-            Error = <B as RefinementBackend>::Error,
+            CanvasTokens = B::Token,
+            CanvasScores = B::Logits,
+            FinalizationContext = B::Context,
+            FinalizationError = B::Error,
         >,
-        <B as RefinementBackend>::Logits:
-            eredu_nn::Tensor<Context = <B as RefinementBackend>::Context>,
     {
         let (scores, position) = self.finalization_input()?;
         let finalized = finalize_refinement_position::<B>(

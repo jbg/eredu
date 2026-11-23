@@ -383,7 +383,7 @@ impl CaptureSession {
 
     /// Invoked while the architecture borrows a tensor. A skipped point never calls
     /// the native transform and never clones a native tensor handle.
-    pub fn observe<B: CaptureBackend>(
+    pub fn observe<B: CaptureBackend + ?Sized>(
         &mut self,
         backend: &mut B,
         path: &str,
@@ -394,7 +394,7 @@ impl CaptureSession {
 
     // Generated sources can fail portable contract checks after reservation.
     // Classify those before finalizing the record, using the same forward driver.
-    fn observe_classified<B: CaptureBackend>(
+    fn observe_classified<B: CaptureBackend + ?Sized>(
         &mut self,
         backend: &mut B,
         path: &str,
@@ -525,7 +525,7 @@ impl CaptureSession {
 
 /// Shared transformation path for ordinary captures and intervention evidence.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn capture_value<B: CaptureBackend>(
+pub(crate) fn capture_value<B: CaptureBackend + ?Sized>(
     backend: &mut B,
     tensor: &B::Tensor,
     selection: &CaptureSelection,
@@ -555,7 +555,7 @@ pub(crate) fn capture_value<B: CaptureBackend>(
 
 /// The native reservation/transform sequence shared by ordinary observations,
 /// intervention evidence and globally identified partition fragments.
-pub(super) fn capture_resolved_value<B: CaptureBackend>(
+pub(super) fn capture_resolved_value<B: CaptureBackend + ?Sized>(
     backend: &mut B,
     tensor: &B::Tensor,
     selection: &CaptureSelection,

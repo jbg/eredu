@@ -3543,6 +3543,30 @@ pub fn select_state_realization(
             issues.push(name.into());
         }
     }
+    if request.prompt_cache
+        && matches!(request.state, CacheResidencyPolicy::Device)
+        && (request.topology.is_some()
+            || !matches!(
+                requirements.access,
+                ReplicatedTextStateAccess::KeyValue | ReplicatedTextStateAccess::AttentionWithFixed
+            )
+            || !requirements.layout.layers().iter().all(|layer| {
+                use eredu_core::cache::LayerCachePolicy;
+                match layer {
+                    LayerCachePolicy::KeyValue { attention, .. }
+                    | LayerCachePolicy::KeyValueWithState { attention, .. } => {
+                        layer.append_streams().is_empty()
+                            && attention
+                                .sliding_window_i32()
+                                .is_ok_and(|window| window != Some(1))
+                    }
+                    LayerCachePolicy::FixedState { .. } => true,
+                    _ => false,
+                }
+            }))
+    {
+        issues.push("resident prompt-cache requires local key/value or fixed state".into());
+    }
     if request.prompt_cache && !capabilities.prompt_cache {
         issues.push("state prompt-cache persistence".into());
     }

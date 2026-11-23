@@ -31,9 +31,10 @@ fn sort3(scores: &[f32], ids: &mut [usize], x: usize, y: usize, z: usize) -> boo
     true
 }
 
-/// The caller supplies ascending source IDs and a valid nth position. Scores
-/// use ascending comparison, so largest-value selection passes negated scores.
-pub(super) fn partition_ids(scores: &[f32], ids: &mut [usize], nth: usize) {
+/// Partitions ascending source IDs by score using value-only median partition.
+/// Largest-value selection passes negated scores. The caller supplies matching
+/// nonempty rows and an in-range pivot.
+pub fn partition_ids(scores: &[f32], ids: &mut [usize], nth: usize) {
     let (mut first, mut last) = (0, ids.len());
     loop {
         let length = last - first;
@@ -168,4 +169,76 @@ pub(super) fn partition_ids(scores: &[f32], ids: &mut [usize], nth: usize) {
             first = i + 1;
         }
     }
+}
+
+/// Evaluates a scalar logistic score without an overflowing exponential.
+pub fn sigmoid(value: f32) -> f32 {
+    if value >= 0. {
+        1. / (1. + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1. + exp)
+    }
+}
+
+/// Evaluates scalar softplus without an overflowing exponential.
+pub fn softplus(value: f32) -> f32 {
+    value.max(0.) + (-value.abs()).exp().ln_1p()
+}
+
+/// Selects one host score row, optionally restricting eligibility to the
+/// partitions with the largest two-score sums. Native backends own score
+/// formation and the rounding of those partition sums.
+pub fn select_row(
+    scores: &[f32],
+    spec: crate::TopKGroupSelectionSpec,
+    round_sum: impl Fn(f32) -> f32,
+) -> Result<Vec<i32>, crate::Error> {
+    use crate::{Error, GroupSelectionOrder};
+    let groups = spec.group_count() as usize;
+    let count = spec.top_k() as usize;
+    if scores.len() != groups || scores.iter().any(|x| x.is_nan() || *x == f32::INFINITY) {
+        return Err(Error::backend("invalid group ranking scores"));
+    }
+    let partitions = spec.selection_partitions() as usize;
+    let selected = spec.selected_groups() as usize;
+    let width = groups / partitions;
+    let mut eligible = scores.to_vec();
+    if selected != partitions {
+        let mut rank: Vec<_> = scores
+            .chunks_exact(width)
+            .enumerate()
+            .map(|(id, row)| {
+                let mut top = [f32::NEG_INFINITY; 2];
+                for &value in row {
+                    if value > top[0] {
+                        top = [value, top[0]];
+                    } else if value > top[1] {
+                        top[1] = value;
+                    }
+                }
+                let score = if width == 1 {
+                    top[0]
+                } else {
+                    round_sum(top[0] + top[1])
+                };
+                (id, score)
+            })
+            .collect();
+        rank.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        for &(id, _) in &rank[selected..] {
+            eligible[id * width..][..width].fill(f32::NEG_INFINITY);
+        }
+    }
+    let mut ids: Vec<_> = (0..groups).collect();
+    match spec.order() {
+        GroupSelectionOrder::Partition => {
+            let descending: Vec<_> = eligible.iter().map(|&x| -x).collect();
+            partition_ids(&descending, &mut ids, count - 1);
+        }
+        GroupSelectionOrder::Ranked => {
+            ids.sort_unstable_by(|&a, &b| eligible[b].total_cmp(&eligible[a]).then(a.cmp(&b)));
+        }
+    }
+    Ok(ids[..count].iter().map(|&id| id as i32).collect())
 }

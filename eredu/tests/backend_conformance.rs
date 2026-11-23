@@ -5,6 +5,7 @@
 //! speculative, realtime, distributed, automatic-planning, and residency
 //! realization call shapes.
 
+#[cfg(feature = "tensor-capture")]
 use eredu_core::backend::TextOperationDriver;
 use eredu_runtime::speculative::autoregressive::SpeculativeGenerationBackend;
 
@@ -75,6 +76,8 @@ mod iterative;
 
 #[path = "backend_conformance/chat_input.rs"]
 mod chat_input;
+#[path = "backend_conformance/checkpoint_recipe.rs"]
+mod checkpoint_recipe;
 #[path = "backend_conformance/control.rs"]
 mod control;
 #[path = "backend_conformance/controlled_speculative.rs"]
@@ -917,6 +920,9 @@ impl ModelCapabilitySession<MockBackend> for MockSession {
             planned_disk_backed_bytes: unavailable(),
             backend_active_allocation_bytes: unavailable(),
             backend_allocator_cache_bytes: unavailable(),
+            backend_device_allocated_bytes: eredu_core::Observed::unavailable(
+                "device total was not measured",
+            ),
             physical_semantics: PhysicalMemorySemantics::Unknown,
             currently_cached_shards: unavailable(),
         })
@@ -1265,7 +1271,9 @@ impl ExecutionPlanBackendFactory<eredu_architectures::processor_plan::ArtifactAr
     type DraftFacts = FixtureDraftAdmission;
     type DraftBinding = ();
 
-    fn draft_inputs(&self) {}
+    fn draft_inputs(&self, _: &ExecutionPlan) -> Result<(), AutomaticPlanningError> {
+        Ok(())
+    }
 
     fn begin_external_draft(
         &self,
@@ -3544,7 +3552,7 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
         for captures in [false, true] {
             for provenance in [CaptureProvenance::Session, CaptureProvenance::ContentExact] {
                 observed_mock::reset_content_discovery_calls();
-                let mut model = unicode_model(None);
+                let mut model = unicode_model_with_vocabulary(None, 2_001);
                 let chat = model
                     .prepare_chat(ChatTemplateRequest {
                         messages: vec![serde_json::json!({"role":"user","content":"hello"})],
@@ -3558,9 +3566,12 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
                     CapturePlan::none()
                 };
                 plan.provenance = provenance;
+                let prompt = multimodal_client_code(&model);
+                assert!(prompt.contains(&2_001));
                 let prepared = model
-                    .prepare_observed_chat(
+                    .prepare_observed_input(
                         &chat,
+                        prompt.clone(),
                         PreparedChatGenerationSettings {
                             overrides: GenerationConfigOverrides {
                                 max_new_tokens: Some(2),
@@ -3575,6 +3586,11 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
                         },
                     )
                     .unwrap();
+                assert_eq!(prepared.prompt_token_ids(), prompt);
+                assert_eq!(
+                    prepared.capture_plan().request().prompt_tokens,
+                    prompt.len() as u64
+                );
                 assert_eq!(
                     observed_mock::content_discovery_calls(),
                     usize::from(provenance == CaptureProvenance::ContentExact)
@@ -3637,6 +3653,11 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
                         .unwrap()
                         .token_ids
                 };
+                assert!(matches!(
+                    &records[0].event,
+                    eredu::api::ObservedGenerationEvent::Started { prompt_token_ids, .. }
+                        if *prompt_token_ids == prompt
+                ));
                 assert!(records.iter().all(|record| {
                     record.artifact_identity.as_deref()
                         == (provenance == CaptureProvenance::ContentExact)

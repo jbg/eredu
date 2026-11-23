@@ -34,7 +34,7 @@ jobs:
           python3 -m pip install --user "cmake>=3.25" "meson>=0.63" ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check the portable workspace with the locked MSRV
-        run: cargo check --locked --workspace --all-targets --no-default-features
+        run: cargo check --locked --workspace --exclude eredu-cli --all-targets --no-default-features
       - name: Check standalone weak facade features with the locked MSRV
         run: |
           cargo check --locked -p eredu --no-default-features --features metal
@@ -51,6 +51,7 @@ jobs:
           cargo check --locked -p eredu-backend-mlx --all-targets --no-default-features --features "accelerate,metal,image"
           cargo check --locked -p eredu --all-targets --no-default-features --features "mlx,metal,distributed,image,audio,onig,esaxx_fast"
           cargo check --locked -p eredu-cli --all-targets
+          cargo check --locked -p eredu -p eredu-cli --no-default-features --features eredu/candle,eredu-cli/candle
 
   cpu:
     runs-on: ubuntu-22.04

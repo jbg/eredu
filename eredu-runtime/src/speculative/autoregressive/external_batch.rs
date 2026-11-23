@@ -15,7 +15,6 @@ use super::{
     ResidentBatchMechanisms,
 };
 use crate::{
-    executable_binding::ErasedExternalPredictionExecutable,
     speculative::{
         prepare_speculative_batch_lanes, run_speculative_batch, BoundAssistantDispatch,
         ExternalAssistantConstruction, ExternalAssistantExecutionMechanisms,
@@ -194,7 +193,7 @@ where
                         &(),
                         M::reborrow_context(context),
                         topology,
-                        M::collect_component_timings(),
+                        eredu_core::speculative::timing::component_timing_enabled(),
                         visitor,
                     )?)
                 }
@@ -213,19 +212,17 @@ where
                                     .into(),
                         }
                     })?;
-                    assistant
-                        .dispatch_mut()
-                        .visit_executor(ConditionedBatch::<B, M, C, V> {
-                            target,
-                            capture,
-                            runner: ConditionedExecutorRunner {
-                                lanes,
-                                selected,
-                                context: M::reborrow_context(context),
-                                topology,
-                                visitor,
-                            },
-                        })
+                    run_conditioned_batch::<M::AssistantMechanisms, _, _, _, B::Error>(
+                        target,
+                        assistant.dispatch_mut(),
+                        capture,
+                        &selected,
+                        lanes,
+                        M::reborrow_context(context),
+                        topology,
+                        eredu_core::speculative::timing::component_timing_enabled(),
+                        visitor,
+                    )
                 }
             })();
             draft.settle(result)
@@ -233,99 +230,145 @@ where
     )
 }
 
-type PreparedLane<'a, B, M, C> = SpeculativeBatchLane<
-    'a,
-    crate::text_session_driver::TextPromptFor<B>,
-    super::batch::BatchSampler<B, M, C>,
-    <super::batch::BatchSampler<B, M, C> as SpeculativeSampling>::Seed,
->;
-
-struct ConditionedBatch<'a, 'lane, B, M, C, V>
-where
-    B: eredu_core::TextGenerationBackend,
-    M: ExternalBatchMechanisms<B>,
-    C: SpeculativeTokenFilterController + 'static,
-{
-    target: &'a mut dyn ErasedExternalPredictionExecutable<M::ExecutableTypes>,
+/// Runs a bound conditioned assistant through the portable batch scheduler.
+pub fn run_conditioned_batch<M, D, S, V, E>(
+    target: &mut crate::speculative::ExternalAssistantTarget<M>,
+    assistant: &mut D,
     capture: ExternalPredictionCaptureRequest,
-    runner: ConditionedExecutorRunner<'a, 'lane, B, M, C, V>,
+    selected: &SelectedSpeculativeRealization,
+    lanes: Vec<AssistantLane<'_, M, S>>,
+    context: M::Context<'_>,
+    topology: SpeculativeExecutionTopology,
+    collect_timings: bool,
+    visitor: V,
+) -> Result<SpeculativeGenerationBatchOutput, E>
+where
+    M: ExternalAssistantExecutionMechanisms,
+    D: BoundAssistantDispatch<M::Binder>,
+    S: for<'a> SpeculativeSampling<
+            Logits = M::Logits,
+            Error = M::Error,
+            Context<'a> = M::Context<'a>,
+        > + 'static,
+    V: SpeculativeGenerationVisitor,
+    E: From<SpeculativeDriverError<M::Error>>,
+{
+    assistant.visit_executor(ConditionedBatch::<M, S, V, E> {
+        target,
+        capture,
+        runner: ConditionedExecutorRunner {
+            lanes,
+            selected,
+            context: M::reborrow_context(context),
+            topology,
+            collect_timings,
+            visitor,
+            error: std::marker::PhantomData,
+        },
+    })
 }
 
-impl<B, M, C, V> SelectedAssistantExecutionVisitor<M::AssistantBinder>
-    for ConditionedBatch<'_, '_, B, M, C, V>
+type AssistantLane<'a, M, S> = SpeculativeBatchLane<
+    'a,
+    crate::speculative::ExternalAssistantPrompt<M>,
+    S,
+    <S as SpeculativeSampling>::Seed,
+>;
+
+struct ConditionedBatch<'a, 'lane, M, S, V, E>
 where
-    B: eredu_core::TextGenerationBackend,
-    M: ExternalBatchMechanisms<B>,
-    C: SpeculativeTokenFilterController + 'static,
-    V: SpeculativeGenerationVisitor,
-    B::Error: From<SpeculativeDriverError<M::Error>>,
+    M: ExternalAssistantExecutionMechanisms,
+    S: SpeculativeSampling,
 {
-    type Output = Result<SpeculativeGenerationBatchOutput, B::Error>;
+    target: &'a mut crate::speculative::ExternalAssistantTarget<M>,
+    capture: ExternalPredictionCaptureRequest,
+    runner: ConditionedExecutorRunner<'a, 'lane, M, S, V, E>,
+}
+
+impl<M, S, V, E> SelectedAssistantExecutionVisitor<M::Binder>
+    for ConditionedBatch<'_, '_, M, S, V, E>
+where
+    M: ExternalAssistantExecutionMechanisms,
+    S: for<'a> SpeculativeSampling<
+            Logits = M::Logits,
+            Error = M::Error,
+            Context<'a> = M::Context<'a>,
+        > + 'static,
+    V: SpeculativeGenerationVisitor,
+    E: From<SpeculativeDriverError<M::Error>>,
+{
+    type Output = Result<SpeculativeGenerationBatchOutput, E>;
 
     fn visit<A, Dispatch>(
         self,
-        assistant: &mut crate::speculative::InstalledExternalAssistant<M::AssistantBinder, A>,
+        assistant: &mut crate::speculative::InstalledExternalAssistant<M::Binder, A>,
         dispatch: Dispatch,
     ) -> Self::Output
     where
         A: ExternalAssistantConstruction,
         Dispatch: SelectedAssistantExecutor<A>,
     {
-        dispatch.execute::<M::AssistantMechanisms, _>(
-            self.target,
-            assistant,
-            self.capture,
-            self.runner,
-        )
+        dispatch.execute::<M, _>(self.target, assistant, self.capture, self.runner)
     }
 }
 
-struct ConditionedExecutorRunner<'a, 'lane, B, M, C, V>
+struct ConditionedExecutorRunner<'a, 'lane, M, S, V, E>
 where
-    B: eredu_core::TextGenerationBackend,
-    M: ExternalBatchMechanisms<B>,
-    C: SpeculativeTokenFilterController + 'static,
+    M: ExternalAssistantExecutionMechanisms,
+    S: SpeculativeSampling,
 {
-    lanes: Vec<PreparedLane<'lane, B, M, C>>,
-    selected: SelectedSpeculativeRealization,
+    lanes: Vec<AssistantLane<'lane, M, S>>,
+    selected: &'a SelectedSpeculativeRealization,
     context: M::Context<'a>,
     topology: SpeculativeExecutionTopology,
+    collect_timings: bool,
     visitor: V,
+    error: std::marker::PhantomData<fn() -> E>,
 }
 
-impl<A, B, M, C, V> ExternalAssistantExecutorVisitor<A, M::AssistantMechanisms>
-    for ConditionedExecutorRunner<'_, '_, B, M, C, V>
+impl<A, M, S, V, F> ExternalAssistantExecutorVisitor<A, M>
+    for ConditionedExecutorRunner<'_, '_, M, S, V, F>
 where
     A: ExternalAssistantConstruction,
-    B: eredu_core::TextGenerationBackend,
-    M: ExternalBatchMechanisms<B>,
-    C: SpeculativeTokenFilterController + 'static,
+    M: ExternalAssistantExecutionMechanisms,
+    S: for<'a> SpeculativeSampling<
+            Logits = M::Logits,
+            Error = M::Error,
+            Context<'a> = M::Context<'a>,
+        > + 'static,
     V: SpeculativeGenerationVisitor,
-    B::Error: From<SpeculativeDriverError<M::Error>>,
+    F: From<SpeculativeDriverError<M::Error>>,
 {
-    type Output = Result<SpeculativeGenerationBatchOutput, B::Error>;
+    type Output = Result<SpeculativeGenerationBatchOutput, F>;
 
     fn execute<'run, E>(self, executor: &'run mut E) -> Self::Output
     where
         Self: 'run,
         E: SpeculativeCacheFactory<
-            SelectedSpeculativeRealization,
-            Input = M::Input,
-            Cache = crate::speculative::ExternalAssistantCache<<M::AssistantMechanisms as ExternalAssistantExecutionMechanisms>::NativeCache>,
-            Logits = M::Logits,
-            Context<'run> = M::Context<'run>,
-            Completion = <M::AssistantMechanisms as ExternalAssistantExecutionMechanisms>::Completion,
-            Telemetry = <M::AssistantMechanisms as ExternalAssistantExecutionMechanisms>::Telemetry,
-            Error = M::Error,
-        > + 'run,
-{
+                SelectedSpeculativeRealization,
+                Input = crate::speculative::ExternalAssistantPrompt<M>,
+                Cache = crate::speculative::ExternalAssistantCache<M::NativeCache>,
+                Logits = M::Logits,
+                Context<'run> = M::Context<'run>,
+                Completion = M::Completion,
+                Telemetry = (),
+                Error = M::Error,
+            > + eredu_core::speculative::GenerationExecutorCacheFactory<
+                crate::speculative::AssistantExecutorTypes<M>,
+            > + 'run,
+        E::Cache: 'static,
+        E::TargetState: 'static,
+        E::DraftState: 'static,
+        E::CacheCheckpoint: 'static,
+        E::Verification: 'static,
+    {
         Ok(run_speculative_batch(
             executor,
             self.lanes,
-            &self.selected,
+            self.selected,
             M::reborrow_context(self.context),
             self.topology,
-            M::collect_component_timings(),
+            self.collect_timings,
             self.visitor,
         )?)
     }

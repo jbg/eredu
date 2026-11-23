@@ -125,67 +125,9 @@ pub struct YarnRope {
     pub freqs: Array,
 }
 
-fn yarn_inverse_frequency_values(
-    dims: i32,
-    base: f32,
-    factor: f32,
-    original_context: f32,
-    beta_fast: f32,
-    beta_slow: f32,
-    truncate: bool,
-) -> Vec<f32> {
-    let correction = |rotations: f32| {
-        dims as f64
-            * (original_context as f64 / (rotations as f64 * 2.0 * std::f64::consts::PI)).ln()
-            / (2.0 * (base as f64).ln())
-    };
-    let low = if truncate {
-        correction(beta_fast).floor()
-    } else {
-        correction(beta_fast)
-    }
-    .max(0.0) as f32;
-    let high = if truncate {
-        correction(beta_slow).ceil()
-    } else {
-        correction(beta_slow)
-    }
-    .min((dims - 1) as f64) as f32;
-    let width = if low == high { 0.001 } else { high - low };
-    (0..dims / 2)
-        .map(|index| {
-            let base_frequency = base.powf(2.0 * index as f32 / dims as f32);
-            let ramp = ((index as f32 - low) / width).clamp(0.0, 1.0);
-            let extrapolation_mask = 1.0 - ramp;
-            (1.0 / (factor * base_frequency)) * (1.0 - extrapolation_mask)
-                + (1.0 / base_frequency) * extrapolation_mask
-        })
-        .collect()
-}
-
 impl YarnRope {
     /// Constructs a YaRN RoPE module.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        dims: i32,
-        traditional: bool,
-        base: f32,
-        factor: f32,
-        original_context: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        amplitude: f32,
-        truncate: bool,
-    ) -> Self {
-        let values = yarn_inverse_frequency_values(
-            dims,
-            base,
-            factor,
-            original_context,
-            beta_fast,
-            beta_slow,
-            truncate,
-        );
+    pub fn new(dims: i32, traditional: bool, values: &[f32], amplitude: f32) -> Self {
         Self {
             dimensions: dims,
             traditional,
@@ -332,6 +274,7 @@ pub(super) struct ElementwiseRotary {
     inverse_frequencies: Array,
     amplitude: f32,
     arithmetic: eredu_nn::RotaryArithmetic,
+    recurrence: Option<(f32, f32)>,
 }
 
 impl ElementwiseRotary {
@@ -343,11 +286,7 @@ impl ElementwiseRotary {
         let (inverse_frequencies, amplitude) = match native {
             RopeVariant::Yarn(rope) => {
                 let PreparedRotaryAlgorithm::Yarn {
-                    factor,
-                    original_max_positions,
-                    beta_fast,
-                    beta_slow,
-                    truncate,
+                    ref inverse_frequencies,
                     ..
                 } = spec.algorithm
                 else {
@@ -355,17 +294,8 @@ impl ElementwiseRotary {
                         "rotary algorithm and materialization disagree",
                     ));
                 };
-                let values = yarn_inverse_frequency_values(
-                    spec.dimensions,
-                    spec.base,
-                    factor,
-                    original_max_positions as f32,
-                    beta_fast,
-                    beta_slow,
-                    truncate,
-                );
                 (
-                    Array::from_slice(&values, &[spec.dimensions / 2]),
+                    Array::from_slice(inverse_frequencies, &[spec.dimensions / 2]),
                     rope.concentration,
                 )
             }
@@ -384,9 +314,17 @@ impl ElementwiseRotary {
                 (Array::from_slice(&values, &[spec.dimensions / 2]), 1.0)
             }
         };
+        let recurrence = match (&spec.algorithm, spec.arithmetic) {
+            (
+                PreparedRotaryAlgorithm::Standard { factor },
+                eredu_nn::RotaryArithmetic::RecurrentFloat32,
+            ) => Some((spec.base, factor.recip())),
+            _ => None,
+        };
         Ok(Self {
             dimensions: spec.dimensions,
             traditional: spec.traditional,
+            recurrence,
             inverse_frequencies,
             amplitude,
             arithmetic: spec.arithmetic,
@@ -415,24 +353,44 @@ impl ElementwiseRotary {
         let length = input.dim(-2);
         let width = input.dim(-1);
         let x = input.reshape(&[-1, length, width], stream)?;
-        let positions = Array::arange::<_, f32>(Some(offset), offset + length, None, stream)?
-            .expand_dims(-1, stream)?;
-        let angles = positions.multiply(&self.inverse_frequencies, stream)?;
-        let amplitude = Array::from_f32(self.amplitude);
-        let table_type = if self.arithmetic == eredu_nn::RotaryArithmetic::Float32Products {
-            safemlx::Dtype::Float32
+        let (cos, sin) = if let Some((base, scale)) = self.recurrence {
+            let (sin, cos): (Vec<f32>, Vec<f32>) = eredu_nn::arithmetic::recurrent_rotary_tables(
+                length as usize,
+                self.dimensions as usize,
+                base,
+                scale,
+                offset,
+            )
+            .into_iter()
+            .unzip();
+            let shape = [length, self.dimensions / 2];
+            (
+                Array::from_slice(&cos, &shape),
+                Array::from_slice(&sin, &shape),
+            )
         } else {
-            input.dtype()
+            let positions = Array::arange::<_, f32>(Some(offset), offset + length, None, stream)?
+                .expand_dims(-1, stream)?;
+            let angles = positions.multiply(&self.inverse_frequencies, stream)?;
+            let amplitude = Array::from_f32(self.amplitude);
+            let table_type = if self.arithmetic == eredu_nn::RotaryArithmetic::Float32Products {
+                safemlx::Dtype::Float32
+            } else {
+                input.dtype()
+            };
+            (
+                cos(&angles, stream)?
+                    .multiply(&amplitude, stream)?
+                    .as_dtype(table_type, stream)?,
+                sin(&angles, stream)?
+                    .multiply(&amplitude, stream)?
+                    .as_dtype(table_type, stream)?,
+            )
         };
-        let cos = cos(&angles, stream)?
-            .multiply(&amplitude, stream)?
-            .as_dtype(table_type, stream)?;
-        let sin = sin(&angles, stream)?
-            .multiply(&amplitude, stream)?
-            .as_dtype(table_type, stream)?;
         let (cos, sin, rotary) = match self.arithmetic {
             eredu_nn::RotaryArithmetic::InputTableFloat32Products
-            | eredu_nn::RotaryArithmetic::Float32Products => (
+            | eredu_nn::RotaryArithmetic::Float32Products
+            | eredu_nn::RotaryArithmetic::RecurrentFloat32 => (
                 cos.as_dtype(safemlx::Dtype::Float32, stream)?,
                 sin.as_dtype(safemlx::Dtype::Float32, stream)?,
                 x.try_index_device((.., .., ..self.dimensions), stream)?
@@ -457,12 +415,23 @@ impl ElementwiseRotary {
                 rotary.try_index_device((.., .., half..), stream)?,
             )
         };
-        let left = first
-            .multiply(&cos, stream)?
-            .subtract(second.multiply(&sin, stream)?, stream)?;
-        let right = second
-            .multiply(&cos, stream)?
-            .add(first.multiply(&sin, stream)?, stream)?;
+        let (left, right) = if self.recurrence.is_some() {
+            let left_add = second.multiply(&sin, stream)?.negative(stream)?;
+            let right_add = second.multiply(&cos, stream)?;
+            (
+                super::arithmetic::fused_f32(&first, &cos, &left_add, stream)?,
+                super::arithmetic::fused_f32(&first, &sin, &right_add, stream)?,
+            )
+        } else {
+            (
+                first
+                    .multiply(&cos, stream)?
+                    .subtract(second.multiply(&sin, stream)?, stream)?,
+                second
+                    .multiply(&cos, stream)?
+                    .add(first.multiply(&sin, stream)?, stream)?,
+            )
+        };
         let rotated = if self.traditional {
             concatenate_axis(
                 &[
@@ -545,25 +514,13 @@ pub fn initialize_rope(
             stream,
         )?)),
         PreparedRotaryAlgorithm::Yarn {
-            factor,
-            original_max_positions,
-            beta_fast,
-            beta_slow,
+            ref inverse_frequencies,
             amplitude,
-            truncate,
-        } => {
-            let rope = YarnRope::new(
-                dims,
-                traditional,
-                base,
-                factor,
-                original_max_positions as f32,
-                beta_fast,
-                beta_slow,
-                amplitude,
-                truncate,
-            );
-            Ok(RopeVariant::Yarn(rope))
-        }
+        } => Ok(RopeVariant::Yarn(YarnRope::new(
+            dims,
+            traditional,
+            inverse_frequencies,
+            amplitude,
+        ))),
     }
 }

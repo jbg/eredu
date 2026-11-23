@@ -56,9 +56,6 @@ impl IQuantTensor {
             decoder.decode_into(&self.data, &mut output)?;
             return Ok(output);
         }
-        if self.ggml_type.is_iq() {
-            return crate::iquant::decode_f32(self.ggml_type, &self.data, self.endian);
-        }
         let descriptor = TensorDescriptor {
             name: "<native blocks>".to_string(),
             dimensions: self.shape.iter().rev().copied().collect(),
@@ -98,19 +95,12 @@ impl AffineTensor {
     pub fn dequantize(&self) -> Vec<f32> {
         let count = self.scales.len() * self.group_size as usize;
         let mut out = Vec::with_capacity(count);
-        let mask = (1u32 << self.bits) - 1;
         for index in 0..count {
-            let bit = index * self.bits as usize;
-            let word = bit / 32;
-            let shift = bit % 32;
-            let mut code = self.weights[word] >> shift;
-            if shift + self.bits as usize > 32 {
-                code |= self.weights[word + 1] << (32 - shift);
-            }
+            let code = crate::packed_words::unpack_code(&self.weights, index, self.bits as usize);
             let group = index / self.group_size as usize;
             let scale = f16::from_bits(self.scales[group]).to_f32();
             let bias = f16::from_bits(self.biases[group]).to_f32();
-            out.push(scale * (code & mask) as f32 + bias);
+            out.push(scale * code as f32 + bias);
         }
         out
     }
@@ -150,14 +140,15 @@ pub(crate) fn conversion_kind(ty: GgmlType, endian: Endian) -> Result<Conversion
     if ty == GgmlType::MxFp4 {
         return Ok(ConversionKind::MxFp4);
     }
-    let (bits, group_size) = match affine_config(ty) {
+    let (bits, group_size) = match affine_layout(ty) {
         Some(config) => config,
         None => return Err(Error::UnsupportedTensorType(ty.code())),
     };
     Ok(ConversionKind::Affine { bits, group_size })
 }
 
-fn affine_config(ty: GgmlType) -> Option<(u8, u32)> {
+/// Bit width and group size of the canonical affine representation.
+pub fn affine_layout(ty: GgmlType) -> Option<(u8, u32)> {
     Some(match ty {
         GgmlType::Q2K => (2, 16),
         GgmlType::Q3K => (3, 16),
@@ -344,7 +335,7 @@ pub fn convert_affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Re
 }
 
 fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineTensor> {
-    let (bits, group_size) = affine_config(desc.ggml_type)
+    let (bits, group_size) = affine_layout(desc.ggml_type)
         .ok_or_else(|| Error::tensor(&desc.name, "tensor encoding has no affine conversion"))?;
     let (weight_shape, scale_shape) = affine_shapes(desc, bits, group_size)?;
     let groups = scale_shape.iter().try_fold(1u64, |a, &b| {
@@ -444,26 +435,15 @@ fn pack(codes: &[u8], bits: u8, out: &mut Vec<u32>) {
     }
 }
 
-fn scale_min(s: &[u8], i: usize) -> (u8, u8) {
-    if i < 4 {
-        (s[i] & 63, s[i + 4] & 63)
-    } else {
-        (
-            (s[i + 4] & 15) | ((s[i - 4] >> 6) << 4),
-            (s[i + 4] >> 4) | ((s[i] >> 6) << 4),
-        )
-    }
-}
 fn q45k(raw: &[u8], e: Endian, is_q5: bool, out: &mut AffineTensor) {
     let size = if is_q5 { 176 } else { 144 };
     for b in raw.chunks_exact(size) {
         let d = f16::from_bits(half(b, e)).to_f32();
         let dm = f16::from_bits(half(&b[2..], e)).to_f32();
-        let s = &b[4..16];
+        let scales = crate::unpack_k_scale_min(b[4..16].try_into().expect("K-block scale table"));
         let qh = if is_q5 { Some(&b[16..48]) } else { None };
         let qs = if is_q5 { &b[48..] } else { &b[16..] };
-        for g in 0..8 {
-            let (sc, m) = scale_min(s, g);
+        for (g, (sc, m)) in scales.into_iter().enumerate() {
             out.scales.push(hbits(d * sc as f32));
             out.biases.push(hbits(-dm * m as f32));
             let mut c = [0; 32];

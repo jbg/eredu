@@ -390,11 +390,11 @@ EREDU_CONTINUATION_MODEL=/path/to/SmolLM2-135M-Instruct \
 
 `forecast_generation` borrows the same request accepted by
 uninterrupted generation and `with_controlled`. `forecast_speculative_token_ids` exposes the
-same projection for consumers that already counted/tokenized the input. The MLX
-adapter currently supplies complete speculative resource facts for **independent
-autoregressive drafters** when both models have ordinary workspace coverage.
-Both must already be loaded. Forecasting reads retained geometry, residency and
-native policy; it does not allocate a cache, run either model or consume a request.
+same projection for consumers that already counted or tokenized the input.
+Loaded Candle and MLX targets and independent autoregressive drafts supply their
+own retained geometry, residency, device headroom, and allocator observations.
+Forecasting reads these observations without allocating a cache, running either
+model, or consuming a request.
 
 The runtime projects full-pass prefill, drafting, verification and commitment
 phases. Each includes distinct target/draft parameters, canonical caches,
@@ -403,9 +403,11 @@ replay and retained sampling distributions. Verification and replay permit K+1
 rows for K draft tokens. Configured lookahead permits one additional block; the
 estimate does not assume acceptance, early termination or adaptive disabling.
 Global verification/branch ceilings do not multiply one lane's footprint. Token
-history copies belong to the host pool; separate physical pools are compared
-independently. A shared allocator is counted once, and both models' declared
-resident parameter contributions are deducted from additional demand.
+history copies belong to the host pool. Discrete devices keep their own pool IDs
+and headroom. Unified accelerators share capacity with the host, including when
+the other model uses a discrete pool. A known shared allocator is counted once
+within its pool. Both models' resident parameter contributions are deducted from
+additional demand.
 
 The v1 transaction envelope budgets up to three additional target and five
 additional draft state payloads beyond canonical state/cache-update workspace,
@@ -423,9 +425,11 @@ its report and shorter-output advice.
 
 Embedded prediction startup uses ordinary module, state and capture contracts,
 with explicit unknowns for uncovered mechanisms. Its parameters are already in
-target residency and are counted once. Feature-conditioned external assistants,
-cross-device MLX execution outside unified memory, uncovered ordinary workspaces,
-media and transfer costs remain incomplete. Cold embedded planning can use
+target residency and are counted once. Conditioned assistants use the same pool
+placement and allocator calibration as independent drafts when the architecture
+supplies a memory topology. Gemma 4's conditioned assistant has no such topology.
+Unobserved device capacity, allocator counters, and native scratch remain
+explicit uncertainties. Cold embedded planning can use
 `inspected_speculative_generation_memory_plan` with explicit sampling calibration;
 cold external-drafter planning still needs retained draft geometry.
 The portable session implements `SpeculativeForecastSession<B, D>` when its

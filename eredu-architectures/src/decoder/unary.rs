@@ -9,7 +9,8 @@ pub fn component(
     use eredu_core::component::ComponentNonlinearity as C;
     match activation {
         eredu_nn::UnaryActivation::Gelu => C::Gelu,
-        eredu_nn::UnaryActivation::GeluApproximate => C::GeluApproximate,
+        eredu_nn::UnaryActivation::GeluApproximate
+        | eredu_nn::UnaryActivation::GeluApproximateF16 => C::GeluApproximate,
         eredu_nn::UnaryActivation::Silu => C::Silu {
             multiplier: eredu_core::component::ComponentScalar::new(1.0),
         },

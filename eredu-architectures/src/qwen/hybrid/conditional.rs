@@ -1296,7 +1296,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalKe
         };
         crate::operator_requirements::require::<B>(
             "Qwen hybrid conditional",
-            crate::operator_requirements::QWEN_HYBRID.union(crate::operator_requirements::QWEN_VL),
+            crate::operator_requirements::qwen_hybrid(&parsed.text)
+                .union(crate::operator_requirements::QWEN_VL)
+                .union(
+                    parsed
+                        .vision
+                        .as_ref()
+                        .map_or(eredu_nn::NeuralOperatorCapabilities::NONE, |vision| {
+                            vision.config().arithmetic_capabilities()
+                        }),
+                ),
         )?;
         if geometry.is_some() {
             crate::operator_requirements::require::<B>(

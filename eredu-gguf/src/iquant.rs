@@ -13,34 +13,31 @@ use crate::iquant_tables::{
 use crate::{Endian, Error, GgmlType, Result};
 use half::f16;
 
-pub(crate) fn decode_f32(ty: GgmlType, raw: &[u8], endian: Endian) -> Result<Vec<f32>> {
-    let (block_values, block_bytes) = ty.block_and_bytes()?;
-    let blocks = raw.len() / usize::try_from(block_bytes).unwrap();
-    let expected = blocks * usize::try_from(block_values).unwrap();
-    let mut data = Vec::with_capacity(expected);
+// BlockDecoder validates the encoded and output extents before dispatch.
+pub(crate) fn decode_into(
+    ty: GgmlType,
+    raw: &[u8],
+    endian: Endian,
+    output: &mut [f32],
+) -> Result<()> {
+    let mut output = output.iter_mut();
+    let mut emit = |value| *output.next().expect("IQ block output extent") = value;
     match ty {
-        GgmlType::IQ2XXS => iq2_xxs(raw, endian, &mut data),
-        GgmlType::IQ2XS => iq2_xs(raw, endian, &mut data),
-        GgmlType::IQ3XXS => iq3_xxs(raw, endian, &mut data),
-        GgmlType::IQ1S => iq1_s(raw, endian, &mut data),
-        GgmlType::IQ4NL => iq4_nl(raw, endian, &mut data),
-        GgmlType::IQ3S => iq3_s(raw, endian, &mut data),
-        GgmlType::IQ2S => iq2_s(raw, endian, &mut data),
-        GgmlType::IQ4XS => iq4_xs(raw, endian, &mut data),
-        GgmlType::IQ1M => iq1_m(raw, endian, &mut data),
+        GgmlType::IQ2XXS => iq2_xxs(raw, endian, &mut emit),
+        GgmlType::IQ2XS => iq2_xs(raw, endian, &mut emit),
+        GgmlType::IQ3XXS => iq3_xxs(raw, endian, &mut emit),
+        GgmlType::IQ1S => iq1_s(raw, endian, &mut emit),
+        GgmlType::IQ4NL => iq4_nl(raw, endian, &mut emit),
+        GgmlType::IQ3S => iq3_s(raw, endian, &mut emit),
+        GgmlType::IQ2S => iq2_s(raw, endian, &mut emit),
+        GgmlType::IQ4XS => iq4_xs(raw, endian, &mut emit),
+        GgmlType::IQ1M => iq1_m(raw, endian, &mut emit),
         other => return Err(Error::UnsupportedTensorType(other.code())),
     }
-    if data.len() != expected {
-        return Err(Error::tensor(
-            "<unnamed>",
-            "IQ dequantization produced an inconsistent element count",
-        ));
+    if output.len() != 0 {
+        return Err(Error::tensor("<blocks>", "IQ block output length mismatch"));
     }
-    Ok(data)
-}
-
-fn emit(out: &mut Vec<f32>, value: f32) {
-    out.push(value);
+    Ok(())
 }
 
 fn half(bytes: &[u8], endian: Endian) -> f32 {
@@ -78,7 +75,7 @@ fn signed(value: f32, signs: u8, index: usize) -> f32 {
     }
 }
 
-fn iq2_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq2_xxs(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<66>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
@@ -98,14 +95,14 @@ fn iq2_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
                 let grid = grid8(&IQ2XXS_GRID, usize::from(index));
                 let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
                 for (j, quant) in grid.into_iter().enumerate() {
-                    emit(out, signed(db * f32::from(quant), signs, j));
+                    out(signed(db * f32::from(quant), signs, j));
                 }
             }
         }
     }
 }
 
-fn iq2_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq2_xs(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<74>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
@@ -121,14 +118,14 @@ fn iq2_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
                 let grid = grid8(&IQ2XS_GRID, usize::from(quant & 511));
                 let signs = KSIGNS_IQ2XS[usize::from(quant >> 9)];
                 for (j, value) in grid.into_iter().enumerate() {
-                    emit(out, signed(db[l / 2] * f32::from(value), signs, j));
+                    out(signed(db[l / 2] * f32::from(value), signs, j));
                 }
             }
         }
     }
 }
 
-fn iq2_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq2_s(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<82>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
@@ -146,14 +143,14 @@ fn iq2_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
                 let grid = grid8(&IQ2S_GRID, index);
                 let signs = qs[32 + 4 * ib32 + l];
                 for (j, value) in grid.into_iter().enumerate() {
-                    emit(out, signed(db[l / 2] * f32::from(value), signs, j));
+                    out(signed(db[l / 2] * f32::from(value), signs, j));
                 }
             }
         }
     }
 }
 
-fn iq3_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq3_xxs(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<98>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
@@ -166,17 +163,17 @@ fn iq3_xxs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
                 let first = grid4(&IQ3XXS_GRID, usize::from(qs[8 * ib32 + 2 * l]));
                 let second = grid4(&IQ3XXS_GRID, usize::from(qs[8 * ib32 + 2 * l + 1]));
                 for (j, value) in first.into_iter().enumerate() {
-                    emit(out, signed(db * f32::from(value), signs, j));
+                    out(signed(db * f32::from(value), signs, j));
                 }
                 for (j, value) in second.into_iter().enumerate() {
-                    emit(out, signed(db * f32::from(value), signs, j + 4));
+                    out(signed(db * f32::from(value), signs, j + 4));
                 }
             }
         }
     }
 }
 
-fn iq3_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq3_s(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<110>().0 {
         let d = half(block, endian);
         let qs = &block[2..66];
@@ -199,10 +196,10 @@ fn iq3_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
                     let first = grid4(&IQ3S_GRID, first_index);
                     let second = grid4(&IQ3S_GRID, second_index);
                     for (j, value) in first.into_iter().enumerate() {
-                        emit(out, signed(db[side] * f32::from(value), sign[l], j));
+                        out(signed(db[side] * f32::from(value), sign[l], j));
                     }
                     for (j, value) in second.into_iter().enumerate() {
-                        emit(out, signed(db[side] * f32::from(value), sign[l], j + 4));
+                        out(signed(db[side] * f32::from(value), sign[l], j + 4));
                     }
                 }
             }
@@ -210,7 +207,7 @@ fn iq3_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
     }
 }
 
-fn iq1_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq1_s(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<50>().0 {
         let d = half(block, endian);
         let qs = &block[2..34];
@@ -222,14 +219,14 @@ fn iq1_s(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
             for l in 0..4 {
                 let index = usize::from(qs[4 * ib + l]) | (usize::from((high >> (3 * l)) & 7) << 8);
                 for quant in signed_grid8(index) {
-                    emit(out, dl * (f32::from(quant) + delta));
+                    out(dl * (f32::from(quant) + delta));
                 }
             }
         }
     }
 }
 
-fn iq1_m(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq1_m(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<56>().0 {
         let qs = &block[..32];
         let qh = &block[32..48];
@@ -261,26 +258,26 @@ fn iq1_m(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
             ];
             for l in 0..4 {
                 for quant in signed_grid8(indices[l]) {
-                    emit(out, dl[l / 2] * (f32::from(quant) + deltas[l]));
+                    out(dl[l / 2] * (f32::from(quant) + deltas[l]));
                 }
             }
         }
     }
 }
 
-fn iq4_nl(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq4_nl(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<18>().0 {
         let d = half(block, endian);
         for &quant in &block[2..18] {
-            emit(out, d * f32::from(KVALUES_IQ4NL[usize::from(quant & 0xf)]));
+            out(d * f32::from(KVALUES_IQ4NL[usize::from(quant & 0xf)]));
         }
         for &quant in &block[2..18] {
-            emit(out, d * f32::from(KVALUES_IQ4NL[usize::from(quant >> 4)]));
+            out(d * f32::from(KVALUES_IQ4NL[usize::from(quant >> 4)]));
         }
     }
 }
 
-fn iq4_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
+fn iq4_xs(raw: &[u8], endian: Endian, out: &mut impl FnMut(f32)) {
     for block in raw.as_chunks::<136>().0 {
         let d = half(block, endian);
         let scales_high = word(&block[2..], endian);
@@ -291,10 +288,10 @@ fn iq4_xs(raw: &[u8], endian: Endian, out: &mut Vec<f32>) {
             let high = ((scales_high >> (2 * ib)) & 3) as u8;
             let dl = d * f32::from(i16::from(low | (high << 4)) - 32);
             for &quant in &qs[16 * ib..16 * ib + 16] {
-                emit(out, dl * f32::from(KVALUES_IQ4NL[usize::from(quant & 0xf)]));
+                out(dl * f32::from(KVALUES_IQ4NL[usize::from(quant & 0xf)]));
             }
             for &quant in &qs[16 * ib..16 * ib + 16] {
-                emit(out, dl * f32::from(KVALUES_IQ4NL[usize::from(quant >> 4)]));
+                out(dl * f32::from(KVALUES_IQ4NL[usize::from(quant >> 4)]));
             }
         }
     }

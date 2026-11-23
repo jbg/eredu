@@ -506,6 +506,106 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
         model
             .set_prompt_cache_store("fixture-checkpoint", Box::new(store.clone()))
             .unwrap();
+        let emit = |_| ControlFlow::Continue(());
+        let expected = generate(&mut cold, tokens.clone(), Default::default());
+        let limits = SnapshotLimits {
+            max_snapshots: 2,
+            max_branches: 1,
+            retained_bytes: 64 << 20,
+            cumulative_copy_bytes: 256 << 20,
+        };
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
+        let mut run = model
+            .start_controlled(prepared, &[], Default::default(), emit, OutputMode::Text)
+            .unwrap();
+        assert_eq!(run.prompt_cache_stats().unwrap().reused_tokens, 0);
+        assert!(store.open().unwrap().is_none());
+        run.enable_snapshots(limits).unwrap();
+        let before_prefill = run.snapshot(emit).unwrap();
+        run.step(emit).unwrap();
+        run.cancel(emit).unwrap();
+        assert!(store.open().unwrap().is_none());
+        drop(run);
+
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
+        let mut run = model
+            .start_controlled(prepared, &[], Default::default(), emit, OutputMode::Text)
+            .unwrap();
+        run.enable_snapshots(limits).unwrap();
+        let empty = run.snapshot(emit).unwrap();
+        let mut child = run
+            .fork(
+                &empty,
+                GenerationBranchOptions {
+                    trace_limits: TraceLimits {
+                        per_record_bytes: 16 << 10,
+                        total_bytes: 128 << 10,
+                    },
+                    capture_limits: None,
+                    sampling: None,
+                    intervention: None,
+                },
+                emit,
+            )
+            .unwrap();
+        run.exchange(&mut child, emit).unwrap();
+        run.resume(emit).unwrap();
+        assert_eq!(run.token_ids(), expected.token_ids());
+        assert!(store.open().unwrap().is_none());
+        run.exchange(&mut child, emit).unwrap();
+        drop(child);
+        run.step(emit).unwrap();
+        run.pause(emit).unwrap();
+        run.resume(emit).unwrap();
+        assert_eq!(run.token_ids(), expected.token_ids());
+        assert!(store.open().unwrap().is_some());
+        drop(run);
+
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
+        let mut run = model
+            .start_controlled(prepared, &[], Default::default(), emit, OutputMode::Text)
+            .unwrap();
+        assert!(run.prompt_cache_stats().unwrap().reused_tokens > 0);
+        assert_eq!(run.position().execution_step, 0);
+        run.enable_snapshots(limits).unwrap();
+        let restored_prefix = run.snapshot(emit).unwrap();
+        assert!(
+            restored_prefix.metadata().retained_bytes > before_prefill.metadata().retained_bytes
+        );
+        run.run(emit).unwrap();
+        assert_eq!(run.token_ids(), expected.token_ids());
+        run.restore(&restored_prefix, emit).unwrap();
+        run.resume(emit).unwrap();
+        assert_eq!(run.token_ids(), expected.token_ids());
+        let mut branch = run
+            .fork(
+                &restored_prefix,
+                GenerationBranchOptions {
+                    trace_limits: TraceLimits {
+                        per_record_bytes: 16 << 10,
+                        total_bytes: 128 << 10,
+                    },
+                    capture_limits: None,
+                    sampling: None,
+                    intervention: None,
+                },
+                emit,
+            )
+            .unwrap();
+        run.exchange(&mut branch, emit).unwrap();
+        run.resume(emit).unwrap();
+        assert_eq!(run.token_ids(), expected.token_ids());
+        drop(branch);
+        drop(run);
+
+        let prepared = model.prepare_controlled_chat(&chat, settings).unwrap();
+        let mut run = model
+            .start_controlled(prepared, &[], Default::default(), emit, OutputMode::Text)
+            .unwrap();
+        run.cancel(emit).unwrap();
+        assert!(store.open().unwrap().is_some());
+        drop(run);
+        store.clear().unwrap();
         let first = generate(&mut model, tokens.clone(), Default::default());
         assert_eq!(
             first.stats().prompt_cache.as_ref().unwrap().reused_tokens,
@@ -526,6 +626,50 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
             warm.token_ids(),
             generate(&mut cold, tokens.clone(), Default::default()).token_ids()
         );
+        let trace = TraceLimits {
+            per_record_bytes: 16 << 10,
+            total_bytes: 128 << 10,
+        };
+        for (settings, reuse) in [
+            (settings, true),
+            (
+                PreparedChatGenerationSettings {
+                    prefill: PrefillChunkPolicy::Unchunked,
+                    ..settings
+                },
+                false,
+            ),
+        ] {
+            model.reset().unwrap();
+            let prepared = model
+                .prepare_observed_token_ids(
+                    &chat,
+                    tokens.clone(),
+                    settings,
+                    CapturePlan::none(),
+                    trace,
+                )
+                .unwrap();
+            let observed = model
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| ControlFlow::Continue(()),
+                    OutputMode::Text,
+                )
+                .unwrap();
+            assert_eq!(observed.token_ids(), warm.token_ids());
+            assert_eq!(
+                observed
+                    .stats()
+                    .prompt_cache
+                    .as_ref()
+                    .map(|stats| stats.reused_tokens),
+                reuse.then_some(saved_manifest.total_prefix_tokens),
+            );
+            assert_eq!(store.open().unwrap().unwrap().manifest(), &saved_manifest);
+        }
         // The existing checkpoint identity permits reuse across model loads.
         cold.set_prompt_cache_store("fixture-checkpoint", Box::new(store.clone()))
             .unwrap();
@@ -663,6 +807,7 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
             0
         );
         assert_eq!(changed_identity.token_ids(), mismatch.token_ids());
+        let preserved = store.open().unwrap().unwrap().manifest().clone();
         let cancellation = eredu_core::GenerationCancellationToken::default();
         let signal = cancellation.clone();
         let cancelled = model
@@ -685,7 +830,7 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
             cancelled.finish_reason(),
             eredu_core::FinishReason::Cancelled
         );
-        assert_eq!(model.prompt_cache_store().unwrap().retained_bytes(), 0);
+        assert_eq!(store.open().unwrap().unwrap().manifest(), &preserved);
     }
     model
         .set_prompt_cache_store(

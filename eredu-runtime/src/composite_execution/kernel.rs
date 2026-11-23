@@ -49,6 +49,15 @@ pub trait CompositeComponentKernel<B: NeuralBackend, S: RuntimeState<B>>:
         false
     }
 
+    /// Ordered input-part boundaries for resident prefill, including the final
+    /// part count. An empty list keeps the prepared request in one invocation.
+    fn resident_prefill_boundaries(
+        _config: &Self::AdmissionConfig,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// One architecture-specific plan for each ordered input part, with a neutral
     /// accounting projection of the same admitted geometry.
     type InputPartPlan: Clone
@@ -343,6 +352,13 @@ where
 
     fn supports_chunked_text_prefill() -> bool {
         <K as CompositeComponentKernel<B, S>>::supports_chunked_text_prefill()
+    }
+
+    fn resident_prefill_boundaries(
+        config: &Self::AdmissionConfig,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Vec<usize> {
+        <K as CompositeComponentKernel<B, S>>::resident_prefill_boundaries(config, input)
     }
 
     fn prepared_publication_width(

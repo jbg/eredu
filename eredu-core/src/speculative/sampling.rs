@@ -19,11 +19,17 @@ type Root<M> = <<<M as SpeculativeSamplingPrimitives>::CaptureBinding as Specula
 /// Native score, random-state, transport, and capture operations used by the portable sampler.
 pub trait SpeculativeSamplingPrimitives: Clone + 'static {
     /// Sampling and score primitives shared with ordinary generation.
-    type Backend: crate::refinement::RefinementFinalizationBackend<
-        Error = Self::Error,
-        RandomState: Clone,
-        Logits: eredu_nn::Tensor<Context = Queue<Self>>,
-    >;
+    type Backend: SamplingBackend<
+            Error = Self::Error,
+            RandomState: Clone,
+            Logits: eredu_nn::Tensor<Context = Queue<Self>>,
+        > + crate::refinement::RefinementFinalizationBackend<
+            CanvasScores = Logits<Self>,
+            CanvasTokens = <Self::Backend as SamplingBackend>::Token,
+            PositionScores = Logits<Self>,
+            FinalizationContext = Queue<Self>,
+            FinalizationError = Self::Error,
+        >;
     /// Retained executable score value.
     type Value;
     /// Explicit seed material for the native random stream.

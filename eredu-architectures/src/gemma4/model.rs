@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
-    LinearOperator, NormalizationOperator, PadMode, Parameterized, RotaryPosition, Tensor,
+    NormalizationOperator, PadMode, Parameterized, RotaryPosition, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, LayerRuntimeState, LayeredForwardState, LayeredPartitionInput,
@@ -55,7 +55,7 @@ pub fn external_assistant_capture_request(
     target: &FamilyConfig,
     assistant: &super::assistant::AssistantConfig,
 ) -> Result<ExternalPredictionCaptureRequest, String> {
-    let _compatibility = assistant
+    let compatibility = assistant
         .prove_compatibility(&target.text)
         .map_err(|error| error.to_string())?;
     let last = target
@@ -63,8 +63,23 @@ pub fn external_assistant_capture_request(
         .num_hidden_layers()
         .checked_sub(1)
         .ok_or_else(|| "Gemma 4 assistant target has no decoder layer".to_owned())?;
+    let mut seen = std::collections::BTreeSet::new();
+    let policies = compatibility
+        .target_publisher_layers()
+        .iter()
+        .filter(|&&layer| seen.insert(layer))
+        .map(|&layer| {
+            target
+                .text
+                .layer_schedule
+                .get(layer)
+                .expect("compatibility proof validated the publisher")
+                .attention
+        })
+        .collect();
     Ok(ExternalPredictionCaptureRequest::SharedAttention {
         final_hidden_path: format!("model.language_model.layers.{last}.output"),
+        policies,
     })
 }
 
@@ -499,6 +514,34 @@ where
         crate::media_plan::admit_gemma4_input(config, input, inspector)
     }
 
+    fn prepared_prediction_token_ids(
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let parts =
+            eredu_runtime::composite_execution::prepared_token_parts(input, context, |plan| {
+                match plan {
+                    Gemma4InputPartPlan::TextTokens { .. } => None,
+                    Gemma4InputPartPlan::Projected {
+                        placeholder_token_id,
+                        positions,
+                        ..
+                    } => Some((*placeholder_token_id, *positions)),
+                    Gemma4InputPartPlan::Audio {
+                        placeholder_token_id,
+                        shape,
+                        ..
+                    }
+                    | Gemma4InputPartPlan::Vision {
+                        placeholder_token_id,
+                        shape,
+                        ..
+                    } => Some((*placeholder_token_id, shape.decoder_positions)),
+                }
+            })?;
+        B::Tensor::concatenate(&parts, 1, context)
+    }
+
     fn prepared_group_invocation(
         &self,
         group: usize,
@@ -703,9 +746,9 @@ where
         request: &ExternalPredictionCaptureRequest,
     ) -> Result<Option<Vec<String>>, Self::Error> {
         match request {
-            ExternalPredictionCaptureRequest::SharedAttention { final_hidden_path } => {
-                Ok(Some(vec![final_hidden_path.clone()]))
-            }
+            ExternalPredictionCaptureRequest::SharedAttention {
+                final_hidden_path, ..
+            } => Ok(Some(vec![final_hidden_path.clone()])),
             _ => Ok(None),
         }
     }
@@ -715,23 +758,30 @@ where
         forward: &Self::ForwardContext,
         observed: Vec<B::Tensor>,
     ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
-        if !matches!(
-            request,
-            ExternalPredictionCaptureRequest::SharedAttention { .. }
-        ) {
+        let ExternalPredictionCaptureRequest::SharedAttention { policies, .. } = request else {
             return Ok(None);
-        }
+        };
         let [hidden]: [B::Tensor; 1] = observed.try_into().map_err(|observed: Vec<_>| {
             Error::backend(format!(
                 "Gemma 4 assistant capture expected one final hidden state, received {}",
                 observed.len()
             ))
         })?;
-        let shared_kv = forward
-            .shared_attention_states()
+        let shared_kv = policies
             .iter()
-            .map(|(policy, (keys, values))| (*policy, keys.clone(), values.clone()))
-            .collect();
+            .map(|policy| {
+                let (keys, values) =
+                    forward
+                        .shared_attention_states()
+                        .get(policy)
+                        .ok_or_else(|| {
+                            Error::backend(format!(
+                                "missing assistant attention publication {policy:?}"
+                            ))
+                        })?;
+                Ok((*policy, keys.clone(), values.clone()))
+            })
+            .collect::<Result<_, Error>>()?;
         Ok(Some(
             ExternalPredictionTargetCapture::HiddenWithSharedAttention { hidden, shared_kv },
         ))
@@ -745,14 +795,17 @@ where
     ) -> Result<Option<B::Tensor>, Self::Error> {
         match operation {
             ExternalPredictionTargetOperation::TokenEmbeddings(tokens) => match parallel {
-                Some(parallel) => B::vocabulary_parallel_lookup(
-                    self.static_modules.text.embeddings_mut()?,
-                    tokens,
-                    eredu_nn::EmbeddingLookupPolicy::Strict,
-                    parallel,
+                Some(parallel) => scale_embedding(
+                    &B::vocabulary_parallel_lookup(
+                        self.static_modules.text.embeddings_mut()?,
+                        tokens,
+                        eredu_nn::EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?,
+                    self.args.text.hidden_size,
                     context,
-                )?
-                .multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)
+                )
                 .map(Some),
                 None => self.token_embeddings(tokens, context).map(Some),
             },
@@ -782,6 +835,7 @@ pub enum Unit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
 /// Values retained across one complete multimodal decoder pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
+    image_spans: Vec<std::ops::Range<i32>>,
     position_offset: i32,
     parts: Vec<PreparedPart<T>>,
     per_layer_token_override: Option<T>,
@@ -1164,7 +1218,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Gemma 4",
-            crate::operator_requirements::GEMMA4,
+            crate::operator_requirements::gemma4_family(&args),
         )?;
         let definition = parameters::select_definition(&args, definition, None)?;
         let text = model_text::StaticTextModules::new(&args, context)?;
@@ -1180,7 +1234,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
             "Gemma 4",
-            crate::operator_requirements::GEMMA4,
+            crate::operator_requirements::gemma4_family(&args),
         )?;
         let definition = parameters::select_definition(&args, definition, Some(&geometry))?;
         let text = model_text::StaticTextModules::new_parallel(&args, &geometry, context)?;
@@ -1201,7 +1255,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .transpose()?;
         let vision_projection = args
             .projector(super::media::ProjectionKind::Vision)
-            .map(|spec| ModalityProjector::new(spec.clone(), context))
+            .map(|spec| {
+                ModalityProjector::new(spec.clone(), context).map(|projector| {
+                    projector.with_rounded_weight_inputs(
+                        args.vision
+                            .as_ref()
+                            .is_some_and(|vision| vision.published_gguf),
+                    )
+                })
+            })
             .transpose()?;
         let audio = args
             .audio
@@ -1210,7 +1272,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .transpose()?;
         let audio_projection = args
             .projector(super::media::ProjectionKind::Audio)
-            .map(|spec| ModalityProjector::new(spec.clone(), context))
+            .map(|spec| {
+                ModalityProjector::new(spec.clone(), context).map(|projector| {
+                    projector.with_rounded_weight_inputs(
+                        args.audio
+                            .as_ref()
+                            .is_some_and(|audio| audio.published_gguf),
+                    )
+                })
+            })
             .transpose()?;
         Ok(Self {
             args,
@@ -1581,11 +1651,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         tokens: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.static_modules
+        let embeddings = self
+            .static_modules
             .text
             .embeddings_mut()?
-            .forward(tokens, context)?
-            .multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)
+            .forward(tokens, context)?;
+        scale_embedding(&embeddings, self.args.text.hidden_size, context)
     }
 
     /// Returns the normalized composite family configuration.
@@ -1617,8 +1688,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         if state.layout().len() != self.args.text.num_hidden_layers() {
             return Err(Error::backend("Gemma 4 rank-local state layout mismatch"));
         }
-        let embeddings =
-            embeddings.multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)?;
+        let embeddings = scale_embedding(&embeddings, self.args.text.hidden_size, context)?;
         let mut position_offset = 0;
         for local in 0..state.layout().len() {
             position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
@@ -1628,6 +1698,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         Ok(LayeredForwardState {
             hidden: embeddings.clone(),
             context: ForwardContext {
+                image_spans: Vec::new(),
                 mask: None,
                 position_offset,
                 parts: vec![PreparedPart::Text {
@@ -1686,6 +1757,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
+                image_spans: Vec::new(),
                 mask,
                 position_offset,
                 parts,
@@ -1728,6 +1800,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
+                image_spans: Vec::new(),
                 mask,
                 position_offset,
                 parts: Vec::new(),
@@ -1798,7 +1871,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         if state.layout().len() != self.args.text.num_hidden_layers() {
             return Err(Error::backend("Gemma 4 rank-local state layout mismatch"));
         }
-        let scale = (self.args.text.hidden_size as f32).sqrt();
         let mut next_embedding = text_embeddings.iter();
         let parts = input
             .parts
@@ -1806,10 +1878,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .map(|part| match part {
                 DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
-                    embeddings: next_embedding
-                        .next()
-                        .ok_or_else(|| Error::backend("missing Gemma 4 rank-local text embedding"))?
-                        .multiply_scalar(scale, context)?,
+                    embeddings: scale_embedding(
+                        next_embedding.next().ok_or_else(|| {
+                            Error::backend("missing Gemma 4 rank-local text embedding")
+                        })?,
+                        self.args.text.hidden_size,
+                        context,
+                    )?,
                 }),
                 DecoderInputPart::Image(tokens) | DecoderInputPart::Video(tokens) => {
                     Ok(PreparedPart::Vision {
@@ -1908,6 +1983,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         Ok(LayeredForwardState {
             hidden: assembled.embeddings,
             context: ForwardContext {
+                image_spans: self.image_attention_spans(input.parts)?,
                 mask: input.mask.cloned(),
                 position_offset,
                 parts,
@@ -2084,12 +2160,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
                 }),
                 DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
-                    embeddings: self
-                        .static_modules
-                        .text
-                        .embeddings_mut()?
-                        .forward(tokens, context)?
-                        .multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)?,
+                    embeddings: self.token_embeddings(tokens, context)?,
                 }),
                 DecoderInputPart::Image(tokens) | DecoderInputPart::Video(tokens) => {
                     Ok(PreparedPart::Vision {
@@ -2128,7 +2199,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         if parts.is_empty() {
             return Err(Error::backend("Gemma 4 input has no ordered parts"));
         }
-        let scale = (self.args.text.hidden_size as f32).sqrt();
         parts
             .iter()
             .map(|part| match part {
@@ -2138,14 +2208,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
                 }),
                 DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
-                    embeddings: B::vocabulary_parallel_lookup(
-                        self.static_modules.text.embeddings_mut()?,
-                        tokens,
-                        EmbeddingLookupPolicy::Strict,
-                        parallel,
+                    embeddings: scale_embedding(
+                        &B::vocabulary_parallel_lookup(
+                            self.static_modules.text.embeddings_mut()?,
+                            tokens,
+                            EmbeddingLookupPolicy::Strict,
+                            parallel,
+                            context,
+                        )?,
+                        self.args.text.hidden_size,
                         context,
-                    )?
-                    .multiply_scalar(scale, context)?,
+                    )?,
                 }),
                 DecoderInputPart::Image(tokens) | DecoderInputPart::Video(tokens) => {
                     Ok(PreparedPart::Vision {
@@ -2173,6 +2246,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
                 }
             })
             .collect()
+    }
+
+    fn image_attention_spans(
+        &self,
+        parts: &[DecoderInputPart<'_, B::Tensor>],
+    ) -> Result<Vec<std::ops::Range<i32>>, Error> {
+        let mut spans = Vec::new();
+        if self
+            .args
+            .vision
+            .as_ref()
+            .is_some_and(|vision| vision.published_gguf)
+        {
+            let mut start = 0_i32;
+            for part in parts {
+                let tokens = match part {
+                    DecoderInputPart::Text(tokens)
+                    | DecoderInputPart::Image(tokens)
+                    | DecoderInputPart::Video(tokens)
+                    | DecoderInputPart::Audio(tokens)
+                    | DecoderInputPart::Projected { tokens, .. } => tokens,
+                };
+                let end = start
+                    .checked_add(tokens.dim(1))
+                    .ok_or_else(|| Error::backend("Gemma 4 attention span overflows"))?;
+                if start < end && matches!(part, DecoderInputPart::Image(_)) {
+                    spans.push(start..end);
+                }
+                start = end;
+            }
+        }
+        Ok(spans)
     }
 
     fn assemble(
@@ -2248,14 +2353,28 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         let sequence = hidden.dim(1);
         let layers = self.args.text.num_hidden_layers() as i32;
         let width = self.args.text.hidden_size_per_layer_input;
-        let token_identity = embeddings
-            .forward(token_ids, context)?
-            .multiply_scalar((width as f32).sqrt(), context)?
-            .reshape(&[batch, sequence, layers, width], context)?;
-        let projected = projection
-            .forward(hidden, context)?
-            .multiply_scalar((self.args.text.hidden_size as f32).sqrt().recip(), context)?
-            .reshape(&[batch, sequence, layers, width], context)?;
+        // The projected media drives the contextual branch, while the
+        // token-identity branch uses the padding row under each media slot.
+        let mut token_ids = token_ids.clone();
+        for placeholder in [
+            self.args.image_token_id,
+            self.args.video_token_id,
+            self.args.audio_token_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mask = token_ids.equal_i32(placeholder, context)?;
+            let pad = B::Tensor::full_i32(self.args.text.pad_token_id, &[1, 1], context)?;
+            token_ids = B::Tensor::where_condition(&mask, &pad, &token_ids, context)?;
+        }
+        let token_identity =
+            scale_embedding(&embeddings.forward(&token_ids, context)?, width, context)?
+                .reshape(&[batch, sequence, layers, width], context)?;
+        let projected =
+            super::media::forward_linear(projection, hidden, self.args.text.gguf_source, context)?
+                .multiply_scalar((self.args.text.hidden_size as f32).sqrt().recip(), context)?
+                .reshape(&[batch, sequence, layers, width], context)?;
         let projected = norm.forward(&projected, context)?;
         let inputs = projected
             .add(&token_identity, context)?
@@ -2277,6 +2396,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
                 .map(Some),
             _ => Ok(Some(inputs)),
         }
+    }
+}
+
+fn scale_embedding<T: Tensor>(embedding: &T, width: i32, context: &T::Context) -> Result<T, Error> {
+    let scale = (width as f32).sqrt();
+    match embedding.element_type() {
+        Some(dtype @ (eredu_nn::TensorElementType::F16 | eredu_nn::TensorElementType::Bf16)) => {
+            let scale = T::full_f32(scale, &[1], context)?.cast_float(dtype, context)?;
+            embedding.multiply(&scale, context)
+        }
+        _ => embedding.multiply_scalar(scale, context),
     }
 }
 
@@ -3439,6 +3569,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
+                image_spans: self.image_attention_spans(input.parts)?,
                 mask: input.mask.cloned(),
                 position_offset,
                 parts,
@@ -3506,6 +3637,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
+                image_spans: self.image_attention_spans(input.parts)?,
                 mask: input.mask.cloned(),
                 position_offset,
                 parts,

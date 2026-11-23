@@ -89,6 +89,14 @@ impl<P: PreparationMechanismProvider>
 {
     type Preparation = SelectedPreparation;
 
+    fn project_inspection(
+        &self,
+        inspection: ArtifactInspection<ArtifactArchitecturePlan>,
+    ) -> Result<ArtifactInspection<ArtifactArchitecturePlan>, eredu_core::artifact::ArtifactError>
+    {
+        crate::preparation_selection::project_text_inspection(inspection, &self.mechanisms)
+    }
+
     fn select(
         self,
         inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
@@ -99,7 +107,7 @@ impl<P: PreparationMechanismProvider>
     > {
         let request = self.preparation.normalize(plan)?;
         let outcome =
-            inspect_selected_model(inspection.clone(), &request, &self.mechanisms, self.media);
+            inspect_projected_model(inspection.clone(), &request, &self.mechanisms, self.media);
         let (report, selected) = outcome.into_parts();
         let selected = selected.ok_or_else(|| {
             eredu_core::AutomaticPlanningError::Invalid(
@@ -295,6 +303,27 @@ pub fn inspect_selected_model<P>(
 where
     P: PreparationMechanismProvider,
 {
+    match crate::preparation_selection::project_text_inspection(inspection.clone(), mechanisms) {
+        Ok(inspection) => inspect_projected_model(inspection, request, mechanisms, media),
+        Err(error) => {
+            let path = inspection.path();
+            let format = inspection.format();
+            let mut report = ModelInspectionReport::unverified(path, format);
+            reject_artifact(&mut report, path, format, &error);
+            ModelInspectionOutcome {
+                report,
+                selected: None,
+            }
+        }
+    }
+}
+
+fn inspect_projected_model<P: PreparationMechanismProvider>(
+    inspection: ArtifactInspection<ArtifactArchitecturePlan>,
+    request: &NormalizedLoadRequest,
+    mechanisms: &P,
+    media: MediaFeatureAvailability,
+) -> ModelInspectionOutcome {
     let descriptor = inspection.architecture_plan().architecture_descriptor();
     let capabilities = architecture_capabilities(&inspection).and_then(|capabilities| {
         let capacity = inspection

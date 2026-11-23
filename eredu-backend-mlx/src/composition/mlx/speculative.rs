@@ -2,10 +2,6 @@
 
 /// External assistant adapters over neutral family equations and state.
 pub mod external;
-/// MLX semantic-generation resource adapter over the portable runtime driver.
-pub mod scheduler;
-
-pub use scheduler::SpeculativeComponentTimingGuard;
 
 use eredu_core::speculative::{SpeculativeMechanism, SpeculativeMechanismCapabilities};
 use eredu_core::{

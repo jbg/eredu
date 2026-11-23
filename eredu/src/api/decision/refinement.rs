@@ -3,8 +3,7 @@ use crate::api::{LoadedModel, PreparedChatGenerationSettings};
 use crate::runtime::chat::ChatTemplateRequest;
 use anyhow::{ensure, Context, Result};
 use eredu_core::{
-    capture::*, refinement::*, GenerationConfigOverrides, TextExecutionSession,
-    TextGenerationBackend,
+    refinement::*, GenerationConfigOverrides, TextExecutionSession, TextGenerationBackend,
 };
 use serde_json::json;
 use std::{collections::BTreeSet, ops::ControlFlow};
@@ -192,6 +191,32 @@ pub fn evaluate_refinement<B: TextGenerationBackend, S: TextExecutionSession<B>>
         (1..=64).contains(&steps),
         "refinement_steps must be in 1..=64"
     );
+    let capabilities = model.runtime.session().decoding_capabilities();
+    let policy = if let Some(mask_token_id) = capabilities
+        .mask_token_id
+        .filter(|_| capabilities.masked_unmasking)
+    {
+        // Every alternative is scored while its answer slot is still masked.
+        ensure!(
+            steps == 1,
+            "masked decision readout requires one refinement step"
+        );
+        RefinementPolicy::MaskedUnmasking {
+            config: MaskedRefinementOptions {
+                max_denoising_steps: steps,
+                ..Default::default()
+            }
+            .try_into()?,
+            mask_token_id,
+        }
+    } else {
+        EntropyRefinementOptions {
+            max_denoising_steps: steps,
+            stability_threshold: steps,
+            ..Default::default()
+        }
+        .try_into()?
+    };
     let length = model
         .refinement_canvas_length()
         .context("the selected model does not support pinned block refinement")?
@@ -214,14 +239,7 @@ pub fn evaluate_refinement<B: TextGenerationBackend, S: TextExecutionSession<B>>
                 },
                 seed,
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion {
-                    policy: Some(
-                        EntropyRefinementOptions {
-                            max_denoising_steps: steps,
-                            stability_threshold: steps,
-                            ..Default::default()
-                        }
-                        .try_into()?,
-                    ),
+                    policy: Some(policy),
                 }),
                 ..Default::default()
             },

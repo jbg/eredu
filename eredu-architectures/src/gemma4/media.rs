@@ -162,6 +162,8 @@ pub struct ModalityProjector<B: NeuralBackend + eredu_nn::DistributedNeuralBacke
     projection: B::Linear,
     #[parameter(skip)]
     epsilon: f32,
+    #[parameter(skip)]
+    rounded_weight_inputs: bool,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B> {
@@ -174,7 +176,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B>
         Ok(Self {
             projection: B::linear(spec.projection, context)?,
             epsilon: spec.epsilon,
+            rounded_weight_inputs: false,
         })
+    }
+
+    pub(crate) fn with_rounded_weight_inputs(mut self, enabled: bool) -> Self {
+        self.rounded_weight_inputs = enabled;
+        self
     }
 
     /// Normalizes encoder features and projects them into decoder hidden space.
@@ -184,7 +192,27 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let normalized = B::rms_norm_without_weight(input, self.epsilon, context)?;
-        self.projection.forward(&normalized, context)
+        forward_linear(
+            &mut self.projection,
+            &normalized,
+            self.rounded_weight_inputs,
+            context,
+        )
+    }
+}
+
+// GGUF floating dot products round activations to the stored row precision,
+// then accumulate and return the caller's FP32 activation precision.
+pub(crate) fn forward_linear<T: Tensor>(
+    linear: &mut impl LinearOperator<T>,
+    input: &T,
+    rounded_weight_inputs: bool,
+    context: &T::Context,
+) -> Result<T, Error> {
+    if rounded_weight_inputs {
+        linear.forward_with_rounded_weight_inputs(input, context)
+    } else {
+        linear.forward(input, context)
     }
 }
 

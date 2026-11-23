@@ -69,7 +69,7 @@ where
                 &(),
                 binding.context(),
                 SpeculativeExecutionTopology::Single,
-                M::collect_component_timings(),
+                eredu_core::speculative::timing::component_timing_enabled(),
                 visitor,
             )?)
         },

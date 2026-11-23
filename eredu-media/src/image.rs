@@ -5,6 +5,56 @@ use image::{imageops::FilterType, ImageBuffer, Rgb};
 
 use crate::{MediaError, ProcessedMediaDtype};
 
+/// Host RGB resize and per-channel normalization.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RgbTransformPlan {
+    /// Target image height.
+    pub height: usize,
+    /// Target image width.
+    pub width: usize,
+    /// Pixel interpolation selected by the family processor.
+    pub resample: RgbResample,
+    /// Arithmetic applied before channel normalization.
+    pub rescale: Rgb8Rescale,
+    /// Per-channel normalization mean.
+    pub mean: [f32; 3],
+    /// Per-channel normalization standard deviation.
+    pub std: [f32; 3],
+}
+
+/// Backend-neutral pixel interpolation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RgbResample {
+    /// Bilinear interpolation aligned to the image corners, truncating to RGB8.
+    BilinearAlignCorners,
+    /// Bicubic interpolation.
+    Bicubic,
+    /// Antialiased cubic interpolation with one final RGB8 rounding.
+    AntialiasedBicubic,
+    /// Lanczos interpolation with a three-lobe kernel.
+    Lanczos3,
+}
+
+/// Resizes and normalizes a validated RGB8 view using the requested arithmetic.
+pub fn transform_rgb8(
+    source: RgbImageView<'_>,
+    plan: RgbTransformPlan,
+) -> Result<NormalizedImage, MediaError> {
+    let width = u32::try_from(plan.width)
+        .map_err(|_| MediaError::invalid("RGB target width exceeds u32"))?;
+    let height = u32::try_from(plan.height)
+        .map_err(|_| MediaError::invalid("RGB target height exceeds u32"))?;
+    let resized = match plan.resample {
+        RgbResample::BilinearAlignCorners => {
+            resize_rgb8_bilinear_align_corners(source, width, height)?
+        }
+        RgbResample::Bicubic => resize_rgb8_bicubic(source, width, height)?,
+        RgbResample::AntialiasedBicubic => resize_rgb8_antialiased_bicubic(source, width, height)?,
+        RgbResample::Lanczos3 => resize_rgb8_lanczos3(source, width, height)?,
+    };
+    normalize_rgb8(resized.as_view(), plan.rescale, plan.mean, plan.std)
+}
+
 /// Memory order of a normalized RGB output buffer.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum NormalizedImageLayout {
@@ -327,6 +377,65 @@ fn resize_rgb8_bicubic_enabled(
     })
 }
 
+/// Resizes an RGB8 image with corner-aligned bilinear interpolation and byte truncation.
+pub fn resize_rgb8_bilinear_align_corners(
+    image: RgbImageView<'_>,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, MediaError> {
+    if width == 0 || height == 0 {
+        return Err(MediaError::invalid("resize dimensions must be positive"));
+    }
+    if width == image.width && height == image.height {
+        return Ok(RgbImage {
+            pixels: image.packed_pixels(),
+            width,
+            height,
+        });
+    }
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| MediaError::invalid("bilinear resize storage overflow"))?;
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(count)
+        .map_err(|_| MediaError::invalid("could not allocate bilinear resize output"))?;
+    let ratio = |input: u32, output: u32| {
+        if output > 1 {
+            (input - 1) as f32 / (output - 1) as f32
+        } else {
+            0.0
+        }
+    };
+    let x_ratio = ratio(image.width, width);
+    let y_ratio = ratio(image.height, height);
+    let coordinate = |index: u32, scale: f32, limit: u32| {
+        let position = index as f32 * scale;
+        let first = (position as usize).min(limit as usize - 1);
+        let second = (first + 1).min(limit as usize - 1);
+        (first, second, position - first as f32)
+    };
+    let lerp = |a: f32, b: f32, t: f32| (b - a).mul_add(t, a);
+    for y in 0..height {
+        let (y0, y1, dy) = coordinate(y, y_ratio, image.height);
+        for x in 0..width {
+            let (x0, x1, dx) = coordinate(x, x_ratio, image.width);
+            for channel in 0..3 {
+                let at = |x, y| f32::from(image.pixels[y * image.row_stride + 3 * x + channel]);
+                let top = lerp(at(x0, y0), at(x1, y0), dx);
+                let bottom = lerp(at(x0, y1), at(x1, y1), dx);
+                pixels.push(lerp(top, bottom, dy) as u8);
+            }
+        }
+    }
+    Ok(RgbImage {
+        pixels,
+        width,
+        height,
+    })
+}
+
 /// Resizes an RGB8 image with a Lanczos3 filter.
 pub fn resize_rgb8_lanczos3(
     image: RgbImageView<'_>,
@@ -375,6 +484,15 @@ fn resize_rgb8_lanczos3_enabled(
     })
 }
 
+/// Rescaling operation applied before channel normalization.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rgb8Rescale {
+    /// Multiply the byte by a supplied factor.
+    Multiply(f32),
+    /// Divide the byte by a supplied divisor, with one FP32 division.
+    Divide(f32),
+}
+
 /// Rescales and normalizes RGB8 pixels, returning channel-first data.
 pub fn rescale_and_normalize_rgb8(
     image: RgbImageView<'_>,
@@ -382,9 +500,23 @@ pub fn rescale_and_normalize_rgb8(
     mean: [f32; 3],
     std: [f32; 3],
 ) -> Result<NormalizedImage, MediaError> {
-    if !rescale_factor.is_finite() {
+    normalize_rgb8(image, Rgb8Rescale::Multiply(rescale_factor), mean, std)
+}
+
+/// Rescales and normalizes RGB8 pixels with the selected arithmetic.
+pub fn normalize_rgb8(
+    image: RgbImageView<'_>,
+    rescale: Rgb8Rescale,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Result<NormalizedImage, MediaError> {
+    let valid = match rescale {
+        Rgb8Rescale::Multiply(factor) => factor.is_finite(),
+        Rgb8Rescale::Divide(divisor) => divisor.is_finite() && divisor != 0.0,
+    };
+    if !valid {
         return Err(MediaError::invalid(format!(
-            "image rescale factor must be finite, got {rescale_factor}"
+            "invalid RGB rescale {rescale:?}"
         )));
     }
     if mean.iter().any(|value| !value.is_finite()) {
@@ -404,7 +536,11 @@ pub fn rescale_and_normalize_rgb8(
         let row = &image.pixels[y * image.row_stride..][..width * 3];
         for x in 0..width {
             for channel in 0..3 {
-                let value = row[x * 3 + channel] as f32 * rescale_factor;
+                let value = row[x * 3 + channel] as f32;
+                let value = match rescale {
+                    Rgb8Rescale::Multiply(factor) => value * factor,
+                    Rgb8Rescale::Divide(divisor) => value / divisor,
+                };
                 let normalized = (value - mean[channel]) / std[channel];
                 if !normalized.is_finite() {
                     return Err(MediaError::invalid(

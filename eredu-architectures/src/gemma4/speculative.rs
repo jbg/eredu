@@ -63,7 +63,6 @@ where
     type Logits = M::Logits;
     type Context<'a> = M::Context<'a>;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
     type Error = M::Error;
 
     fn create_cache(
@@ -363,8 +362,8 @@ where
             [&output.logits, &output.hidden, inputs].into_iter().chain(
                 output
                     .shared_kv
-                    .values()
-                    .flat_map(|(keys, values)| [keys, values]),
+                    .iter()
+                    .flat_map(|(_, keys, values)| [keys, values]),
             ),
         )
     }
@@ -420,7 +419,7 @@ where
 {
     let mut shapes = Vec::with_capacity(1 + output.shared_kv.len() * 2);
     shapes.push(M::tensor_shape(&output.hidden)?);
-    for (keys, values) in output.shared_kv.values() {
+    for (_, keys, values) in &output.shared_kv {
         shapes.push(M::tensor_shape(keys)?);
         shapes.push(M::tensor_shape(values)?);
     }
@@ -443,10 +442,7 @@ where
     Ok(ExternalTargetOutput {
         logits,
         hidden,
-        shared_kv: shared_kv
-            .into_iter()
-            .map(|(policy, keys, values)| (policy, (keys, values)))
-            .collect(),
+        shared_kv,
     })
 }
 
@@ -457,7 +453,7 @@ pub struct ExternalTargetOutput<T> {
     /// Target-width hidden capture used to seed the assistant.
     pub hidden: T,
     /// Shared target K/V captures keyed by attention policy.
-    pub shared_kv: SharedAttentionStates<T>,
+    pub shared_kv: Vec<(eredu_core::AttentionPolicy, T, T)>,
 }
 
 /// Committed Gemma 4 target state from which one private assistant round starts.
@@ -565,8 +561,6 @@ pub trait ExternalMechanisms: 'static {
         Self: 'a;
     /// Exact verification completion.
     type Completion: BoundedCompletion<Error = Self::Error>;
-    /// Optional component telemetry.
-    type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -795,6 +789,30 @@ impl<M: ExternalMechanisms>
     }
 }
 
+impl<M: ExternalAssistantExecutionMechanisms>
+    eredu_core::speculative::GenerationExecutorCacheFactory<
+        eredu_runtime::speculative::AssistantExecutorTypes<M>,
+    > for ExternalExecutor<'_, ArchitectureExternalMechanisms<M>>
+{
+    fn new_cache<'a>(
+        &mut self,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'a,
+    {
+        eredu_core::speculative::SpeculativeCacheFactory::create_cache(self, selected, context)
+    }
+
+    fn bind_context<'a>(context: M::Context<'a>) -> Self::Context<'a>
+    where
+        Self: 'a,
+    {
+        context
+    }
+}
+
 impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
     /// Binds already materialized target and assistant objects to the neutral lifecycle.
     pub const fn new(
@@ -820,7 +838,7 @@ impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
         let shared_kv = output
             .shared_kv
             .iter()
-            .map(|(policy, (keys, values))| {
+            .map(|(policy, keys, values)| {
                 Ok((
                     *policy,
                     (
@@ -942,7 +960,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     where
         Self: 'a;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
+    type Telemetry = ();
     type Error = M::Error;
 
     /// Releases optional conversions; caller must establish a settled boundary.

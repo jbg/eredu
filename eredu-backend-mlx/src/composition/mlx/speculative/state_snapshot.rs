@@ -3,11 +3,9 @@ use eredu_core::execution_control::SnapshotEstimate;
 use safemlx::{error::Exception, transforms::async_eval_with_event, Array, Stream};
 
 pub(crate) fn estimate_array(array: &Array) -> Option<SnapshotEstimate> {
-    let bytes = u64::try_from(array.nbytes())
-        .ok()?
-        .checked_mul(2)?
-        .checked_add(4096)?
-        .checked_add((array.shape().len() as u64).checked_mul(16)?)?;
+    use eredu_core::cache::mechanisms::CacheTensorStorage;
+    let costs = crate::backend::runtime::cache::MlxCacheBackend::snapshot_tensor_costs()?;
+    let bytes = costs.bytes(u64::try_from(array.nbytes()).ok()?, array.shape().len())?;
     Some(SnapshotEstimate {
         retained_bytes: bytes,
         copy_bytes: bytes,

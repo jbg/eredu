@@ -1,8 +1,7 @@
-//! MLX comparison kernels over position ranges admitted by the cache owner.
-
-use std::ops::Range;
+//! MLX comparison kernels over admitted pooling visibility.
 
 use eredu_core::{cache::mechanisms::PoolingCacheStorage, BackendFailure};
+use eredu_nn::attention_mask::{LocalWindowVisibility, PooledWindowVisibility};
 use safemlx::{error::Exception, Array, Stream};
 
 use super::MlxCacheBackend;
@@ -10,36 +9,38 @@ use crate::MlxTensor;
 
 impl PoolingCacheStorage for MlxCacheBackend {
     fn local_visibility(
-        queries: Range<i32>,
-        keys: Range<i32>,
-        window: i32,
+        geometry: LocalWindowVisibility,
         queue: &Stream,
     ) -> Result<MlxTensor, BackendFailure> {
         (|| {
+            let queries = geometry.queries();
+            let keys = geometry.keys();
+            let [rows, columns] = geometry.shape();
             let queries = Array::arange::<i32, i32>(Some(queries.start), queries.end, None, queue)?
-                .reshape(&[-1, 1], queue)?;
+                .reshape(&[rows, 1], queue)?;
             let keys = Array::arange::<i32, i32>(Some(keys.start), keys.end, None, queue)?
-                .reshape(&[1, -1], queue)?;
+                .reshape(&[1, columns], queue)?;
             let causal = queries.ge(&keys, queue)?;
-            let recent = keys.gt(queries.subtract(Array::from_int(window), queue)?, queue)?;
+            let earliest = queries.subtract(Array::from_int(geometry.max_past()), queue)?;
+            let recent = keys.ge(earliest, queue)?;
             Ok::<_, Exception>(MlxTensor::from_array(causal.logical_and(&recent, queue)?))
         })()
         .map_err(BackendFailure::from_error)
     }
 
     fn pooled_visibility(
-        query_ends: Range<i32>,
-        pooled_tokens: i32,
-        ratio: i32,
+        geometry: PooledWindowVisibility,
         queue: &Stream,
     ) -> Result<Array, BackendFailure> {
         (|| {
-            let pooled = Array::arange::<i32, i32>(Some(0), pooled_tokens, None, queue)?
-                .reshape(&[1, pooled_tokens], queue)?;
-            let visible =
-                Array::arange::<i32, i32>(Some(query_ends.start), query_ends.end, None, queue)?
-                    .floor_divide(Array::from_int(ratio), queue)?
-                    .reshape(&[-1, 1], queue)?;
+            let queries = geometry.queries();
+            let [rows, columns] = geometry.shape();
+            let pooled = Array::arange::<i32, i32>(Some(0), columns, None, queue)?
+                .reshape(&[1, columns], queue)?;
+            let visible = Array::arange::<i32, i32>(Some(queries.start), queries.end, None, queue)?
+                .add(Array::from_int(1), queue)?
+                .floor_divide(Array::from_int(geometry.ratio()), queue)?
+                .reshape(&[rows, 1], queue)?;
             pooled.lt(visible, queue)
         })()
         .map_err(BackendFailure::from_error)

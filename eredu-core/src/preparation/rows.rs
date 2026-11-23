@@ -127,7 +127,10 @@ pub trait RowDecode<B: NeuralBackend, N: DenseResidencyMechanisms> {
     type Loan: ParameterLoan<B::Tensor, <B::Tensor as Tensor>::Context, Error = Self::Error>;
 
     /// Opens a scope for the exact acquired rows.
-    fn begin_loan(transfer: N::Transfer) -> Result<Self::Loan, Self::Error>;
+    fn begin_loan(
+        transfer: N::Transfer,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Loan, Self::Error>;
 
     /// Reports the exact decoding workspace for the supplied compact shape.
     fn workspace(

@@ -10,7 +10,7 @@ use safemlx::ops::indexing::{ArrayIndex, IntoStrideBy};
 
 use super::score_readout::CHUNK;
 
-mod routed;
+pub(super) mod routed;
 mod token_scores;
 
 #[cfg(feature = "tensor-capture")]
@@ -71,7 +71,13 @@ impl CaptureBackend for NativeCapture<'_> {
         source: &PartitionRoutedUnitCaptureSource<'_, MlxTensor>,
         request: &PartitionRoutedUnitCaptureRequest<'_>,
     ) -> Option<Result<RoutedUnitCapture, Error>> {
-        Some(routed::capture_partition(source, request, self.stream))
+        Some(capture_routed_units(
+            &routed::NativeRoutedReadout(self.stream),
+            &source.source,
+            request.geometry,
+            request.slice,
+            Some((source, request)),
+        ))
     }
     fn estimate_routed_units(
         &self,
@@ -87,7 +93,13 @@ impl CaptureBackend for NativeCapture<'_> {
         geometry: RoutedUnitGeometry,
         slice: &ResolvedCaptureSlice,
     ) -> Option<Result<RoutedUnitCapture, Error>> {
-        Some(routed::capture(source, geometry, slice, self.stream))
+        Some(capture_routed_units(
+            &routed::NativeRoutedReadout(self.stream),
+            source,
+            geometry,
+            slice,
+            None,
+        ))
     }
     type Tensor = MlxTensor;
     type Error = Error;

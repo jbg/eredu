@@ -140,6 +140,24 @@ error is 0.00006223; maximum diffusion logit error is 0.00009656. Maximum layer
 error is 0.00048828, on a large-magnitude residual activation. The four canonical
 cache frontiers are 3, 4, 5, and 6; transient calls preserve them.
 
+### Local shared-backbone generation on the 3B Q4_K_M conversion
+
+The pinned IntellAgents 3B Q4_K_M conversion yields the same five greedy token
+IDs on Candle CPU, Candle Metal, and MLX Metal. The sequence is
+`1010, 38166, 1256, 1010, 81410`.
+Render a single user message, “Write a list of twenty countries, each on its own
+line. Start with France.”, with the generation prompt enabled. Use seed 71, a
+five-token commitment limit, and two proposal positions. Compare
+`session().generate` in target-only mode with ordinary and controlled
+`drafting_session(SpeculativeDraft::SharedBackbone, …)` in self-speculation.
+All three accept three proposals. The CPU run uses the base draft. The two
+Metal runs bind the published `linear_spec_lora` from NVIDIA revision
+`0d51902da1f8869f83413ce642fab402fa5641e0` and enable it in the speculation
+request. All three runs reproduce the sequence after restoring a direct
+self-speculation snapshot taken after verification and before its first token
+commitment. Ordinary and controlled diffusion also agree on all five token
+IDs and each complete 31 refinement iterations.
+
 ### Normal loader with BF16 and the published draft adapter
 
 The ordinary loader binds the pinned 3B BF16 base and separate FP32

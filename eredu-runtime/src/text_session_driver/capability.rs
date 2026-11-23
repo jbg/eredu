@@ -7,7 +7,7 @@ use crate::{
 };
 use eredu_core::{
     backend::TextTransactionMechanisms,
-    capability::NativeMemoryFacts,
+    capability::{NativeExecutionMemory, NativeMemoryFacts},
     input::PreparedInputInspector,
     residency::{
         MemoryTier, ParameterConversionRetentionReport, ParameterConversionRetentionTrimReport,
@@ -129,7 +129,7 @@ fn prepared_media_bytes<T>(
         .map(Some)
 }
 
-impl<B, N> ModelCapabilitySession<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> ModelCapabilitySession<B> for TextSessionDriver<N::Resources, N, G>
 where
     B: TextGenerationBackend,
     Self: eredu_core::backend::TextOperationDriver<
@@ -137,7 +137,8 @@ where
         Prompt = crate::text_session_driver::TextPromptFor<B>,
     >,
     N: TextCapabilityMechanisms<B, Prefill = crate::text_session_driver::TextPromptFor<B>>
-        + TextTransactionMechanisms,
+        + TextTransactionMechanisms
+        + NativeExecutionMemory<B>,
 {
     fn model_capabilities(
         runtime: &ModelRuntime<B, Self>,
@@ -238,24 +239,13 @@ where
         runtime: &ModelRuntime<B, Self>,
     ) -> Result<StaticMemoryReport, CapabilityError> {
         let session = runtime.session();
-        let observation_error = |error: B::Error| CapabilityError::Observation(error.to_string());
-        let residency = session.residency_report().map_err(observation_error)?;
-        let banks = session
-            .parameter_bank_report()
-            .map_err(observation_error)?
-            .map(|report| bank_memory_facts(Some(report)))
-            .unwrap_or_default();
-        let mut components = session
-            .component_residency_reports()
-            .map_err(observation_error)?
-            .into_iter();
-        let residency = residency.or_else(|| components.next());
-        static_memory_from_residency_and_components(
-            residency,
-            components,
-            banks,
-            N::native_memory(),
-        )
+        let native = N::placement_memory(runtime.backend())
+            .map_err(|error| CapabilityError::Observation(error.to_string()))?
+            .native;
+        let residency = session
+            .residency_report()
+            .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+        installed_parameter_memory::<B, N, G>(session, residency, native)
     }
 
     fn trim_parameter_conversions(
@@ -302,6 +292,25 @@ pub fn bank_memory_facts(
             device_resident_bytes: bank.device_resident_bytes(),
         })
         .collect()
+}
+
+pub(super) fn installed_parameter_memory<B, N, G>(
+    session: &TextSessionDriver<N::Resources, N, G>,
+    residency: Option<ResidencyReport>,
+    native: NativeMemoryFacts,
+) -> Result<StaticMemoryReport, CapabilityError>
+where
+    B: TextGenerationBackend,
+    N: TextCapabilityMechanisms<B>,
+{
+    let observation_error = |error: B::Error| CapabilityError::Observation(error.to_string());
+    let banks = bank_memory_facts(session.parameter_bank_report().map_err(observation_error)?);
+    let mut components = session
+        .component_residency_reports()
+        .map_err(observation_error)?
+        .into_iter();
+    let residency = residency.or_else(|| components.next());
+    static_memory_from_residency_and_components(residency, components, banks, native)
 }
 
 /// Combines selected parameter residency with native memory counters.
@@ -420,6 +429,7 @@ pub fn static_memory_from_residency_and_components(
         planned_disk_backed_bytes: disk,
         backend_active_allocation_bytes: native.active_allocation_bytes,
         backend_allocator_cache_bytes: native.allocator_cache_bytes,
+        backend_device_allocated_bytes: native.device_allocated_bytes,
         physical_semantics: native.physical_semantics,
         currently_cached_shards: cached_shards,
     })

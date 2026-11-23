@@ -13,18 +13,41 @@ use eredu_nn::{
 };
 use eredu_runtime::RuntimeStateComponents;
 
-/// Optional mechanisms needed by the recurrent equation, including FP32 boundaries.
-pub const REQUIRED_OPERATORS: eredu_nn::NeuralOperatorCapabilities = {
+const COMMON_OPERATORS: eredu_nn::NeuralOperatorCapabilities = {
     use eredu_nn::NeuralOperatorCapabilities as C;
     C::SIGMOID
         .union(C::SOFTPLUS)
-        .union(C::EXP)
-        .union(C::L2_NORMALIZE)
         .union(C::OUTPUT_GATED_GROUP_RMS_NORM)
         .union(C::GATED_DELTA_SCAN)
         .union(C::BROADCAST_TO)
         .union(C::CAST_FLOAT)
 };
+
+/// Optional mechanisms for log-transition arithmetic, including FP32 boundaries.
+pub const REQUIRED_OPERATORS: eredu_nn::NeuralOperatorCapabilities = COMMON_OPERATORS
+    .union(eredu_nn::NeuralOperatorCapabilities::EXP)
+    .union(eredu_nn::NeuralOperatorCapabilities::L2_NORMALIZE);
+
+/// Parameter and activation conventions for one gated-delta mixer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedDeltaArithmetic {
+    /// Store log transition magnitude, add epsilon to the squared norm, and scale the query.
+    LogTransition,
+    /// Store negative transition directly, floor the norm, and scale the scan output.
+    NegativeTransition,
+}
+
+impl GatedDeltaArithmetic {
+    /// Forward operators needed by this arithmetic convention.
+    pub const fn required_operators(self) -> eredu_nn::NeuralOperatorCapabilities {
+        match self {
+            Self::LogTransition => REQUIRED_OPERATORS,
+            Self::NegativeTransition => {
+                COMMON_OPERATORS.union(eredu_nn::NeuralOperatorCapabilities::SQRT)
+            }
+        }
+    }
+}
 
 /// Exact parameter identities, formats, geometry and arithmetic for a mixer.
 #[derive(Debug, Clone)]
@@ -43,14 +66,16 @@ pub struct GatedDeltaMixerSpec {
     pub convolution: CausalDepthwiseConvolutionSpec,
     /// Per-value-head softplus bias.
     pub decay_bias: ParameterSpec,
-    /// Per-value-head logarithmic transition magnitude.
-    pub transition_log: ParameterSpec,
+    /// Per-value-head transition parameter in the declared arithmetic convention.
+    pub transition: ParameterSpec,
     /// Per-value-dimension RMS scale shared by heads.
     pub normalization_weight: ParameterSpec,
     /// Projection from value heads back to the residual width.
     pub output: LinearSpec,
-    /// Additive epsilon for query/key L2 normalization.
+    /// Epsilon for query/key L2 normalization.
     pub l2_epsilon: f32,
+    /// Transition storage and recurrent activation arithmetic.
+    pub arithmetic: GatedDeltaArithmetic,
     /// Additive epsilon for output RMS normalization.
     pub output_epsilon: f32,
     /// Gate activation applied after output normalization.
@@ -81,7 +106,7 @@ impl eredu_nn::DeclareLogicalParameters for GatedDeltaMixerSpec {
                 R::RecurrentBias,
             )?,
             D::new(
-                &self.transition_log,
+                &self.transition,
                 &[self.geometry.value_heads()],
                 R::RecurrentTransition,
             )?,
@@ -155,6 +180,8 @@ impl GatedDeltaMixerSpec {
 #[parameterized(tensor = "B::Tensor")]
 pub struct GatedDeltaMixer<B: NeuralBackend> {
     #[parameter(skip)]
+    arithmetic: GatedDeltaArithmetic,
+    #[parameter(skip)]
     l2_epsilon: f32,
     #[parameter(skip)]
     output_epsilon: f32,
@@ -181,8 +208,8 @@ pub struct GatedDeltaMixer<B: NeuralBackend> {
     convolution: CausalDepthwiseConvolution<B>,
     /// Per-value-head decay bias.
     pub decay_bias: Parameter<B::Tensor>,
-    /// Per-value-head logarithmic transition magnitude.
-    pub transition_log: Parameter<B::Tensor>,
+    /// Per-value-head transition parameter.
+    pub transition: Parameter<B::Tensor>,
     /// Learned gated-normalization scale.
     pub normalization_weight: Parameter<B::Tensor>,
     output: B::Linear,
@@ -195,8 +222,12 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         spec.validate()?;
-        B::require_operator_capabilities("gated-delta mixer", REQUIRED_OPERATORS)?;
+        B::require_operator_capabilities(
+            "gated-delta mixer",
+            spec.arithmetic.required_operators(),
+        )?;
         Ok(Self {
+            arithmetic: spec.arithmetic,
             key_heads: spec.geometry.key_heads(),
             value_heads: spec.geometry.value_heads(),
             key_head_dim: spec.geometry.key_dimensions(),
@@ -217,8 +248,8 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
                 &[spec.geometry.value_heads()],
                 context,
             )?,
-            transition_log: Parameter::unloaded(
-                spec.transition_log,
+            transition: Parameter::unloaded(
+                spec.transition,
                 &[spec.geometry.value_heads()],
                 context,
             )?,
@@ -348,17 +379,19 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
             source_heads: self.key_heads,
             target_heads: self.value_heads,
         };
-        let query = B::expand_heads(
-            &B::l2_normalize(&query, self.l2_epsilon, context)?,
-            expansion,
-            context,
-        )?
-        .multiply_scalar((self.key_head_dim as f32).sqrt().recip(), context)?;
-        let key = B::expand_heads(
-            &B::l2_normalize(&key, self.l2_epsilon, context)?,
-            expansion,
-            context,
-        )?;
+        let normalize = |value| match self.arithmetic {
+            GatedDeltaArithmetic::LogTransition => B::l2_normalize(value, self.l2_epsilon, context),
+            GatedDeltaArithmetic::NegativeTransition => {
+                B::l2_normalize_with_floor(value, self.l2_epsilon, context)
+            }
+        };
+        let scale = (self.key_head_dim as f32).sqrt().recip();
+        let query = B::expand_heads(&normalize(&query)?, expansion, context)?;
+        let query = match self.arithmetic {
+            GatedDeltaArithmetic::LogTransition => query.multiply_scalar(scale, context)?,
+            GatedDeltaArithmetic::NegativeTransition => query,
+        };
+        let key = B::expand_heads(&normalize(&key)?, expansion, context)?;
         let beta = {
             let projected = self.input_beta.forward(input, context)?;
             instrumentation.observe("mixer.update.projected", &projected)?;
@@ -369,6 +402,16 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
             .as_ref()
             .cast_float(TensorElementType::F32, context)?
             .reshape(&[1, 1, self.value_heads], context)?;
+        let transition = self
+            .transition
+            .as_ref()
+            .cast_float(TensorElementType::F32, context)?;
+        let transition = match self.arithmetic {
+            GatedDeltaArithmetic::LogTransition => {
+                B::exp(transition, context)?.multiply_scalar(-1.0, context)?
+            }
+            GatedDeltaArithmetic::NegativeTransition => transition,
+        };
         let decay = B::softplus(
             {
                 let projected = self.input_decay.forward(input, context)?;
@@ -380,16 +423,7 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
             1.0,
             context,
         )?
-        .multiply(
-            &B::exp(
-                self.transition_log
-                    .as_ref()
-                    .cast_float(TensorElementType::F32, context)?,
-                context,
-            )?
-            .multiply_scalar(-1.0, context)?,
-            context,
-        )?;
+        .multiply(&transition, context)?;
         let scan = {
             let recurrent = state
                 .fixed_component(StateTensorRole::Recurrent)
@@ -418,8 +452,14 @@ impl<B: NeuralBackend> GatedDeltaMixer<B> {
                 context,
             )?
         };
+        let output = match self.arithmetic {
+            GatedDeltaArithmetic::LogTransition => scan.output,
+            GatedDeltaArithmetic::NegativeTransition => {
+                scan.output.multiply_scalar(scale, context)?
+            }
+        };
         let normalized = B::output_gated_group_rms_norm(
-            &scan.output.cast_float(activation_dtype, context)?,
+            &output.cast_float(activation_dtype, context)?,
             &gate,
             self.normalization_weight.as_ref(),
             1,

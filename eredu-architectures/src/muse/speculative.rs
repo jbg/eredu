@@ -67,7 +67,6 @@ where
     type Logits = M::Logits;
     type Context<'a> = M::Context<'a>;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
     type Error = M::Error;
 
     fn create_cache(
@@ -130,7 +129,7 @@ where
         Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
         eredu_core::BackendFailure,
     > {
-        assistant.parameter_memory_observation::<M::Memory>()
+        assistant.parameter_memory_observation(M::placement_memory(assistant.execution_queue())?)
     }
 
     fn tensor_backing_bytes(
@@ -736,8 +735,6 @@ pub trait ExternalMechanisms: 'static {
         Self: 'a;
     /// Exact target completion.
     type Completion: BoundedCompletion<Error = Self::Error>;
-    /// Optional component telemetry.
-    type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -1017,6 +1014,30 @@ impl<M: ExternalMechanisms>
     }
 }
 
+impl<M: ExternalAssistantExecutionMechanisms>
+    eredu_core::speculative::GenerationExecutorCacheFactory<
+        eredu_runtime::speculative::AssistantExecutorTypes<M>,
+    > for ExternalExecutor<'_, ArchitectureExternalMechanisms<M>>
+{
+    fn new_cache<'a>(
+        &mut self,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Cache, Self::Error>
+    where
+        Self: 'a,
+    {
+        eredu_core::speculative::SpeculativeCacheFactory::create_cache(self, selected, context)
+    }
+
+    fn bind_context<'a>(context: M::Context<'a>) -> Self::Context<'a>
+    where
+        Self: 'a,
+    {
+        context
+    }
+}
+
 impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
     /// Binds materialized target and assistant objects to the neutral lifecycle.
     pub const fn new(
@@ -1150,7 +1171,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     where
         Self: 'a;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
+    type Telemetry = ();
     type Error = M::Error;
 
     /// Releases optional conversions; caller must establish a settled boundary.

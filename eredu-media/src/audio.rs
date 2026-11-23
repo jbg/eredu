@@ -186,18 +186,65 @@ pub struct LeadingSlaneyLogMelConfig {
     pub energy_floor: f32,
 }
 
+/// Floating arithmetic for semicausal magnitude analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMelArithmetic {
+    /// Use the standard FFT and add the floor before the logarithm.
+    AdditiveFloor,
+    /// Use radix-2 FP32 butterflies and clamp after accumulating mel groups in FP64.
+    ClampedFloor,
+}
+
+/// Fully specified host log-mel feature extraction.
+#[derive(Debug, Clone)]
+pub enum AudioFeatureRequest {
+    /// Semicausal periodic-Hann magnitude analysis with HTK mel filters.
+    SemicausalHtk {
+        /// Window, FFT, filter bank, and waveform geometry.
+        config: LogMelConfig,
+        /// Arithmetic for the transform and logarithmic floor.
+        arithmetic: LogMelArithmetic,
+    },
+    /// Leading-zero magnitude analysis with area-normalized Slaney filters.
+    LeadingSlaney(LeadingSlaneyLogMelConfig),
+}
+
+/// Executes a log-mel request on a validated mono waveform.
+pub fn extract_audio_features(
+    waveform: AudioWaveform<'_>,
+    request: &AudioFeatureRequest,
+) -> Result<LogMelFeatures, MediaError> {
+    match request {
+        AudioFeatureRequest::SemicausalHtk { config, arithmetic } => {
+            extract_log_mel_with_arithmetic(waveform, config, *arithmetic)
+        }
+        AudioFeatureRequest::LeadingSlaney(config) => {
+            extract_leading_slaney_log_mel(waveform, config)
+        }
+    }
+}
+
 /// Extracts semicausal periodic-Hann HTK log-mel features.
 pub fn extract_log_mel(
     waveform: AudioWaveform<'_>,
     config: &LogMelConfig,
 ) -> Result<LogMelFeatures, MediaError> {
+    extract_log_mel_with_arithmetic(waveform, config, LogMelArithmetic::AdditiveFloor)
+}
+
+/// Extracts semicausal periodic-Hann HTK features with explicit arithmetic.
+pub fn extract_log_mel_with_arithmetic(
+    waveform: AudioWaveform<'_>,
+    config: &LogMelConfig,
+    arithmetic: LogMelArithmetic,
+) -> Result<LogMelFeatures, MediaError> {
     #[cfg(feature = "audio")]
     {
-        extract_log_mel_enabled(waveform, config)
+        extract_log_mel_enabled(waveform, config, arithmetic)
     }
     #[cfg(not(feature = "audio"))]
     {
-        let _ = (waveform, config);
+        let _ = (waveform, config, arithmetic);
         Err(MediaError::invalid(
             "HTK log-mel extraction requires the `audio` feature",
         ))
@@ -208,6 +255,7 @@ pub fn extract_log_mel(
 fn extract_log_mel_enabled(
     waveform: AudioWaveform<'_>,
     config: &LogMelConfig,
+    arithmetic: LogMelArithmetic,
 ) -> Result<LogMelFeatures, MediaError> {
     if waveform.sample_rate != config.sample_rate {
         return Err(MediaError::invalid(format!(
@@ -250,13 +298,27 @@ fn extract_log_mel_enabled(
     padded[left_padding..left_padding + real_samples]
         .copy_from_slice(&waveform.samples[..real_samples]);
 
+    let clamped = arithmetic == LogMelArithmetic::ClampedFloor;
+    if clamped && !config.fft_length.is_power_of_two() {
+        return Err(MediaError::invalid(
+            "radix-2 log-mel analysis requires a power-of-two FFT",
+        ));
+    }
     let window = (0..config.frame_length)
         .map(|index| {
             0.5 - 0.5
                 * (2.0 * std::f32::consts::PI * index as f32 / config.frame_length as f32).cos()
         })
         .collect::<Vec<_>>();
-    let mel_filters = htk_mel_filters(config);
+    let mel_filters = htk_mel_filters(config, clamped);
+    let twiddles = clamped.then(|| {
+        (0..config.fft_length / 2)
+            .map(|bin| {
+                let angle = (std::f64::consts::TAU * bin as f64 / config.fft_length as f64) as f32;
+                Complex32::new(angle.cos(), -angle.sin())
+            })
+            .collect::<Vec<_>>()
+    });
     let frequency_bins = config.fft_length / 2 + 1;
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(config.fft_length);
@@ -270,14 +332,39 @@ fn extract_log_mel_enabled(
         for index in 0..config.frame_length {
             spectrum[index].re = padded[start + index] * window[index];
         }
-        fft.process(&mut spectrum);
+        if let Some(twiddles) = &twiddles {
+            radix2_fft(&mut spectrum, twiddles);
+        } else {
+            fft.process(&mut spectrum);
+        }
+        let magnitude = spectrum[..frequency_bins]
+            .iter()
+            .map(|value| {
+                if clamped {
+                    value.re.mul_add(value.re, value.im * value.im).sqrt()
+                } else {
+                    value.norm()
+                }
+            })
+            .collect::<Vec<_>>();
         for mel in 0..config.mel_bins {
-            let mut magnitude = 0.0f32;
-            for frequency in 0..frequency_bins {
-                magnitude +=
-                    spectrum[frequency].norm() * mel_filters[frequency * config.mel_bins + mel];
-            }
-            values[frame * config.mel_bins + mel] = (magnitude + config.mel_floor).ln();
+            let weighted = magnitude
+                .iter()
+                .enumerate()
+                .map(|(frequency, value)| value * mel_filters[frequency * config.mel_bins + mel]);
+            values[frame * config.mel_bins + mel] = if clamped {
+                let mut weighted = weighted;
+                let mut total = 0.0f64;
+                for _ in 0..frequency_bins / 4 {
+                    let group =
+                        std::array::from_fn::<_, 4, _>(|_| weighted.next().unwrap_or_default());
+                    total += f64::from(((group[0] + group[1]) + group[2]) + group[3]);
+                }
+                total += weighted.map(f64::from).sum::<f64>();
+                total.max(f64::from(config.mel_floor)).ln() as f32
+            } else {
+                (weighted.sum::<f32>() + config.mel_floor).ln()
+            };
         }
         let endpoint = start + frame_span - 1;
         mask[frame] = endpoint >= left_padding && endpoint < left_padding + real_samples;
@@ -400,7 +487,61 @@ fn extract_leading_slaney_log_mel_enabled(
 }
 
 #[cfg(feature = "audio")]
-fn htk_mel_filters(config: &LogMelConfig) -> Vec<f32> {
+fn radix2_fft(spectrum: &mut [Complex32], twiddles: &[Complex32]) {
+    let size = spectrum.len();
+    let bits = size.trailing_zeros();
+    for index in 0..size {
+        let reverse = index.reverse_bits() >> (usize::BITS - bits);
+        if index < reverse {
+            spectrum.swap(index, reverse);
+        }
+    }
+    for level in 1..=bits {
+        let width = 1 << level;
+        let half = width / 2;
+        for block in spectrum.chunks_exact_mut(width) {
+            let (even, odd) = block.split_at_mut(half);
+            for (bin, (even, odd)) in even.iter_mut().zip(odd).enumerate() {
+                let factor = twiddles[bin * (size / width)];
+                let Complex32 { re, im } = *even;
+                *even = Complex32::new(
+                    (-factor.im).mul_add(odd.im, factor.re.mul_add(odd.re, re)),
+                    factor.im.mul_add(odd.re, factor.re.mul_add(odd.im, im)),
+                );
+                *odd = Complex32::new(
+                    factor.im.mul_add(odd.im, (-factor.re).mul_add(odd.re, re)),
+                    (-factor.im).mul_add(odd.re, (-factor.re).mul_add(odd.im, im)),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+fn htk_mel_filters(config: &LogMelConfig, clamped: bool) -> Vec<f32> {
+    if clamped {
+        let hertz_to_mel = |hertz: f64| 2595.0 * (1.0 + hertz / 700.0).log10();
+        let mel_low = hertz_to_mel(f64::from(config.min_frequency));
+        let mel_high = hertz_to_mel(f64::from(config.max_frequency));
+        let centers = (0..config.mel_bins + 2)
+            .map(|bin| {
+                let position = bin as f64 / (config.mel_bins + 1) as f64;
+                let mel = mel_low + (mel_high - mel_low) * position;
+                700.0 * (10.0f64.powf(mel / 2595.0) - 1.0)
+            })
+            .collect::<Vec<_>>();
+        let step = f64::from(config.sample_rate) / config.fft_length as f64;
+        return (0..=config.fft_length / 2)
+            .flat_map(|bin| {
+                let frequency = bin as f64 * step;
+                centers.windows(3).map(move |edges| {
+                    let rise = (frequency - edges[0]) / (edges[1] - edges[0]);
+                    let fall = (edges[2] - frequency) / (edges[2] - edges[1]);
+                    rise.min(fall).max(0.0) as f32
+                })
+            })
+            .collect();
+    }
     let frequency_bins = config.fft_length / 2 + 1;
     let hertz_to_mel = |frequency: f32| 2595.0 * (1.0 + frequency / 700.0).log10();
     let mel_to_hertz = |mel: f32| 700.0 * (10.0f32.powf(mel / 2595.0) - 1.0);

@@ -32,13 +32,13 @@ if (CHUNKS == 4) {
         for (uint i = 0; i < LANES; ++i) {
             total += simd_shuffle(merged, i);
         }
-        partial[lane] = 1.0f / metal::precise::sqrt(total / float(WIDTH) + epsilon[0]);
+        partial[lane] = metal::precise::divide(1.0f, metal::precise::sqrt(metal::precise::divide(total, float(WIDTH)) + epsilon[0]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     inverse = partial[lane];
 } else {
     float sum = parallel_cascade_sum_f32<LANES>(squared, WIDTH, lane);
-    inverse = 1.0f / metal::precise::sqrt(sum / float(WIDTH) + epsilon[0]);
+    inverse = metal::precise::divide(1.0f, metal::precise::sqrt(metal::precise::divide(sum, float(WIDTH)) + epsilon[0]));
 }
 for (uint i = chunk * 32 + lane; i < WIDTH; i += CHUNKS * 32) {
     // Learned gain consumes the rounded normalized value.

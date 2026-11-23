@@ -1,7 +1,17 @@
 //! Blockwise attention over ordered paged-cache blocks.
 
 use super::*;
-use crate::backend::nn::attention::grouped_head_product;
+use crate::backend::nn::{
+    attention::{grouped_head_product, input_score_product},
+    matrix::{BatchedDotReduction, PreparedBf16BatchedProduct},
+    ordered_bf16_attention::OrderedBf16Attention,
+};
+use crate::MlxTensor;
+use eredu_core::cache::mechanisms::AttentionScan;
+use eredu_nn::paged_attention::{
+    mask_columns, merge_softmax, page_visibility, requires_value_pass, retained_page_ranges,
+    SoftmaxPartial,
+};
 
 pub struct KeyValueAttentionBlock {
     pub start: i64,
@@ -32,11 +42,13 @@ pub struct BlockwiseAttentionAccumulator {
     scale: f32,
     softcap: Option<f32>,
     arithmetic: eredu_nn::AttentionArithmetic,
-    value_pass: bool,
+    pass: usize,
+    ordered: Option<OrderedBf16Attention>,
     causal: bool,
     retained_start: Option<i64>,
     explicit_mask: Option<Array>,
     query_start: i64,
+    context_end: i64,
     sliding_window: Option<i32>,
     prefix_tokens: i64,
     sinks: Option<Array>,
@@ -85,7 +97,8 @@ impl BlockwiseAttentionAccumulator {
             scale,
             softcap: None,
             arithmetic: eredu_nn::AttentionArithmetic::Fused,
-            value_pass: false,
+            pass: 0,
+            ordered: None,
             causal: true,
             retained_start: None,
             explicit_mask: explicit_mask
@@ -94,6 +107,7 @@ impl BlockwiseAttentionAccumulator {
                 })
                 .transpose()?,
             query_start,
+            context_end,
             sliding_window,
             prefix_tokens,
             sinks: sinks.cloned(),
@@ -128,6 +142,7 @@ impl BlockwiseAttentionAccumulator {
     pub fn set_arithmetic(
         &mut self,
         arithmetic: eredu_nn::AttentionArithmetic,
+        stream: &Stream,
     ) -> Result<(), Exception> {
         if self.running_max.is_some() {
             return Err(Exception::custom(
@@ -135,6 +150,14 @@ impl BlockwiseAttentionAccumulator {
             ));
         }
         self.arithmetic = arithmetic;
+        self.ordered = (requires_value_pass(arithmetic)
+            && self.output_dtype == Dtype::Bfloat16
+            && self
+                .context_end
+                .saturating_add(i64::from(self.sinks.is_some()))
+                >= 4
+            && OrderedBf16Attention::supported(stream)?)
+        .then(OrderedBf16Attention::default);
         Ok(())
     }
 
@@ -157,21 +180,70 @@ impl BlockwiseAttentionAccumulator {
         Ok(())
     }
 
-    /// Retains the global softmax normalization and starts a second bounded
-    /// scan, rounding normalized probabilities before their value products.
-    pub fn begin_value_pass(&mut self) -> Result<(), Exception> {
-        if self.arithmetic != eredu_nn::AttentionArithmetic::InputScores
-            || self.value_pass
-            || self.running_max.is_none()
-            || self.running_sum.is_none()
-        {
-            return Err(Exception::custom(
-                "rounded-probability attention requires a completed normalization pass",
-            ));
+    /// Returns the sweep plan selected for the admitted arithmetic and device.
+    pub fn scan(&self) -> AttentionScan {
+        if self.ordered.is_some() {
+            AttentionScan::MaximumThenMassThenValues
+        } else if requires_value_pass(self.arithmetic) {
+            AttentionScan::OnlineThenValues
+        } else {
+            AttentionScan::Online
         }
-        self.value_pass = true;
-        self.accumulator = None;
+    }
+
+    pub fn ordered_workspace_bytes(&self, page_score_bytes: u64) -> u64 {
+        self.ordered.as_ref().map_or(0, |ordered| {
+            ordered
+                .workspace_bytes()
+                .saturating_add(page_score_bytes / 2)
+        })
+    }
+
+    /// Transitions to the next sweep after establishing its inputs.
+    pub fn begin_pass(&mut self, pass: usize, stream: &Stream) -> Result<(), Exception> {
+        if pass != self.pass + 1 || pass >= self.scan().passes() || self.running_max.is_none() {
+            return Err(Exception::custom("attention sweep is out of order"));
+        }
+        if self.ordered.is_some() {
+            if pass == 2 {
+                if let Some(sink) = self.sink_scores(self.output_dtype, stream)? {
+                    let ordered = self.ordered.as_mut().expect("ordered BF16 attention");
+                    ordered.accumulate_mass(
+                        &sink,
+                        self.running_max.as_ref().expect("attention has maxima"),
+                        i32::try_from(self.context_end)
+                            .map_err(|_| Exception::custom("attention context exceeds i32"))?,
+                        stream,
+                    )?;
+                    safemlx::transforms::eval(ordered.roots())?;
+                }
+            }
+        } else {
+            self.accumulator = None;
+        }
+        self.pass = pass;
         Ok(())
+    }
+
+    fn sink_scores(&self, dtype: Dtype, stream: &Stream) -> Result<Option<Array>, Exception> {
+        self.sinks
+            .as_ref()
+            .map(|sink| {
+                if sink.ndim() != 1 || sink.dim(0) != self.query_heads {
+                    return Err(Exception::custom(
+                        "paged attention sinks must have one value per query head",
+                    ));
+                }
+                broadcast_to(
+                    &sink
+                        .as_dtype(dtype, stream)?
+                        .as_dtype(Dtype::Float32, stream)?
+                        .reshape(&[1, self.query_heads, 1, 1], stream)?,
+                    &[self.batch, self.query_heads, self.query_len, 1],
+                    stream,
+                )
+            })
+            .transpose()
     }
 
     pub fn accumulate(
@@ -190,7 +262,8 @@ impl BlockwiseAttentionAccumulator {
             self.running_max
                 .iter()
                 .chain(self.running_sum.iter())
-                .chain(self.accumulator.iter()),
+                .chain(self.accumulator.iter())
+                .chain(self.ordered.iter().flat_map(OrderedBf16Attention::roots)),
         )
     }
 
@@ -204,12 +277,8 @@ impl BlockwiseAttentionAccumulator {
             // Physical pages can overlap discarded logical history. Split out
             // only the permanent prefix and retained suffix before interpreting
             // the caller's positional mask; transient positions are in suffix.
-            let prefix_end = block.end.min(self.prefix_tokens).min(start);
-            let suffix_start = block.start.max(start);
-            for (begin, end) in [(block.start, prefix_end), (suffix_start, block.end)] {
-                if begin >= end {
-                    continue;
-                }
+            for range in retained_page_ranges(block.start..block.end, self.prefix_tokens, start) {
+                let (begin, end) = (range.start, range.end);
                 let range = (begin - block.start) as i32..(end - block.start) as i32;
                 let keys = block
                     .keys
@@ -244,6 +313,7 @@ impl BlockwiseAttentionAccumulator {
             || values.dim(1) != keys.dim(1)
             || values.dim(2) != keys.dim(2)
             || keys.dim(1) <= 0
+            || keys.dim(2) <= 0
             || keys.dim(3) != self.head_dim
         {
             return Err(Exception::custom(
@@ -258,21 +328,43 @@ impl BlockwiseAttentionAccumulator {
         }
         let key_len = keys.dim(2);
         let value_dim = values.dim(3);
-        let keys = keys.as_dtype(Dtype::Float32, stream)?;
-        let values = values.as_dtype(Dtype::Float32, stream)?;
-        let mut scores = if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
-            grouped_head_product(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
+        let rounded = requires_value_pass(self.arithmetic);
+        let ordered_scores = rounded && self.output_dtype == Dtype::Bfloat16;
+        let dot_dtype = if ordered_scores {
+            Dtype::Bfloat16
+        } else {
+            Dtype::Float32
+        };
+        let keys = keys
+            .as_dtype(dot_dtype, stream)?
+            .swap_axes(-1, -2, stream)?;
+        let mut scores = if ordered_scores {
+            let query = self.queries.as_dtype(dot_dtype, stream)?;
+            let reduction =
+                BatchedDotReduction::for_scores(eredu_nn::arithmetic::Bf16DotGeometry {
+                    rows: self.query_len as u64,
+                    width: self.head_dim as u64,
+                    columns: self.context_end as u64,
+                });
+            let prepared =
+                PreparedBf16BatchedProduct::new(&keys, false, reduction, self.query_len, stream)?;
+            input_score_product(&query, &keys, prepared.as_ref(), reduction, stream)?
+                .as_dtype(Dtype::Float32, stream)?
+                .multiply(Array::from_f32(self.scale), stream)?
+                .as_dtype(self.output_dtype, stream)?
+        } else if rounded {
+            grouped_head_product(&self.queries, &keys, stream)?
                 .as_dtype(self.output_dtype, stream)?
                 .as_dtype(Dtype::Float32, stream)?
                 .multiply(Array::from_f32(self.scale), stream)?
                 .as_dtype(self.output_dtype, stream)?
         } else if self.arithmetic == eredu_nn::AttentionArithmetic::Float32 {
-            grouped_head_product(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
+            grouped_head_product(&self.queries, &keys, stream)?
                 .multiply(Array::from_f32(self.scale), stream)?
         } else {
             grouped_head_product(
                 &self.queries.multiply(Array::from_f32(self.scale), stream)?,
-                &keys.swap_axes(-1, -2, stream)?,
+                &keys,
                 stream,
             )?
         };
@@ -282,52 +374,56 @@ impl BlockwiseAttentionAccumulator {
                 stream,
             )?
             .multiply(Array::from_f32(cap), stream)?;
+            if ordered_scores {
+                scores = scores.as_dtype(self.output_dtype, stream)?;
+            }
         }
         if let Some(bias) = additive_bias {
             scores = scores.add(bias.as_dtype(scores.dtype(), stream)?, stream)?;
         }
         let allowed = if self.causal {
-            absolute_attention_mask(
+            page_visibility(
                 self.query_start,
                 self.query_len,
-                block_start,
-                block_end,
+                block_start..block_end,
                 self.sliding_window,
                 self.prefix_tokens,
             )
+            .map_err(|error| Exception::custom(error.to_string()))?
         } else {
             vec![true; self.query_len as usize * key_len as usize]
         };
         let allowed = Array::from_slice(&allowed, &[self.query_len, key_len]);
+        let hidden = if self.ordered.is_some() {
+            f32::NEG_INFINITY
+        } else {
+            f32::MIN
+        };
         let effective_mask = if let Some(mask) = &self.explicit_mask {
-            let relative_start = block_start - self.mask_origin;
-            let relative_end = block_end - self.mask_origin;
-            if relative_start < 0 || relative_end > mask.dim(-1) as i64 {
-                return Err(Exception::custom(
-                    "paged attention mask does not cover every visible cache block",
-                ));
-            }
-            let mask = mask.try_index_device(
-                (.., .., .., relative_start as i32..relative_end as i32),
-                stream,
-            )?;
+            let columns = mask_columns(block_start..block_end, self.mask_origin, mask.dim(-1))
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            let mask = mask.try_index_device((.., .., .., columns), stream)?;
             if mask.dtype() == Dtype::Bool {
                 let combined = allowed.logical_and(&mask, stream)?;
-                scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
+                scores = r#where(&combined, scores, Array::from_f32(hidden), stream)?;
                 combined
             } else {
                 let combined =
                     allowed.logical_and(&mask.is_neg_inf(stream)?.logical_not(stream)?, stream)?;
                 scores = scores.add(mask.as_dtype(scores.dtype(), stream)?, stream)?;
-                scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
+                scores = r#where(&combined, scores, Array::from_f32(hidden), stream)?;
                 combined
             }
         } else {
-            scores = r#where(&allowed, scores, Array::from_f32(f32::MIN), stream)?;
+            scores = r#where(&allowed, scores, Array::from_f32(hidden), stream)?;
             allowed
         };
         let scores = scores.as_dtype(Dtype::Float32, stream)?;
-        if self.value_pass {
+        if self.ordered.is_some() {
+            return self.accumulate_ordered(&scores, values, block_start, stream);
+        }
+        let values = values.as_dtype(Dtype::Float32, stream)?;
+        if self.pass == 1 {
             let maximum = self
                 .running_max
                 .as_ref()
@@ -366,7 +462,7 @@ impl BlockwiseAttentionAccumulator {
         let mut weights = scores.subtract(&block_max, stream)?.exp(stream)?;
         weights = weights.multiply(effective_mask.as_dtype(Dtype::Float32, stream)?, stream)?;
         let block_sum = sum_axis(&weights, -1, true, stream)?;
-        let block_accumulator = if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+        let block_accumulator = if requires_value_pass(self.arithmetic) {
             safemlx::ops::zeros::<f32>(
                 &[self.batch, self.query_heads, self.query_len, value_dim],
                 stream,
@@ -376,36 +472,40 @@ impl BlockwiseAttentionAccumulator {
         };
         match (&self.running_max, &self.running_sum, &self.accumulator) {
             (Some(old_max), Some(old_sum), Some(old_accumulator)) => {
-                let new_max = maximum(old_max, &block_max, stream)?;
-                let old_scale = old_max.subtract(&new_max, stream)?.exp(stream)?;
-                let block_scale = block_max.subtract(&new_max, stream)?.exp(stream)?;
-                self.running_sum = Some(
-                    old_sum
-                        .multiply(&old_scale, stream)?
-                        .add(block_sum.multiply(&block_scale, stream)?, stream)?,
-                );
-                self.accumulator = Some(
-                    old_accumulator
-                        .multiply(&old_scale, stream)?
-                        .add(block_accumulator.multiply(&block_scale, stream)?, stream)?,
-                );
-                self.running_max = Some(new_max);
+                let retained = SoftmaxPartial {
+                    maximum: MlxTensor::from_array(old_max.clone()),
+                    mass: MlxTensor::from_array(old_sum.clone()),
+                    weighted_values: MlxTensor::from_array(old_accumulator.clone()),
+                };
+                let page = SoftmaxPartial {
+                    maximum: MlxTensor::from_array(block_max),
+                    mass: MlxTensor::from_array(block_sum),
+                    weighted_values: MlxTensor::from_array(block_accumulator),
+                };
+                let merged = merge_softmax(
+                    &retained,
+                    &page,
+                    stream,
+                    |left, right, stream| {
+                        maximum(left.as_array(), right.as_array(), stream)
+                            .map(MlxTensor::from_array)
+                            .map_err(eredu_nn::Error::backend_source)
+                    },
+                    |input, stream| {
+                        input
+                            .as_array()
+                            .exp(stream)
+                            .map(MlxTensor::from_array)
+                            .map_err(eredu_nn::Error::backend_source)
+                    },
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                self.running_sum = Some(merged.mass.into_array());
+                self.accumulator = Some(merged.weighted_values.into_array());
+                self.running_max = Some(merged.maximum.into_array());
             }
             _ => {
-                if let Some(sinks) = &self.sinks {
-                    if sinks.ndim() != 1 || sinks.dim(0) != self.query_heads {
-                        return Err(Exception::custom(
-                            "paged attention sinks must have one value per query head",
-                        ));
-                    }
-                    let sink = sinks
-                        .as_dtype(Dtype::Float32, stream)?
-                        .reshape(&[1, self.query_heads, 1, 1], stream)?;
-                    let sink = broadcast_to(
-                        &sink,
-                        &[self.batch, self.query_heads, self.query_len, 1],
-                        stream,
-                    )?;
+                if let Some(sink) = self.sink_scores(Dtype::Float32, stream)? {
                     let new_max = maximum(&sink, &block_max, stream)?;
                     let sink_sum = sink.subtract(&new_max, stream)?.exp(stream)?;
                     let block_scale = block_max.subtract(&new_max, stream)?.exp(stream)?;
@@ -434,12 +534,56 @@ impl BlockwiseAttentionAccumulator {
         Ok(())
     }
 
+    fn accumulate_ordered(
+        &mut self,
+        scores: &Array,
+        values: &Array,
+        block_start: i64,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.pass == 0 {
+            let block = scores.max_axis(-1, true, stream)?;
+            let previous = match &self.running_max {
+                Some(maximum) => Some(maximum.clone()),
+                None => self.sink_scores(self.output_dtype, stream)?,
+            };
+            self.running_max = Some(match previous {
+                Some(previous) => maximum(previous, block, stream)?,
+                None => block,
+            });
+            return safemlx::transforms::eval(self.running_max.iter());
+        }
+        let position = |value| {
+            i32::try_from(value).map_err(|_| Exception::custom("attention context exceeds i32"))
+        };
+        let maximum = self.running_max.as_ref().expect("attention has maxima");
+        let ordered = self.ordered.as_mut().expect("ordered BF16 attention");
+        let start = position(block_start)?;
+        if self.pass == 1 {
+            ordered.accumulate_mass(scores, maximum, start, stream)?;
+        } else {
+            ordered.accumulate_values(
+                scores,
+                maximum,
+                values,
+                start,
+                position(self.context_end)?,
+                stream,
+            )?;
+        }
+        // Bound the number of page-local graphs and their retained cache views.
+        safemlx::transforms::eval(ordered.roots())
+    }
+
     pub fn finish(self, stream: &Stream) -> Result<Array, Exception> {
+        if let Some(ordered) = self.ordered {
+            return ordered.finish(stream);
+        }
         let accumulator = self
             .accumulator
             .ok_or_else(|| Exception::custom("blockwise attention received no cache blocks"))?;
-        if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
-            if !self.value_pass {
+        if requires_value_pass(self.arithmetic) {
+            if self.pass != 1 {
                 return Err(Exception::custom(
                     "rounded-probability attention is missing its value pass",
                 ));
@@ -454,24 +598,4 @@ impl BlockwiseAttentionAccumulator {
         let output = accumulator.divide(safe_sum, stream)?;
         output.as_dtype(self.output_dtype, stream)
     }
-}
-
-pub(super) fn absolute_attention_mask(
-    query_start: i64,
-    query_len: i32,
-    key_start: i64,
-    key_end: i64,
-    sliding_window: Option<i32>,
-    prefix_tokens: i64,
-) -> Vec<bool> {
-    let mut mask = Vec::with_capacity(query_len as usize * (key_end - key_start) as usize);
-    for query in query_start..query_start + query_len as i64 {
-        for key in key_start..key_end {
-            let causal = key <= query;
-            let visible = sliding_window
-                .is_none_or(|window| key < prefix_tokens || key >= query - (window - 1) as i64);
-            mask.push(causal && visible);
-        }
-    }
-    mask
 }

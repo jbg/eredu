@@ -190,6 +190,9 @@ impl<N: TextPredictionPrimitives> TextInvocationMechanisms for PortableTextTypes
     fn decode_prompt_tokens(value: &N::Decode) -> N::InputTensor {
         N::decode_prompt_tokens(value)
     }
+    fn decoder_token_ids(value: &N::Tensor) -> Result<Vec<u32>, N::Error> {
+        N::decoder_token_ids(value)
+    }
 }
 
 impl<N: TextPredictionPrimitives> TextErasureTypes for PortableTextTypes<N> {
@@ -209,9 +212,6 @@ impl<N: TextPredictionPrimitives> TextErasureTypes for PortableTextTypes<N> {
     ) -> Result<(u64, Option<u64>, Option<u64>), BackendFailure> {
         state.memory_bounds(additional)
     }
-    fn decoder_token_ids(value: &N::Tensor) -> Result<Vec<u32>, N::Error> {
-        N::decoder_token_ids(value)
-    }
 }
 
 impl<N: TextPredictionPrimitives> EmbeddedTextBinding for PortableTextTypes<N> {
@@ -222,7 +222,8 @@ impl<N: TextPredictionPrimitives> EmbeddedTextBinding for PortableTextTypes<N> {
         range: std::ops::Range<usize>,
         queue: &N::Context,
     ) -> Result<N::Tensor, PredictionError<N>> {
-        N::slice_tokens(tokens, range, queue)
+        eredu_nn::sequence::span(tokens, range, queue)
+            .map_err(|error| N::input_failure(BackendFailure::from_error(error)))
     }
     fn settle_input(value: &N::Tensor) -> Result<(), PredictionError<N>> {
         N::settle_input(value)

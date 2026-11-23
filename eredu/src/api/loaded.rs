@@ -127,17 +127,11 @@ where
     }
 }
 
-fn map_committed_generation_error<E>(
-    error: CommittedGenerationError<
-        eredu_core::ControlledTextGenerationError<E, crate::api::ConstraintError>,
-        TextDecoderError,
-    >,
-) -> PreparedChatError
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
+fn map_committed_generation_error(
+    error: CommittedGenerationError<PreparedChatError, TextDecoderError>,
+) -> PreparedChatError {
     match error {
-        CommittedGenerationError::Source(error) => map_controlled_generation_error(error),
+        CommittedGenerationError::Source(error) => error,
         CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Decoder(error)) => {
             PreparedChatError::Tokenizer(error)
         }
@@ -234,17 +228,13 @@ impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B
     ) -> Result<GenerationOutput, PreparedChatError>
     where
         F: FnMut(SemanticEvent),
-        S: eredu_core::AutomaticPromptCacheSession<B>,
     {
-        if self.prompt_cache_store.is_some() {
-            return self.generate_with_store(request, started);
-        }
         let mode = request.output_mode;
         self.generate_prepared(request, None, started, mode, None)
     }
 
     pub(super) fn generate_prepared<'a, F>(
-        &'a mut self,
+        &mut self,
         request: GenerationRequest<'_, S::Prompt, F>,
         delivery: Option<GenerationStepDelivery<'a>>,
         generation_started: std::time::Instant,
@@ -313,101 +303,133 @@ impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B
                 super::GenerationStats::default(),
             ));
         };
+        let cache_eligible = control_handle.is_none();
+        #[cfg(feature = "tensor-capture")]
+        let cache_eligible = cache_eligible
+            && delivery
+                .as_ref()
+                .is_none_or(|delivery| delivery.plan.is_empty() && delivery.intervention.is_none());
+        let prompt_cache = match (&self.prompt_cache_store, &input) {
+            (Some(cache), PreparedChatInput::TokenIds { token_ids, .. }) if cache_eligible => {
+                cache.prepare(&mut self.runtime, &config, token_ids, &cancellation)?
+            }
+            _ => None,
+        };
+        let reused = prompt_cache
+            .as_ref()
+            .map_or(0, |cache| cache.stats.reused_tokens);
         let decoder = PreparedChatTokenDecoder {
             decoder: self.text_decoder(true),
         };
         let raw_decoder =
             RawTokenDecoder::with_structural_tokens(decoder, control.structural_tokens);
         let mut pipeline = CommittedTokenPipeline::new(raw_decoder, control.parser);
-        let prompt = match input {
-            PreparedChatInput::TokenIds { token_ids, .. } => {
-                S::prepare_text_prompt(self.runtime.backend(), token_ids).map_err(|error| {
-                    PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
-                })
-            }
-            PreparedChatInput::PreparedInput { prompt, .. } => Ok(prompt),
-            PreparedChatInput::RenderedPrompt(_) => {
-                unreachable!("host preparation tokenized the prompt")
-            }
-            PreparedChatInput::SessionBound { .. } => {
-                unreachable!("host preparation validated the session")
-            }
-        };
-        let prompt = self.runtime.finish_text_preparation(
-            Stage::Prompt,
-            prompt,
-            PreparedChatError::Backend,
-        )?;
-        let mut generator = eredu_core::ControlledTextGeneration::from_prompt(
-            &mut self.runtime,
-            prompt,
-            config,
-            control.controller,
-        )
-        .map_err(map_controlled_generation_error)?;
-        generator.set_cancellation_token(cancellation.clone());
-        if let Some(handle) = control_handle {
-            generator
-                .bind_control_handle(handle)
-                .map_err(eredu_core::TextOperationPolicyError::DecodingMode)?;
-        }
-        #[cfg(feature = "tensor-capture")]
-        let instrumented = delivery.is_some();
-        let (on_token, delivery_failure) = if let Some(delivery) = delivery {
-            #[cfg(feature = "tensor-capture")]
-            match delivery.intervention {
-                Some(intervention) => {
-                    generator.enable_interventions(delivery.plan, intervention)?
+        let used_cache = prompt_cache.is_some();
+        let result = (|| {
+            let prompt = match input {
+                PreparedChatInput::TokenIds { mut token_ids, .. } => {
+                    token_ids.drain(..reused);
+                    S::prepare_text_prompt(self.runtime.backend(), token_ids).map_err(|error| {
+                        PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+                    })
                 }
-                None => generator.enable_capture(delivery.plan)?,
-            }
-            (Some(delivery.on_step), Some(delivery.failure))
-        } else {
-            (None, None)
-        };
-        #[cfg(not(feature = "tensor-capture"))]
-        let instrumented = false;
-        if !instrumented {
-            generator.finish_text_preparation(
-                Stage::Instrumentation,
-                Ok(()),
+                PreparedChatInput::PreparedInput { prompt, .. } => Ok(prompt),
+                PreparedChatInput::RenderedPrompt(_) => {
+                    unreachable!("host preparation tokenized the prompt")
+                }
+                PreparedChatInput::SessionBound { .. } => {
+                    unreachable!("host preparation validated the session")
+                }
+            };
+            let prompt = self.runtime.finish_text_preparation(
+                Stage::Prompt,
+                prompt,
                 PreparedChatError::Backend,
             )?;
-        }
-        let ready = generator.finish_text_preparation_cancellable(
-            Stage::Delivery,
-            Ok(if cancellation.is_cancelled() {
-                None
+            let mut generator = eredu_core::ControlledTextGeneration::from_prompt(
+                &mut self.runtime,
+                prompt,
+                config,
+                control.controller,
+            )
+            .map_err(map_controlled_generation_error)?;
+            generator.set_cancellation_token(cancellation.clone());
+            if let Some(handle) = control_handle {
+                generator
+                    .bind_control_handle(handle)
+                    .map_err(eredu_core::TextOperationPolicyError::DecodingMode)?;
+            }
+            #[cfg(feature = "tensor-capture")]
+            let instrumented = delivery.is_some();
+            let (on_token, delivery_failure) = if let Some(delivery) = delivery {
+                #[cfg(feature = "tensor-capture")]
+                match delivery.intervention {
+                    Some(intervention) => {
+                        generator.enable_interventions(delivery.plan, intervention)?
+                    }
+                    None => generator.enable_capture(delivery.plan)?,
+                }
+                (Some(delivery.on_step), Some(delivery.failure))
             } else {
-                Some(())
-            }),
-            PreparedChatError::Backend,
-        )?;
-        if ready.is_none() {
-            cancellation.cancel();
+                (None, None)
+            };
+            #[cfg(not(feature = "tensor-capture"))]
+            let instrumented = false;
+            if !instrumented {
+                generator.finish_text_preparation(
+                    Stage::Instrumentation,
+                    Ok(()),
+                    PreparedChatError::Backend,
+                )?;
+            }
+            let ready = generator.finish_text_preparation_cancellable(
+                Stage::Delivery,
+                Ok(if cancellation.is_cancelled() {
+                    None
+                } else {
+                    Some(())
+                }),
+                PreparedChatError::Backend,
+            )?;
+            if ready.is_none() {
+                cancellation.cancel();
+            }
+            let mut source = BackendGenerationTokenSource {
+                generator,
+                on_token,
+                delivery_failure,
+                generation_started,
+                time_to_first_token: None,
+                prompt_cache,
+                cancellation: cancellation.clone(),
+            };
+            let (token_ids, finish_reason) = drive_committed_generation_cancellable(
+                &mut source,
+                &mut pipeline,
+                prepared_chat.eos_token_ids(),
+                max_tokens,
+                &cancellation,
+                &mut on_event,
+            )
+            .map_err(map_committed_generation_error)?;
+            let stats = super::GenerationStats {
+                prompt_cache: source.prompt_cache.take().map(|cache| cache.stats),
+                ..Default::default()
+            };
+            Ok(GenerationOutput::new(
+                token_ids,
+                finish_reason,
+                eredu_core::GenerationTiming::new(source.time_to_first_token),
+                stats,
+            ))
+        })();
+        if used_cache {
+            let reset = self.runtime.reset().map_err(PreparedChatError::Backend);
+            if result.is_ok() {
+                reset?;
+            }
         }
-        let mut source = BackendGenerationTokenSource {
-            generator,
-            on_token,
-            delivery_failure,
-            generation_started,
-            time_to_first_token: None,
-        };
-        let (token_ids, finish_reason) = drive_committed_generation_cancellable(
-            &mut source,
-            &mut pipeline,
-            prepared_chat.eos_token_ids(),
-            max_tokens,
-            &cancellation,
-            &mut on_event,
-        )
-        .map_err(map_committed_generation_error)?;
-        Ok(GenerationOutput::new(
-            token_ids,
-            finish_reason,
-            eredu_core::GenerationTiming::new(source.time_to_first_token),
-            super::GenerationStats::default(),
-        ))
+        result
     }
 
     /// Reports fail-closed speculative support for this backend model session.
@@ -1073,47 +1095,6 @@ where
         super::PreparedTextModel::from_artifact(inspection, text_options)?
             .load_on::<B, A>(backend, options)
     }
-}
-
-pub(super) fn bind_gguf_special_token_ids(
-    inspection: &mut eredu_core::ArtifactInspection<
-        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-    >,
-    tokenizer: &ChatTokenizer,
-) -> Result<(), TextMetadataError> {
-    use eredu_architectures::processor_plan::{
-        GgufSpecialTokenIds, GgufSpecialTokenKind, QwenMediaTokenIds,
-    };
-
-    let Some(kind) = inspection
-        .architecture_plan()
-        .required_gguf_special_tokens()
-    else {
-        return Ok(());
-    };
-    let required = |token: &str| {
-        tokenizer.token_to_id(token).ok_or_else(|| {
-            TextMetadataError::TokenizerConfiguration(format!(
-                "GGUF tokenizer is missing required media token {token:?}"
-            ))
-        })
-    };
-    let ids = match kind {
-        GgufSpecialTokenKind::Qwen => GgufSpecialTokenIds::Qwen(QwenMediaTokenIds {
-            image_token_id: required("<|image_pad|>")?,
-            video_token_id: required("<|video_pad|>")?,
-            vision_start_token_id: required("<|vision_start|>")?,
-            vision_end_token_id: required("<|vision_end|>")?,
-        }),
-        GgufSpecialTokenKind::Inkling => GgufSpecialTokenIds::Inkling {
-            image_bos_token_id: required("<|content_image|>")?,
-            audio_bos_token_id: required("<|content_audio_input|>")?,
-        },
-    };
-    inspection
-        .architecture_plan_mut()
-        .bind_gguf_special_token_ids(ids)
-        .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
 }
 
 pub(super) fn source_request_scheduler<P, D, F>(

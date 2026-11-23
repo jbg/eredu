@@ -379,33 +379,6 @@ where
         self,
         mut branch: PreparedConstructionBranch<SelectedCompositeTextRealization, C>,
     ) -> Result<E, PreparedExecutionError<F>> {
-        if let Some(prepared) = branch.retained_composite_rank.take() {
-            if branch.prediction.is_some() || branch.retained_prediction.is_some() {
-                return Err(PreparedExecutionError::UnavailablePrediction);
-            }
-            let communication = branch
-                .communication
-                .take()
-                .ok_or(PreparedExecutionError::MissingCommunication)?;
-            let session = construct_vl_rank::<B, S, _, _>(
-                prepared,
-                self.context,
-                &communication,
-                &self.visitor.components(),
-            )
-            .map_err(PreparedExecutionError::Binding)?;
-            return eredu_runtime::executable_binding::retained_executable::install::<
-                V::RetainedTypes,
-                _,
-            >(
-                session.session,
-                Some(communication),
-                self.visitor.retained_context(),
-            )
-            .map(E::from)
-            .map_err(eredu_core::BackendFailure::from_error)
-            .map_err(PreparedExecutionError::Binding);
-        }
         if let Some(retained) = branch.retained_construction.take() {
             if branch.prediction.is_some() {
                 return Err(PreparedExecutionError::UnavailablePrediction);
@@ -514,5 +487,51 @@ where
             self.visitor,
         )
         .map_err(replicated_error)
+    }
+}
+
+use crate::lfm3::vision::PreparedVlRankGraph;
+use eredu_runtime::executable_binding::route_assembly::RetainedCompositeRank;
+
+impl<B: NeuralBackend, S, V> sealed::Sealed for RetainedCompositeRank<'_, B, S, V> {}
+
+impl<B, S, V, C, E, F> PreparedExecutionRoute<PreparedVlRankGraph, C, E, F>
+    for RetainedCompositeRank<'_, B, S, V>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + 'static,
+    B::Tensor: 'static,
+    S: DecoderPipelineState<B> + 'static,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    C: 'static,
+    V: RetainedCompositeVisitor<B, S, C, F, Components: ComponentRankMechanisms<B, S, C>>,
+    <B::Tensor as eredu_nn::Tensor>::Context: Sized + 'static,
+    E: From<eredu_runtime::executable_binding::InstalledTextExecutable<V::RetainedTypes>>,
+{
+    fn construct(
+        self,
+        mut branch: PreparedConstructionBranch<PreparedVlRankGraph, C>,
+    ) -> Result<E, PreparedExecutionError<F>> {
+        if branch.prediction.is_some() || branch.retained_prediction.is_some() {
+            return Err(PreparedExecutionError::UnavailablePrediction);
+        }
+        let communication = branch
+            .communication
+            .take()
+            .ok_or(PreparedExecutionError::MissingCommunication)?;
+        let session = construct_vl_rank::<B, S, _, _>(
+            branch.selected,
+            self.context,
+            &communication,
+            &self.visitor.components(),
+        )
+        .map_err(PreparedExecutionError::Binding)?;
+        eredu_runtime::executable_binding::retained_executable::install::<V::RetainedTypes, _>(
+            session.session,
+            Some(communication),
+            self.visitor.retained_context(),
+        )
+        .map(E::from)
+        .map_err(eredu_core::BackendFailure::from_error)
+        .map_err(PreparedExecutionError::Binding)
     }
 }

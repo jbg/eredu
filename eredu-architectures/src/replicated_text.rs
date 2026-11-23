@@ -870,7 +870,7 @@ pub fn visit_replicated_text_extension_architecture<B, S, A, V>(
     prompt_cache_architecture_identity: impl Into<String>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -888,7 +888,6 @@ where
         eredu_runtime::SourceHandoffScope::Primary,
     )
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
-    visitor.construction_started();
     let prepared = prepare_architecture_handoff::<B, S, A>(
         architecture,
         source_architecture,
@@ -956,13 +955,13 @@ pub fn visit_replicated_text_architecture<B, S, V>(
     selected: SelectedReplicatedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
 {
     let requirements = selected.requirements().clone();
     let eligible = ordinary_eligible_config(plan)?;
@@ -974,7 +973,6 @@ where
         eredu_runtime::SourceHandoffScope::Primary,
     )
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
-    visitor.construction_started();
     match eligible {
         EligibleConfig::Gemma2(args, declaration) => {
             let capability_estimate = crate::capability::gemma2(args, &declaration)
@@ -1175,7 +1173,7 @@ where
     P: crate::decoder::BlockFactory<B, C>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
 {
     let (architecture, source) = materialize_decoder::<B, C, P>(
         source_args,
@@ -1197,10 +1195,9 @@ where
         context,
     )
     .map_err(ReplicatedTextDispatchError::Architecture)?;
-    eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
-        visitor, prepared, store,
-    )
-    .map_err(ReplicatedTextDispatchError::Backend)
+    visitor
+        .build(prepared, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
 }
 
 /// Materializes the selected resource pair from retained declarations through one typed boundary.
@@ -1290,8 +1287,10 @@ pub(crate) fn retain_executable_component(
             let exact = config.with_audio_output_projection_bias(
                 crate::gemma4::checkpoint::audio_output_projection_bias(inspection),
             );
-            let target =
-                crate::gemma4::with_checkpoint_formats(&exact, selected.quantized_formats())?;
+            let target = crate::gemma4::checkpoint::with_matrix_formats(
+                &exact,
+                selected.matrix_formats_for(selected.requirements()),
+            )?;
             crate::gemma4::model::project_parameters(&target, &retained)
                 .map_err(|error| error.to_string())?
         }
@@ -1878,12 +1877,12 @@ fn visit_fixed_profile<B, S, V, P>(
     selected: SelectedReplicatedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
     P: FixedProfile<B, S, Lfm3Replicated>
         + FixedProfile<B, S, Lfm2Replicated>
         + FixedProfile<B, S, KimiLinearReplicated>
@@ -1908,7 +1907,6 @@ where
     match eligible {
         EligibleConfig::Lfm2(declaration) => {
             let args = declaration.args();
-            visitor.construction_started();
             let capability_estimate = crate::capability::lfm2(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
@@ -1947,14 +1945,12 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
-                visitor, prepared, store,
-            )
-            .map_err(ReplicatedTextDispatchError::Backend)
+            visitor
+                .build(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Lfm3(declaration) => {
             let args = declaration.args();
-            visitor.construction_started();
             let capability_estimate = crate::capability::lfm3(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
@@ -1993,14 +1989,12 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
-                visitor, prepared, store,
-            )
-            .map_err(ReplicatedTextDispatchError::Backend)
+            visitor
+                .build(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::NemotronH(declaration) => {
             let args = declaration.args();
-            visitor.construction_started();
             let capability_estimate = crate::capability::nemotron_h(&declaration)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
@@ -2040,13 +2034,11 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
-                visitor, prepared, store,
-            )
-            .map_err(ReplicatedTextDispatchError::Backend)
+            visitor
+                .build(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::QwenHybrid(args) => {
-            visitor.construction_started();
             let capability_estimate = crate::capability::qwen_hybrid_text(args)
                 .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
             let effective_model_type = args.model_type.clone();
@@ -2082,14 +2074,12 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
-                visitor, prepared, store,
-            )
-            .map_err(ReplicatedTextDispatchError::Backend)
+            visitor
+                .build(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::KimiLinear(declaration) => {
             let args = declaration.args();
-            visitor.construction_started();
             let capability_estimate = crate::capability::kimi_linear(
                 plan.kimi_declaration(args)
                     .map_err(ReplicatedTextDispatchError::Architecture)?
@@ -2133,10 +2123,9 @@ where
                 context,
             )
             .map_err(ReplicatedTextDispatchError::Architecture)?;
-            eredu_runtime::executable_binding::construct_replicated_text::<B, S, _, _>(
-                visitor, prepared, store,
-            )
-            .map_err(ReplicatedTextDispatchError::Backend)
+            visitor
+                .build(prepared, store)
+                .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Gemma2(_, _)
         | EligibleConfig::Llama(_, _)
@@ -2170,7 +2159,7 @@ where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
 {
     visit_fixed_profile::<B, S, V, MixedState>(plan, selected, store, context, visitor)
 }
@@ -2187,7 +2176,7 @@ where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
 {
     visit_fixed_profile::<B, S, V, AttentionState>(plan, selected, store, context, visitor)
 }
@@ -2204,7 +2193,7 @@ where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_runtime::RuntimeStateComponents<B>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
 {
     visit_fixed_profile::<B, S, V, FixedState>(plan, selected, store, context, visitor)
 }
@@ -2220,7 +2209,7 @@ pub fn visit_replicated_stateless_text_architecture<B, S, V>(
 where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
     S: LayerRuntimeState<B>,
-    V: ReplicatedTextArchitectureVisitor<B, S>,
+    V: eredu_runtime::executable_binding::PreparedReplicatedTextVisitor<B, S>,
 {
     visit_fixed_profile::<B, S, V, Stateless>(plan, selected, store, context, visitor)
 }
@@ -2284,7 +2273,7 @@ fn visit_compressed_profile<B, S, V, P>(
     selected: SelectedReplicatedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -2311,7 +2300,6 @@ where
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
     macro_rules! visit_family {
         ($family:ty, $args:expr, $capability:expr, $select:path, $identity:path, $prepare:expr) => {{
-            visitor.construction_started();
             let args = $args;
             let prepare = $prepare;
             let capability_estimate = ($capability)(args)
@@ -2465,7 +2453,7 @@ fn visit_replicated_block_refinement_architecture<B, S, V>(
     selected: SelectedReplicatedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -2499,7 +2487,6 @@ where
             eredu_runtime::SourceHandoffScope::Primary,
         )
         .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
-        visitor.construction_started();
         let retained = requirements.shared_component_definition().ok_or_else(|| {
             ReplicatedTextDispatchError::Architecture(
                 "shared-backbone selection has no retained definition".into(),
@@ -2565,7 +2552,6 @@ where
         eredu_runtime::SourceHandoffScope::Primary,
     )
     .map_err(|handoff| ReplicatedTextDispatchError::Architecture(handoff.to_string()))?;
-    visitor.construction_started();
     let retained = requirements.shared_component_definition().ok_or_else(|| {
         ReplicatedTextDispatchError::Architecture(
             "shared iterative selection has no retained definition".into(),
@@ -3226,6 +3212,14 @@ impl EligibleConfig<'_> {
                 }
             }
             Self::Gemma4(args) => {
+                extend(crate::gemma4::checkpoint::projector_shape_recipes(
+                    args, source,
+                )?)?;
+                if let Some(audio) = &args.audio {
+                    extend(crate::gemma4::checkpoint::audio_convolution_recipes(
+                        audio, source,
+                    ))?;
+                }
                 for ordinal in 0..self.unit_count()? {
                     extend(crate::gemma4::unit_recipes(source, args, ordinal)?)?;
                 }
@@ -3434,8 +3428,8 @@ impl EligibleConfig<'_> {
                 .union(NeuralOperatorCapabilities::CAST_FLOAT),
             Self::K2Horizon(args, _) => crate::decoder::operator_requirements(*args),
             Self::Gemma2(args, _) => crate::decoder::operator_requirements(*args),
-            Self::Llama(_, _)
-            | Self::Nanbeige(_, _)
+            Self::Llama(args, _) => crate::decoder::operator_requirements(*args),
+            Self::Nanbeige(_, _)
             | Self::Qwen(_, _)
             | Self::Lfm2(_)
             | Self::Lfm3(_)
@@ -3465,7 +3459,7 @@ impl EligibleConfig<'_> {
                     *policy == crate::qwen::hybrid::HybridLayerPolicy::LinearAttention
                 }) =>
             {
-                crate::operator_requirements::QWEN_HYBRID
+                crate::operator_requirements::qwen_hybrid(args)
             }
             Self::KimiLinear(_) | Self::NemotronH(_) | Self::QwenHybrid(_) => {
                 NeuralOperatorCapabilities::NONE
@@ -3474,12 +3468,22 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV4(_) => crate::operator_requirements::DEEPSEEK_V4,
             Self::DiffusionGemma(_) => crate::operator_requirements::GEMMA4
                 .union(NeuralOperatorCapabilities::WEIGHTED_EMBEDDING),
-            Self::Gemma4(_) => crate::operator_requirements::GEMMA4,
+            Self::Gemma4(args) => crate::operator_requirements::gemma4_family(args),
             Self::Inkling(_) => crate::operator_requirements::INKLING,
             Self::Muse(args) => crate::operator_requirements::muse(args),
-            Self::QwenVl(_) => crate::operator_requirements::QWEN_VL,
-            Self::QwenCompositeHybrid(_) => crate::operator_requirements::QWEN_HYBRID
-                .union(crate::operator_requirements::QWEN_VISION),
+            Self::QwenVl(args) => crate::operator_requirements::QWEN_VL
+                .union(args.vision_declaration().config().arithmetic_capabilities()),
+            Self::QwenCompositeHybrid(args) => {
+                crate::operator_requirements::qwen_hybrid(&args.text)
+                    .union(crate::operator_requirements::QWEN_VISION)
+                    .union(
+                        args.vision
+                            .as_ref()
+                            .map_or(NeuralOperatorCapabilities::NONE, |vision| {
+                                vision.config().arithmetic_capabilities()
+                            }),
+                    )
+            }
         }
     }
 
@@ -7694,7 +7698,10 @@ pub(crate) fn qwen_hybrid_composite_with_formats(
         "conditional Qwen projector formats have no vision configuration".to_owned()
     })?;
     let mut vision_config = target_vision.config().clone();
-    vision_config.linear_formats = vision;
+    vision_config.linear_formats = vision
+        .into_iter()
+        .filter(|(_, format)| *format != LinearFormat::Dense)
+        .collect();
     *target_vision = Arc::new(
         target_vision
             .with_formats(vision_config)
@@ -7817,13 +7824,31 @@ where
     )
 }
 
+fn gemma4_with_selected_audio_bias(
+    args: &crate::gemma4::FamilyConfig,
+    requirements: &CompositeTextRequirements,
+) -> crate::gemma4::FamilyConfig {
+    let bias = requirements
+        .execution()
+        .parameters()
+        .iter()
+        .find(|parameter| parameter.name() == "model.audio_tower.output_proj.bias")
+        .is_some_and(|parameter| {
+            !matches!(
+                parameter.presence(),
+                ReplicatedTextParameterPresence::OptionalAbsent
+            )
+        });
+    args.with_audio_output_projection_bias(bias)
+}
+
 /// Constructs and visits one selected replicated composite architecture.
 pub fn visit_composite_text_architecture<B, S, V>(
     requirements: CompositeTextRequirements,
     selected: SelectedCompositeTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -7860,7 +7885,6 @@ where
     let source_formats = requirements.execution().native_quantized_formats();
     let target_formats = selected.execution().quantized_formats();
     let has_transform = selected.execution().uses_weight_transform();
-    visitor.construction_started();
     let construction = CompositeTextConstruction::<B, S, V> {
         requirements,
         selected,
@@ -8168,19 +8192,7 @@ where
         self,
         args: &crate::gemma4::FamilyConfig,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
-        let output_projection_bias = self
-            .requirements
-            .execution()
-            .parameters()
-            .iter()
-            .find(|parameter| parameter.name() == "model.audio_tower.output_proj.bias")
-            .is_some_and(|parameter| {
-                !matches!(
-                    parameter.presence(),
-                    ReplicatedTextParameterPresence::OptionalAbsent
-                )
-            });
-        let exact_args = args.with_audio_output_projection_bias(output_projection_bias);
+        let exact_args = gemma4_with_selected_audio_bias(args, &self.requirements);
         let capability = crate::capability::gemma4(&exact_args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
         let retained = self
@@ -8195,7 +8207,10 @@ where
         let source = self
             .has_transform
             .then(|| {
-                crate::gemma4::with_checkpoint_formats(&exact_args, self.source_formats.clone())
+                crate::gemma4::checkpoint::with_matrix_formats(
+                    &exact_args,
+                    self.source_linear_formats.clone(),
+                )
             })
             .transpose()
             .map_err(ReplicatedTextDispatchError::Architecture)?
@@ -8206,9 +8221,11 @@ where
             })
             .transpose()
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target =
-            crate::gemma4::with_checkpoint_formats(&exact_args, self.target_formats.clone())
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+        let target = crate::gemma4::checkpoint::with_matrix_formats(
+            &exact_args,
+            self.target_linear_formats.clone(),
+        )
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
         let definition = executable_component(self.selected.execution())
@@ -8380,7 +8397,7 @@ pub fn visit_composite_prediction_target_text_architecture<B, S, M, V>(
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -8421,7 +8438,6 @@ where
     let source_formats = requirements.execution().native_quantized_formats();
     let target_formats = selected.execution().quantized_formats();
     let has_transform = selected.execution().uses_weight_transform();
-    visitor.construction_started();
     macro_rules! visit_constructed_prediction_target {
         ($architecture:expr, $source:expr, $capability:expr, $model_type:expr, $cache_identity:expr) => {{
             match selected {

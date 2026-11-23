@@ -17,6 +17,7 @@ pub use eredu_checkpoint::safetensors::{
 };
 pub use eredu_core::artifact::{
     ArtifactCompanionRole, ArtifactError, ArtifactSource, CompanionSelection,
+    QuantizedTensorRepresentation,
 };
 
 /// Admitted local artifact and architecture facts, without native resources.
@@ -58,7 +59,7 @@ impl PreparedTextModel {
             return Err(ArtifactError::MetadataOnly.into());
         }
         let (tokenizer, config) = super::loaded::loaded_text_artifact(&artifact, options)?;
-        super::loaded::bind_gguf_special_token_ids(&mut artifact, &tokenizer)?;
+        crate::runtime::model_loading::bind_gguf_special_token_ids(&mut artifact, &tokenizer)?;
         Ok(Self {
             artifact,
             tokenizer,

@@ -12,6 +12,8 @@ pub mod bounded_quantization;
 
 /// Native materialization for retained prediction.
 pub mod prediction;
+/// Shared metadata preflight and bounded execution of checkpoint recipes.
+pub mod recipe_execution;
 /// Native storage and submission for prepared parameter units.
 pub mod unit_binding;
 
@@ -209,9 +211,10 @@ pub trait ModelBindingResources {
         None
     }
 
-    /// Opens a native binding target using the supplied communication, if any.
+    /// Opens a target for the exact selected placement and any realized communication.
     fn open_binding_target(
         &self,
+        placement: &Self::Placement,
         communication: Option<&Self::Communication>,
     ) -> Result<Self::Target, Self::BindingError>;
 
@@ -346,14 +349,8 @@ pub trait NativeTextWeights: crate::backend::NativeTextValues {
 
     /// Reads physical memory facts without submitting work.
     fn text_parameter_memory(
+        queue: &Self::Context,
     ) -> Result<Option<crate::capability::ParameterMemoryFacts>, Self::Error>;
-
-    #[doc(hidden)]
-    fn observe_text_construction() {}
-    #[doc(hidden)]
-    fn observe_text_binding(_ranked: bool) {}
-    #[doc(hidden)]
-    fn observe_text_state_allocation() {}
 }
 
 /// Native read, conversion, and completion operations for admitted parameter bindings.

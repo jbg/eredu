@@ -13,6 +13,7 @@ members = [
     "eredu-nn",
     "eredu-nn-macros",
     "eredu-backend-mlx",
+    "eredu-backend-candle",
     "eredu-runtime",
     "eredu-architectures",
     "eredu-codec",
@@ -53,12 +54,12 @@ eredu-checkpoint = { version = "0.2.0", path = "eredu-checkpoint" }
 eredu-nn = { version = "0.2.1", path = "eredu-nn", default-features = false }
 eredu-nn-macros = { version = "0.1.0", path = "eredu-nn-macros" }
 eredu-backend-mlx = { version = "0.5.0", path = "eredu-backend-mlx", default-features = false }
+eredu-backend-candle = { version = "0.5.0", path = "eredu-backend-candle", default-features = false }
 eredu-runtime = { version = "0.5.0", path = "eredu-runtime" }
 eredu-architectures = { version = "0.5.0", path = "eredu-architectures" }
 eredu-codec = { version = "0.5.0", path = "eredu-codec", default-features = false }
 eredu-media = { version = "0.4.0", path = "eredu-media", default-features = false }
 eredu-evaluation = { version = "0.5.0", path = "eredu-evaluation" }
-eredu-recommendation = { version = "0.1.0", path = "eredu-recommendation", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

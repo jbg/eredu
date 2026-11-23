@@ -14,6 +14,25 @@ pub struct BlockRefinementGeometry {
 }
 
 impl BlockRefinementGeometry {
+    pub(crate) fn validate_readout(
+        self,
+        selections: &[eredu_core::refinement::RefinementScoreSelection],
+    ) -> Result<(), eredu_core::refinement::RefinementReadoutError> {
+        if selections.is_empty()
+            || selections.iter().any(|selection| {
+                selection.position >= self.canvas_length.get()
+                    || selection.token_ids.is_empty()
+                    || selection
+                        .token_ids
+                        .iter()
+                        .any(|id| *id >= self.vocabulary_size.get())
+            })
+        {
+            return Err(eredu_core::refinement::RefinementReadoutError::Geometry);
+        }
+        Ok(())
+    }
+
     pub(crate) fn canvas_shape(self) -> [i32; 2] {
         [1, self.canvas_length.get() as i32]
     }

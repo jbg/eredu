@@ -405,7 +405,7 @@ fn apple_metal_loaded_request_forecast_uses_one_physical_pool() {
     .unwrap();
     let runtime = ModelRuntime::<_, _>::install::<LoadedSession>(backend, model).unwrap();
     let mut profile = <_ as GenerationForecastSession<_>>::loaded_memory_profile(&runtime).unwrap();
-    assert!(!profile.host_execution);
+    assert!(!profile.placement.host_execution);
     assert_eq!(
         profile.parameters.physical_semantics,
         PhysicalMemorySemantics::Unified

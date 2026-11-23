@@ -820,6 +820,54 @@ pub enum DerivedWeightRecipe {
 }
 
 impl DerivedWeightRecipe {
+    /// Lowers a terminal logical F4 source or view to little-endian U32 words.
+    /// Infers the same source selection before and after lowering.
+    pub fn lower_mxfp4_words(
+        self,
+        catalog: &(impl RecipeCatalog + ?Sized),
+    ) -> Result<Self, RecipeError> {
+        let metadata = self.infer(catalog)?;
+        if metadata.dtype != RecipeDtype::F4 {
+            return Err(RecipeError::InvalidMxFp4WordView);
+        }
+        let (input, mut shape) = match self {
+            Self::View { input, shape, .. } => (input, shape),
+            Self::Source { .. } => (Box::new(self), metadata.shape),
+            _ => return Err(RecipeError::InvalidMxFp4WordView),
+        };
+        let width = shape
+            .last_mut()
+            .filter(|width| **width > 0 && width.is_multiple_of(8))
+            .ok_or(RecipeError::InvalidMxFp4WordView)?;
+        *width /= 8;
+        let recipe = Self::View {
+            input,
+            dtype: RecipeDtype::U32,
+            shape,
+        };
+        recipe.infer(catalog)?;
+        Ok(recipe)
+    }
+
+    /// Immediate operands in execution order.
+    pub fn operands(&self) -> impl Iterator<Item = &Self> {
+        let (fixed, variadic): ([Option<&Self>; 2], &[Self]) = match self {
+            Self::Source { .. } => ([None, None], &[]),
+            Self::DecodeTensorFp8 { weight, scale } | Self::ScaleF32 { weight, scale } => {
+                ([Some(weight), Some(scale)], &[])
+            }
+            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => ([None, None], inputs),
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Cast { input, .. }
+            | Self::View { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => ([Some(input), None], &[]),
+        };
+        fixed.into_iter().flatten().chain(variadic)
+    }
+
     /// Compiles byte-preserving, leading-axis joins into one bounded read batch.
     ///
     /// Unsupported transformations or sources return `None` without payload
@@ -2272,6 +2320,8 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 #[derive(Debug, Clone, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum RecipeError {
+    #[error("MXFP4 word lowering requires a terminal F4 source or view with a nonzero width divisible by 8")]
+    InvalidMxFp4WordView,
     #[error("tensor FP8 decoding requires E4M3 values and one F32 scalar scale")]
     InvalidTensorFp8,
     /// A checkpoint multiplier or its input has incompatible geometry or precision.

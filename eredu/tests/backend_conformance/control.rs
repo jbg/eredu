@@ -40,6 +40,7 @@ fn setup() -> (
     };
     (model, chat, settings, first)
 }
+#[cfg(feature = "tensor-capture")]
 fn limits() -> TraceLimits {
     TraceLimits {
         per_record_bytes: 65536,

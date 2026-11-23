@@ -315,7 +315,7 @@ impl<M: LiveCacheAppendBackend> CacheResidencyManager<M> {
                 CacheResidencyError::Runtime("planned cache page is missing".into())
             })?;
             let [first, second] = lease.arrays().arrays().map(Clone::clone);
-            let scope = M::begin_cache_read(lease)?;
+            let scope = M::begin_cache_read(queue, lease)?;
             slice_pair([&first, &second], slice, true)?;
             scope.settle()?;
         }
@@ -913,7 +913,6 @@ impl<M: LiveCacheBackend<Event: 'static>> CacheResidencyManager<M> {
         read: CacheAttentionRead,
         transient: Option<[&M::Tensor; 2]>,
         window: Option<i64>,
-        separate_value_pass: bool,
         queue: &Queue<M>,
         mut accumulator: impl eredu_core::cache::mechanisms::CacheAttentionAccumulator<
             M::Tensor,
@@ -925,9 +924,9 @@ impl<M: LiveCacheBackend<Event: 'static>> CacheResidencyManager<M> {
         let mut scanned_blocks = 0u64;
         let mut scanned_bytes = 0u64;
         let mut scratch = 0u64;
-        for pass in 0..=usize::from(separate_value_pass) {
-            if pass == 1 {
-                accumulator.begin_value_pass()?;
+        for pass in 0..accumulator.scan().passes() {
+            if pass > 0 {
+                accumulator.begin_pass(pass, queue)?;
             }
             let mut pages = self.prefetch_blocks(read.pages.clone(), queue)?;
             while let Some(lease) = pages.next_block()? {
@@ -1032,7 +1031,7 @@ where
         while let Some(lease) = pages.next_block().map_err(Error::backend)? {
             let (start, end, bytes) = (lease.id().start, lease.id().end, lease.bytes());
             let [latent, rotary] = lease.arrays().arrays().map(Clone::clone);
-            let scope = M::begin_cache_read(lease).map_err(Error::backend)?;
+            let scope = M::begin_cache_read(queue, lease).map_err(Error::backend)?;
             accumulate(start, end, [&latent, &rotary], bytes)?;
             scope.settle().map_err(Error::backend)?;
         }

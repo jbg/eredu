@@ -135,3 +135,27 @@ impl From<crate::SessionAdmissionError> for BackendFailure {
         Self::new(BackendFailureKind::InvalidSession, source)
     }
 }
+
+impl From<crate::parameters::ParameterError> for BackendFailure {
+    fn from(error: crate::parameters::ParameterError) -> Self {
+        Self::from_error(error)
+    }
+}
+
+impl From<eredu_nn::Error> for BackendFailure {
+    fn from(error: eredu_nn::Error) -> Self {
+        Self::from_error(error)
+    }
+}
+
+impl From<crate::capture::CaptureError> for BackendFailure {
+    fn from(error: crate::capture::CaptureError) -> Self {
+        Self::from_error(error)
+    }
+}
+
+impl From<crate::BackendError> for BackendFailure {
+    fn from(error: crate::BackendError) -> Self {
+        Self::from_error(error)
+    }
+}

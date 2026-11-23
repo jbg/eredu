@@ -28,6 +28,21 @@ pub trait TextSessionComposition: TextGenerationBackend {
     type Installer: ModelSessionInstaller<Self, Model = Self::Model, Session = Self::Installed>;
 }
 
+impl<B, N> TextSessionComposition for B
+where
+    B: eredu_core::backend::SharedTextNative<Native = N>,
+    N: eredu_runtime::text_session_driver::TextSessionMechanisms<B>,
+    eredu_runtime::text_session_driver::PreparedTextDriver<B, N>: TextExecutionSession<B>
+        + ModelSessionInstaller<
+            B,
+            Session = eredu_runtime::text_session_driver::PreparedTextDriver<B, N>,
+        >,
+{
+    type Model = <Self::Installer as ModelSessionInstaller<B>>::Model;
+    type Installed = eredu_runtime::text_session_driver::PreparedTextDriver<B, N>;
+    type Installer = Self::Installed;
+}
+
 pub(crate) type PreparedTextProduct<B, S> = eredu_core::backend::LoadedModelFor<
     B,
     eredu_architectures::processor_plan::ArtifactArchitecturePlan,
@@ -126,28 +141,17 @@ where
 {
     let external = match plan.drafting() {
         DraftingPlan::External { model, .. } => {
-            let preparation = eredu_architectures::prepare_external_draft(model)
+            let mut preparation = eredu_architectures::prepare_external_draft(model)
                 .map_err(LoadedModelLoadError::Artifact)?;
-            let target_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(tokenizer);
-            let draft_fingerprint = match preparation.tokenizer_source() {
-                eredu_architectures::external_draft::ExternalDraftTokenizerSource::Target => {
-                    target_fingerprint
-                }
-                eredu_architectures::external_draft::ExternalDraftTokenizerSource::Artifact {
-                    model_type,
-                } => {
-                    let draft_tokenizer = crate::api::tokenizer::load_tokenizer_for_model_type(
-                        model_type,
-                        Path::new(model),
-                    )
+            let compatibility = prove_draft_tokenizer(tokenizer, &preparation)?;
+            if let eredu_architectures::ExternalDraftPreparation::Autoregressive(artifact) =
+                &mut preparation
+            {
+                // The exact vocabulary proof permits the same media token IDs
+                // to be resolved for this independent artifact.
+                bind_gguf_special_token_ids(artifact, tokenizer)
                     .map_err(LoadedModelLoadError::Metadata)?;
-                    eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer)
-                }
-            };
-            let compatibility =
-                TokenizerCompatibilityProof::prove(target_fingerprint, draft_fingerprint).map_err(
-                    |error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()),
-                )?;
+            }
             Some(ExternalDraftArtifact {
                 preparation,
                 tokenizer_compatibility: compatibility,
@@ -159,6 +163,109 @@ where
     let target = eredu_core::select_execution_plan_target(factory, plan, artifact, parallel)?;
     let drafting = eredu_core::select_execution_plan_drafting(factory, plan, &target, external)?;
     Ok((target, drafting))
+}
+
+pub(crate) fn bind_gguf_special_token_ids(
+    inspection: &mut eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    tokenizer: &Tokenizer,
+) -> Result<(), crate::api::tokenizer::TextMetadataError> {
+    use crate::api::tokenizer::TextMetadataError;
+    use eredu_architectures::processor_plan::{
+        GgufSpecialTokenIds, GgufSpecialTokenKind, QwenMediaTokenIds,
+    };
+
+    let Some(kind) = inspection
+        .architecture_plan()
+        .required_gguf_special_tokens()
+    else {
+        return Ok(());
+    };
+    let required = |token: &str| {
+        tokenizer.token_to_id(token).ok_or_else(|| {
+            TextMetadataError::TokenizerConfiguration(format!(
+                "GGUF tokenizer is missing required media token {token:?}"
+            ))
+        })
+    };
+    let ids = match kind {
+        GgufSpecialTokenKind::Qwen => GgufSpecialTokenIds::Qwen(QwenMediaTokenIds {
+            image_token_id: required("<|image_pad|>")?,
+            video_token_id: required("<|video_pad|>")?,
+            vision_start_token_id: required("<|vision_start|>")?,
+            vision_end_token_id: required("<|vision_end|>")?,
+        }),
+        GgufSpecialTokenKind::Inkling => GgufSpecialTokenIds::Inkling {
+            image_bos_token_id: required("<|content_image|>")?,
+            audio_bos_token_id: required("<|content_audio_input|>")?,
+        },
+    };
+    inspection
+        .architecture_plan_mut()
+        .bind_gguf_special_token_ids(ids)
+        .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
+}
+
+fn prove_draft_tokenizer(
+    tokenizer: &Tokenizer,
+    preparation: &eredu_architectures::ExternalDraftPreparation,
+) -> Result<TokenizerCompatibilityProof, PlannedModelLoadError> {
+    use crate::api::tokenizer::{
+        gguf_sidecar_dir, load_gguf_tokenizer_from_metadata, load_optional_gguf_tokenizer,
+        load_optional_tokenizer_json, load_tokenizer_for_model_type,
+    };
+    use eredu_architectures::{
+        external_assistant::ExternalAssistantCheckpoint,
+        external_draft::ExternalDraftTokenizerSource, ExternalDraftPreparation,
+    };
+    use eredu_text::tokenizer::vocabulary_fingerprint;
+
+    let (path, gguf) = match preparation {
+        ExternalDraftPreparation::Autoregressive(artifact) => {
+            (artifact.path(), artifact.gguf_checkpoint())
+        }
+        ExternalDraftPreparation::Assistant(assistant) => match assistant.checkpoint() {
+            ExternalAssistantCheckpoint::SafeTensors { source, .. } => (source.as_path(), None),
+            ExternalAssistantCheckpoint::Gguf { checkpoint, .. } => (
+                checkpoint
+                    .shards()
+                    .first()
+                    .expect("admitted GGUF has a shard")
+                    .path(),
+                Some(checkpoint),
+            ),
+        },
+    };
+    let draft_tokenizer = match (preparation.tokenizer_source(), gguf) {
+        (ExternalDraftTokenizerSource::Target, None) => load_optional_tokenizer_json(path),
+        (policy, Some(checkpoint)) => {
+            let metadata = checkpoint
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            match policy {
+                ExternalDraftTokenizerSource::Target => {
+                    load_optional_gguf_tokenizer(gguf_sidecar_dir(path), &metadata)
+                }
+                ExternalDraftTokenizerSource::Artifact { .. } => {
+                    load_gguf_tokenizer_from_metadata(path, &metadata)
+                        .map(|loaded| Some(loaded.tokenizer))
+                }
+            }
+        }
+        (ExternalDraftTokenizerSource::Artifact { model_type }, None) => {
+            load_tokenizer_for_model_type(model_type, path).map(Some)
+        }
+    }
+    .map_err(LoadedModelLoadError::Metadata)?;
+    let target = vocabulary_fingerprint(tokenizer);
+    let draft = draft_tokenizer
+        .as_ref()
+        .map_or(target, vocabulary_fingerprint);
+    TokenizerCompatibilityProof::prove(target, draft)
+        .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()).into())
 }
 
 pub(crate) fn realize_text<F>(
@@ -199,7 +306,7 @@ where
     Ok(PlannedModel::new(model, drafting, plan.drafting().clone()))
 }
 
-fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
+pub(crate) fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
     error: eredu_core::ModelLoadError<E>,
 ) -> LoadedModelLoadError {
     match error {

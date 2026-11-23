@@ -10,8 +10,8 @@ use eredu_checkpoint::{
     },
     StoredDtype, WeightQuantization,
 };
-use eredu_core::{AttentionPolicy, LayerSchedule};
-use eredu_gguf::MetadataValue;
+use eredu_core::AttentionPolicy;
+use eredu_gguf::{Checkpoint, MetadataValue};
 use eredu_nn::{
     multimodal::{masked_output_projection, MaskedOutputProjectionInput},
     AttentionCache, AttentionStateSource, DeclareLogicalParameters, EmbeddingOperator, Error,
@@ -19,6 +19,8 @@ use eredu_nn::{
     Parameterized, RotaryPosition, Tensor,
 };
 use serde::Deserialize;
+
+use crate::{gguf_catalog::supply_embedding_vocabulary, GgufTensorCatalog};
 
 use super::{BlockInput, DenseBlock, ModelArgs, SharedAttentionStates};
 
@@ -499,18 +501,7 @@ impl AssistantConfig {
             "model_type".into(),
             serde_json::Value::String("gemma4".into()),
         );
-        let mut text_config = ModelArgs::from_hf_json(&serde_json::to_vec(&text_value)?)?;
-        let policies = text_config
-            .layer_schedule
-            .iter()
-            .copied()
-            .map(|mut policy| {
-                policy.key_value = AttentionStateSource::Shared;
-                policy
-            })
-            .collect::<Vec<_>>();
-        text_config.layer_schedule = LayerSchedule::new(policies.len(), policies)
-            .map_err(|error| AssistantConfigError::Invalid(error.to_string()))?;
+        let mut text_config = ModelArgs::from_assistant_hf_json(&serde_json::to_vec(&text_value)?)?;
         text_config.tie_word_embeddings = source.tie_word_embeddings;
         if source.quantization.is_some() {
             text_config.weight_quantization = source.quantization;
@@ -533,8 +524,8 @@ impl AssistantConfig {
     }
 
     /// Parses the released assistant GGUF without depending on a backend reader.
-    pub fn from_gguf_metadata<C: crate::GgufTensorCatalog + ?Sized>(
-        catalog: &C,
+    pub fn from_gguf_metadata(
+        catalog: &Checkpoint,
         metadata: &HashMap<String, MetadataValue>,
     ) -> Result<Self, AssistantConfigError> {
         let mut text_metadata = metadata.clone();
@@ -543,18 +534,8 @@ impl AssistantConfig {
                 text_metadata.insert(format!("gemma4.{suffix}"), value.clone());
             }
         }
-        let mut text_config = ModelArgs::from_gguf_metadata(catalog, &text_metadata)?;
-        let policies = text_config
-            .layer_schedule
-            .iter()
-            .copied()
-            .map(|mut policy| {
-                policy.key_value = AttentionStateSource::Shared;
-                policy
-            })
-            .collect::<Vec<_>>();
-        text_config.layer_schedule = LayerSchedule::new(policies.len(), policies)
-            .map_err(|error| AssistantConfigError::Invalid(error.to_string()))?;
+        supply_embedding_vocabulary(&mut text_metadata, "gemma4.vocab_size".into(), catalog);
+        let text_config = ModelArgs::from_gguf_source(catalog, &text_metadata, true)?;
         let integer = |suffix: &str| {
             let key = format!("gemma4-assistant.{suffix}");
             metadata
@@ -746,7 +727,7 @@ pub fn assistant_safetensors_plan(
             );
         } else {
             let dtype = if parameter.role == eredu_nn::LogicalParameterRole::TokenMapping {
-                StoredDtypeConstraint::Exact(StoredDtype::I32)
+                StoredDtypeConstraint::Exact(StoredDtype::I64)
             } else {
                 StoredDtypeConstraint::Floating
             };
@@ -838,7 +819,7 @@ pub fn assistant_gguf_plan(definition: &AssistantDefinition) -> Result<GgufCheck
     let mut groups = Vec::new();
     let mut catalog = CatalogPolicy::strict();
     catalog.allowed_prefixes.push("rope_freqs.".into());
-    super::checkpoint::add_gguf_blocks(&definition.blocks, &mut common, &mut groups, &mut catalog)?;
+    super::checkpoint::add_gguf_blocks(&definition.blocks, &mut common, &mut groups)?;
     GgufCheckpointPlan::new("Gemma 4 assistant GGUF", common, groups, catalog)
         .map_err(|e| e.to_string())
 }
@@ -970,15 +951,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MaskedHead<B> {
     fn new(
         spec: &parameters::OrderedParameters,
         top_k: i32,
+        gguf: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
             centroids: B::linear(spec.centroids.clone(), context)?,
-            token_ordering: Parameter::unloaded_i32(
-                spec.ordering.parameter.clone(),
-                &spec.ordering.shape,
-                context,
-            )?,
+            token_ordering: if gguf {
+                Parameter::unloaded_i32(
+                    spec.ordering.parameter.clone(),
+                    &spec.ordering.shape,
+                    context,
+                )?
+            } else {
+                Parameter::unloaded_i64(
+                    spec.ordering.parameter.clone(),
+                    &spec.ordering.shape,
+                    context,
+                )?
+            },
             output_weight: Parameter::unloaded(
                 spec.table.weight.clone(),
                 &[spec.table.vocabulary, spec.table.dimensions],
@@ -1031,6 +1021,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
     ) -> Result<Self, Error> {
         let config = definition.config.clone();
         let declared = definition.static_parameters.clone();
+        if matches!(declared.vocabulary, Vocabulary::Ordered(_)) {
+            crate::operator_requirements::require::<B>(
+                "ordered assistant readout",
+                eredu_nn::NeuralOperatorCapabilities::MASKED_OUTPUT_PROJECTION,
+            )?;
+        }
         let layers = (0..definition.blocks.len())
             .map(|layer| definition.build_unit::<B>(layer, context))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1043,6 +1039,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
                 Some(MaskedHead::new(
                     spec,
                     config.centroid_intermediate_top_k,
+                    config.text_config.gguf_source,
                     context,
                 )?),
             ),

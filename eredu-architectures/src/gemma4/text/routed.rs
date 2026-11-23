@@ -76,7 +76,7 @@ impl Declaration {
             args.hidden_size,
             width,
             args.hidden_size,
-            eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+            args.approximate_gelu_policy(),
             GatedProductGroupLayout::Packed {
                 gate_up: crate::linear_format::standard_expert_projection(
                     &gate_up,
@@ -159,6 +159,7 @@ impl Declaration {
             || self.routed.selector.coefficient_scale().is_none()
             || Some(self.routed.experts.intermediate_dimensions()) != args.moe_intermediate_size
             || self.routed.experts.reduction() != args.expert_reduction
+            || self.routed.experts.policy() != args.approximate_gelu_policy()
             || self.norms.iter().any(|norm| {
                 norm.epsilon != args.rms_norm_eps
                     || matches!(norm.scale, eredu_nn::NormalizationScale::Unit)
@@ -423,8 +424,10 @@ impl Declaration {
     fn validate_geometry(&self) -> Result<(), Error> {
         let width = self.routed.selector.input_dimensions();
         if self.routed.experts.output_dimensions() != width
-            || self.routed.experts.policy()
+            || (self.routed.experts.policy()
                 != eredu_nn::GatedProductPolicy::ordinary_gelu_approximate()
+                && self.routed.experts.policy()
+                    != eredu_nn::GatedProductPolicy::gelu_approximate_f16())
             || self.norms.iter().any(|norm| norm.dimensions != width)
         {
             return Err(Error::backend(

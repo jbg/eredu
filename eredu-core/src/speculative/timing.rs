@@ -1,18 +1,16 @@
-//! MLX resource adaptation for neutral speculative scheduling.
+//! Opt-in speculative component timing and telemetry.
 
 use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
-use eredu_core::{SpeculativeStats, SpeculativeTelemetry};
+use crate::{SpeculativeStats, SpeculativeTelemetry};
 
-/// Component timings accumulated by an architecture-specific speculative backend.
+/// Component wall times measured by an eager speculative executor.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpeculativeComponentTimings {
     /// Committed-context encoding and assistant K/V projection.
     pub draft_context: Duration,
     /// Assistant proposal-block execution.
     pub draft_assistant: Duration,
-    /// Raw vocabulary-head projection.
-    pub draft_head: Duration,
     /// Target verification execution.
     pub target_verification: Duration,
 }
@@ -21,9 +19,9 @@ thread_local! {
     static COMPONENT_TIMING_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Scoped opt-in for device-timeline speculative component profiling.
+/// Scoped opt-in for speculative component profiling.
 ///
-/// Schedulers created while this guard is alive collect architecture-level
+/// Schedulers created while this guard is alive can collect eager component
 /// timings. Timestamp boundaries add profiling overhead, so normal generation
 /// leaves them disabled. The guard is intentionally bound to its creating
 /// thread and restores the previous setting when dropped.
@@ -49,7 +47,8 @@ impl Drop for SpeculativeComponentTimingGuard {
     }
 }
 
-pub(crate) fn component_timing_enabled() -> bool {
+/// Reports whether the current execution thread has opted into component profiling.
+pub fn component_timing_enabled() -> bool {
     COMPONENT_TIMING_ENABLED.get()
 }
 
@@ -58,7 +57,6 @@ impl SpeculativeComponentTimings {
         stats.add_component_timings(
             self.draft_context,
             self.draft_assistant,
-            self.draft_head,
             self.target_verification,
         );
     }
@@ -66,6 +64,15 @@ impl SpeculativeComponentTimings {
 
 impl SpeculativeTelemetry for SpeculativeComponentTimings {
     fn record(self, stats: &mut SpeculativeStats) {
-        self.add_to(stats);
+        if [
+            self.draft_context,
+            self.draft_assistant,
+            self.target_verification,
+        ]
+        .into_iter()
+        .any(|time| !time.is_zero())
+        {
+            self.add_to(stats);
+        }
     }
 }

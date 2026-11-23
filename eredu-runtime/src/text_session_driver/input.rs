@@ -96,7 +96,7 @@ impl<T: Clone> From<TextPromptView<'_, T>> for PreparedTextPrompt<T> {
 
 impl<T> PreparedTextPrompt<T> {
     /// Wraps an already admitted token tensor as a new invocation input.
-    pub(super) fn from_committed_tokens(tokens: T) -> Result<Self, BackendFailure> {
+    pub(crate) fn from_committed_tokens(tokens: T) -> Result<Self, BackendFailure> {
         let part = PreparedInputPart::new_with_extents(
             InputModality::Text,
             PreparedInputPayload::TokenIds(tokens),
@@ -122,6 +122,46 @@ impl<T> PreparedTextPrompt<T> {
             fragment: false,
             cursor: None,
         }
+    }
+
+    /// Copies an intact prefill input to the draft device, including all
+    /// metadata and the original semantic identity.
+    pub(crate) fn transfer<M>(
+        &self,
+        mechanism: &M,
+        context: &M::Context,
+    ) -> Result<Self, BackendFailure>
+    where
+        M: eredu_core::input::InputTensorTransfer<Tensor = T>,
+        T: Clone,
+    {
+        use crate::input_transfer::{prepared_input_transfer_resources, transfer_prepared_input};
+        if self.cursor.is_some() || self.fragment {
+            return Err(BackendFailure::new(
+                BackendFailureKind::InvalidInput,
+                std::io::Error::other("draft transfer requires an intact prepared prompt"),
+            ));
+        }
+        let input = eredu_core::PreparedModelInput::new(self.parts.clone(), |value| {
+            mechanism.identity(value)
+        })
+        .map_err(BackendFailure::from_error)?;
+        let resources = prepared_input_transfer_resources(&input, mechanism)
+            .map_err(BackendFailure::from_error)?;
+        let (copy, cache_identity, _) = transfer_prepared_input(
+            &input,
+            self.cache_identity.as_ref(),
+            mechanism,
+            context,
+            resources.into_budget(),
+        )
+        .map_err(BackendFailure::from_error)?;
+        Ok(Self {
+            parts: copy.into_parts(),
+            cache_identity,
+            fragment: false,
+            cursor: None,
+        })
     }
 
     /// Borrows the admitted prepared payload.

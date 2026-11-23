@@ -56,14 +56,17 @@ where
         M::retained_values(state)
     }
 
-    fn open_input_recovery() -> Result<impl Sized, BackendFailure> {
-        M::open_input_recovery()
+    fn open_input_recovery(
+        context: &Context<B>,
+    ) -> Result<impl Sized + 'static + use<B, M, P>, BackendFailure> {
+        M::open_input_recovery(context)
     }
 
     fn hold_fork_retention(
+        context: &Context<B>,
         retention: SnapshotRetainedGrowth,
-    ) -> Result<impl Sized, BackendFailure> {
-        M::hold_fork_retention(retention)
+    ) -> Result<impl Sized + 'static + use<B, M, P>, BackendFailure> {
+        M::hold_fork_retention(context, retention)
     }
 }
 

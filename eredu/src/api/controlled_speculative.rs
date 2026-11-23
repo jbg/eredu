@@ -63,7 +63,7 @@ impl<B: SpeculativeBatchBackend<S>, S: eredu_core::TextExecutionSession<B>> Load
     /// Admits bounded speculative prediction captures against this loaded model.
     /// Each raw-logit observation is one vocabulary row, including target prefill;
     /// sequence slices therefore address a single row rather than the full prompt.
-    /// MLX currently accepts model.logits selections for both target and draft.
+    /// Both roles use the admitted model.logits selection on supported routes.
     pub fn prepare_speculative_capture(
         &self,
         settings: super::PreparedChatGenerationSettings,

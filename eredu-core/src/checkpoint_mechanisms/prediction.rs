@@ -26,7 +26,10 @@ where
         Queue = <B::Tensor as Tensor>::Context,
     >;
     /// Native storage used by the predictor's portable model state.
-    type ModelCacheStorage: crate::cache::mechanisms::CacheTensorStorage<Value = B::Tensor>;
+    type ModelCacheStorage: crate::cache::mechanisms::CacheTensorStorage<
+        Value = B::Tensor,
+        Queue = <B::Tensor as Tensor>::Context,
+    >;
     /// Borrowed resources used during one materialization pass.
     type Context<'a>;
 

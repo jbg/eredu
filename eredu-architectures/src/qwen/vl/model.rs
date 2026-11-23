@@ -19,10 +19,7 @@ use crate::qwen::{self, AttentionInput};
 use crate::{composite_execution::PreparedCompositeInput, media_plan::QwenVlInputPartPlan};
 use eredu_runtime::{ComponentEquations as _, ParallelComponentKernel as _};
 
-use super::{
-    mrope_embeddings, multimodal_position_ids, position_ids_tensor, LocalGeometry, ModelArgs,
-    PositionPart,
-};
+use super::{multimodal_position_ids, position_ids_tensor, LocalGeometry, ModelArgs, PositionPart};
 
 /// Stable execution-group identity for Qwen3-VL vision ingress.
 pub const VISION_EXECUTION_GROUP: &str = "vision";
@@ -260,6 +257,46 @@ where
         eredu_core::CapabilityError,
     > {
         crate::media_plan::admit_qwen_vl_input(config, input, inspector)
+    }
+
+    fn resident_prefill_boundaries(
+        config: &Self::AdmissionConfig,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Vec<usize> {
+        let parts = input.prepared().parts();
+        if !config.vision.fp16_video_patches()
+            || !parts
+                .iter()
+                .any(|part| part.modality() == eredu_core::InputModality::Video)
+        {
+            return Vec::new();
+        }
+
+        // Decode contiguous text together and submit each visual embedding span in order.
+        (1..parts.len())
+            .filter(|&boundary| {
+                parts[boundary - 1].modality() != eredu_core::InputModality::Text
+                    || parts[boundary].modality() != eredu_core::InputModality::Text
+            })
+            .chain([parts.len()])
+            .collect()
+    }
+
+    fn prepared_prediction_token_ids(
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let parts =
+            eredu_runtime::composite_execution::prepared_token_parts(input, context, |plan| {
+                match plan {
+                    QwenVlInputPartPlan::TextTokens { .. } => None,
+                    QwenVlInputPartPlan::ProjectedText { positions } => Some((0, *positions)),
+                    QwenVlInputPartPlan::Media { ingress, .. } => {
+                        Some((ingress.placeholder_token_id, ingress.placeholder_count))
+                    }
+                }
+            })?;
+        B::Tensor::concatenate(&parts, 1, context)
     }
 
     fn prepared_group_invocation(
@@ -1443,7 +1480,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         };
         crate::operator_requirements::require::<B>(
             "Qwen3-VL",
-            crate::operator_requirements::QWEN_VL,
+            crate::operator_requirements::QWEN_VL.union(
+                declaration
+                    .vision_declaration()
+                    .config()
+                    .arithmetic_capabilities(),
+            ),
         )?;
         let text = crate::decoder::PartitionStaticModules::<B>::from_selected_construction(
             declaration
@@ -1728,7 +1770,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         }
         let (vision_initial, vision_state) = match input.pixels {
             Some(pixels) => {
-                let (hidden, state) = self.prepare_vision_request(pixels, &grids, context)?;
+                let (hidden, state) =
+                    self.prepare_vision_request(pixels, &grids, input.parts, context)?;
                 (Some(hidden), Some(state))
             }
             None => (None, None),
@@ -1759,44 +1802,40 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
             sequence,
         )
         .map_err(Error::backend)?;
-        if media && offset != 0 {
+        if media && offset != 0 && !self.args.vision.fp16_video_patches() {
             return Err(Error::backend(
                 "Qwen3-VL media input cannot append to a populated cache",
             ));
         }
-        if !media {
-            for axis in &mut positions {
-                for position in axis {
-                    *position += offset;
-                }
-            }
+        for position in positions.iter_mut().flatten() {
+            *position = position
+                .checked_add(offset)
+                .ok_or_else(|| Error::backend("Qwen3-VL position overflow"))?;
         }
         let mut positions = position_ids_tensor::<B::Tensor>(&positions, context)?;
+        let local_delta = || B::Tensor::full_i32(computed_delta, &[1], context);
         let position_delta = if owns_position_delta {
             let delta = state_layer
                 .fixed_component(StateTensorRole::PositionDelta)
                 .map_err(Error::backend)?;
-            if media || delta.is_none() {
-                *delta = Some(B::Tensor::full_i32(computed_delta, &[1], context)?);
-            } else if let Some(delta) = delta.as_ref() {
-                positions = positions.add(delta, context)?;
+            if let Some(previous) = delta {
+                positions = positions.add(previous, context)?;
+                if media {
+                    *previous = previous.add(&local_delta()?, context)?;
+                }
+                previous.clone()
+            } else {
+                let initial = local_delta()?;
+                *delta = Some(initial.clone());
+                initial
             }
-            delta
-                .as_ref()
-                .expect("Qwen3-VL installs position delta")
-                .clone()
         } else {
-            // PositionDelta is architecture-global state owned by text layer zero.
-            // A later PP stage still prepares its rank-local media group from the
-            // immutable request, but receives the authoritative persisted value
-            // with the decoder boundary before it executes any text unit.
-            B::Tensor::full_i32(computed_delta, &[1], context)?
+            // A later pipeline stage receives the authoritative delta from text layer zero.
+            local_delta()?
         };
-        let rotary = mrope_embeddings(
+        let rotary = eredu_nn::multimodal::multi_axis_rotary_embeddings(
             &positions,
-            self.args.text.head_dim,
-            self.args.text.rope_theta,
-            &self.args.mrope_section,
+            &self.args.rotary_spec()?,
             context,
         )?;
         let mask = if let Some(mask) = input.mask {
@@ -1937,6 +1976,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         &mut self,
         pixels: &B::Tensor,
         grids: &[(i32, i32, i32)],
+        parts: &[InputPart<'_, B::Tensor>],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
         let input = VisionInput {
@@ -1944,7 +1984,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
             grid: grids,
         };
         if self.static_modules.vision.owns_ingress() {
-            self.static_modules.vision.begin(input, context)
+            let mut video_ranges = Vec::new();
+            if self.args.vision.fp16_video_patches() {
+                let mut offset = 0i32;
+                for part in parts {
+                    let grid = match part {
+                        InputPart::Video { grid, .. } | InputPart::Image { grid, .. } => *grid,
+                        _ => continue,
+                    };
+                    let end = grid
+                        .iter()
+                        .try_fold(offset, |offset, &(t, h, w)| {
+                            t.checked_mul(h)?.checked_mul(w)?.checked_add(offset)
+                        })
+                        .ok_or_else(|| Error::backend("vision patch count overflow"))?;
+                    if matches!(part, InputPart::Video { .. }) {
+                        video_ranges.push(offset..end);
+                    }
+                    offset = end;
+                }
+            }
+            self.static_modules
+                .vision
+                .begin_with_fp16_patch_ranges(input, &video_ranges, context)
         } else {
             eredu_nn::sequence_layout::validate_patch_grid(
                 grids,
@@ -2160,7 +2222,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         }
         let (vision_initial, vision) = match input.pixels {
             Some(pixels) => {
-                let (hidden, state) = self.prepare_vision_request(pixels, &grids, context)?;
+                let (hidden, state) =
+                    self.prepare_vision_request(pixels, &grids, input.parts, context)?;
                 (Some(hidden), Some(state))
             }
             None => (None, None),
@@ -2204,11 +2267,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> VlKernel<B> {
         if !media {
             positions = positions.add(&delta, context)?;
         }
-        let rotary = mrope_embeddings(
+        let rotary = eredu_nn::multimodal::multi_axis_rotary_embeddings(
             &positions,
-            self.args.text.head_dim,
-            self.args.text.rope_theta,
-            &self.args.mrope_section,
+            &self.args.rotary_spec()?,
             context,
         )?;
         let mask = if let Some(mask) = input.mask {

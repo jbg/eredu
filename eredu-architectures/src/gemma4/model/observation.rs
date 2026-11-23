@@ -16,18 +16,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> GemmaKernel<B
             .text
             .layer_policy(index)
             .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-        let mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
+        let window = policy
+            .attention
+            .window()
+            .map(|window| window.get() as i32 - 1);
+        let mask = if forward.mask.is_some() || hidden.dim(1) <= 1 {
+            None
+        } else if forward.image_spans.is_empty() {
             Some(B::causal_mask(
                 hidden.dim(1),
                 forward.position_offset,
-                policy
-                    .attention
-                    .window()
-                    .map(|window| window.get() as i32 - 1),
+                window,
                 context,
             )?)
         } else {
-            None
+            Some(
+                eredu_nn::attention_mask::causal_mask_with_bidirectional_spans(
+                    hidden.dim(1),
+                    forward.position_offset,
+                    window,
+                    &forward.image_spans,
+                    context,
+                )?,
+            )
         };
         let per_layer_input = forward
             .per_layer_inputs

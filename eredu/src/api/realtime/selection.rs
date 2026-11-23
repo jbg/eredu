@@ -36,6 +36,9 @@ pub enum RealtimeLoadError {
     /// Categorical architecture selection or source preparation failed.
     #[error(transparent)]
     Categorical(#[from] MoshiRealtimePreparationError),
+    /// The selected backend cannot retain speech state and read completed outputs.
+    #[error(transparent)]
+    SpeechCapability(#[from] eredu_core::SessionCapabilityError),
     /// Speech host preparation failed before construction.
     #[error(transparent)]
     SpeechPreparation(#[from] VoiceChatLoadingError),
@@ -154,6 +157,8 @@ impl<'a, S: RealtimeLoadSupport> RealtimeArtifactVisitor<'a> for Select<'_, S> {
                 requested: self.options.protocol(),
             });
         };
+        eredu_core::SessionCapabilities::new(true, true, false)
+            .validate(&self.support.facts().session)?;
         let prepared = PreparedVoiceChatSession::from_retained(artifacts, &options.conversation)?
             .with_quantization(options.quantization)?;
         let construction = prepared.construction();

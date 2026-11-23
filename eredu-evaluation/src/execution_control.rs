@@ -58,14 +58,18 @@ fn step<
     (token.token_id(), records)
 }
 
-fn branch_values(mut value: (u32, ContinuationEvidence)) -> (u32, ContinuationEvidence) {
+fn branch_values(value: (u32, ContinuationEvidence)) -> (u32, ContinuationEvidence) {
     #[cfg(feature = "tensor-capture")]
-    if let Some(step) = &mut value.1 {
-        for record in &mut step.interventions {
-            // Child plans are intentionally re-admitted with fresh identities.
-            record.plan_id.clear();
+    let value = {
+        let mut value = value;
+        if let Some(step) = &mut value.1 {
+            for record in &mut step.interventions {
+                // Child plans are intentionally re-admitted with fresh identities.
+                record.plan_id.clear();
+            }
         }
-    }
+        value
+    };
     value
 }
 

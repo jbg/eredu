@@ -8,6 +8,7 @@ use eredu_core::{
 };
 use eredu_nn::Tensor;
 
+pub(crate) mod host_sampling;
 mod memory;
 mod text_sampler;
 pub use text_sampler::TextSampler;

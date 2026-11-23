@@ -322,14 +322,7 @@ pub trait CategoricalRealtimeNative:
 }
 
 /// Native components, state, and submission ownership for a coupled PCM session.
-pub trait SpeechRealtimeNative:
-    RealtimeStartupMechanisms<
-        Random: Clone + crate::execution_control::SnapshotValue + 'static,
-        Completion: Completion<Error: Send + Sync + 'static> + Clone + 'static,
-    > + RealtimeRandomRoot<SpeechTensor<Self>>
-    + Sized
-    + 'static
-{
+pub trait SpeechRealtimeNative: Sized + 'static {
     /// Tensor, neural, and submission operators.
     type Neural: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
@@ -349,16 +342,8 @@ pub trait SpeechRealtimeNative:
         + crate::checkpoint_mechanisms::unit_binding::ComponentPreparation<
             Context = SpeechContext<Self>,
         > + 'static;
-    /// Native sampling operations.
-    type Sampling: crate::sampling::DenseSamplingBackend<
-        Logits = SpeechTensor<Self>,
-        Token = SpeechTensor<Self>,
-        Context = SpeechContext<Self>,
-        RandomState = Self::Random,
-        Error: std::error::Error + Send + Sync + 'static,
-    >;
     /// Native queue and exact recovery for the coupled session.
-    type Queue: RealtimeQueue<Tensor = SpeechTensor<Self>, Completion = Self::Completion>;
+    type Queue: RealtimeQueue<Tensor = SpeechTensor<Self>, Completion: Clone + 'static>;
     /// Opens the common component binder.
     fn components(&self) -> Self::Components;
     /// Retains native resources for the selected execution queue.
@@ -396,8 +381,8 @@ pub trait RealtimeBindingTarget<Rank, Queue: RealtimeQueue>: 'static {
 
 /// Native tensor storage of a realtime random stream.
 pub trait RealtimeRandomRoot<T>: RealtimeStartupMechanisms {
-    /// Retains the native value backing the supplied random state.
-    fn random_root(random: &Self::Random) -> T;
+    /// Retains the native value backing the supplied random state, if it has one.
+    fn random_root(random: &Self::Random) -> Option<T>;
 }
 
 /// Queue recovery and numerical sampling for a realtime graph.
@@ -418,12 +403,15 @@ pub trait RealtimeGraphResources {
     ) -> &<<Self::Backend as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context;
 
     /// Opens native retirement tracking for forthcoming submissions.
-    fn open_input_recovery() -> Result<impl Sized, BackendFailure>;
+    fn open_input_recovery(
+        context: &<<Self::Backend as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<impl Sized + 'static + use<Self>, BackendFailure>;
 
     /// Retains the supplied lifetime authority through native recovery.
     fn hold_fork_retention(
+        context: &<<Self::Backend as NeuralBackend>::Tensor as Tensor>::Context,
         retention: crate::execution_control::SnapshotRetention,
-    ) -> Result<impl Sized, BackendFailure>;
+    ) -> Result<impl Sized + 'static + use<Self>, BackendFailure>;
 }
 
 /// Physical resources for one media-conditioned graph.

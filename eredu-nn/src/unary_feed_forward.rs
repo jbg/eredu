@@ -11,6 +11,8 @@ pub enum UnaryActivation {
     Gelu,
     /// Tanh-approximated GELU.
     GeluApproximate,
+    /// Tanh GELU with binary16 rounding on FP32 inputs.
+    GeluApproximateF16,
     /// Sigmoid-weighted linear unit.
     Silu,
     /// Positive part.
@@ -28,6 +30,7 @@ impl UnaryActivation {
         match self {
             Self::Gelu => B::Tensor::gelu(&input, context),
             Self::GeluApproximate => B::gelu_approximate(input, context),
+            Self::GeluApproximateF16 => B::gelu_approximate_f16(input, context),
             Self::Silu => B::silu(input, context),
             Self::Relu => input.maximum_scalar(0.0, context),
             Self::ReluSquared => input.maximum_scalar(0.0, context)?.square(context),

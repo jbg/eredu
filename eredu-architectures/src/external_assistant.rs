@@ -253,7 +253,7 @@ pub trait ExternalAssistantArchitecture:
         Logits = M::Logits,
         Context<'a> = M::Context<'a>,
         Completion = M::Completion,
-        Telemetry = M::Telemetry,
+        Telemetry = (),
         Error = M::Error,
     >
     where
@@ -416,6 +416,10 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
     >
     where
         M: ExternalAssistantExecutionMechanisms + 'static;
+
+    fn tokenizer_source(_: &Self::Config) -> crate::external_draft::ExternalDraftTokenizerSource {
+        crate::external_draft::ExternalDraftTokenizerSource::Target
+    }
 
     fn tokenizer_model_type(_config: &Self::Config) -> &'static str {
         "gemma4"
@@ -1546,15 +1550,11 @@ impl ExternalAssistantPreparation {
         }
     }
 
-    /// Architecture identity whose tokenizer contract the assistant shares.
-    pub fn tokenizer_model_type(&self) -> &'static str {
+    /// Returns the exact checkpoint admitted for this assistant.
+    pub fn checkpoint(&self) -> &ExternalAssistantCheckpoint {
         match &self.dispatched {
-            DispatchedExternalAssistantPreparation::Gemma4(p) => {
-                Gemma4AssistantArchitecture::tokenizer_model_type(&p.config)
-            }
-            DispatchedExternalAssistantPreparation::Muse(p) => {
-                MuseAssistantArchitecture::tokenizer_model_type(&p.config)
-            }
+            DispatchedExternalAssistantPreparation::Gemma4(p) => &p.checkpoint,
+            DispatchedExternalAssistantPreparation::Muse(p) => &p.checkpoint,
         }
     }
 
@@ -2311,6 +2311,7 @@ fn external_speculative_contract(
             ExternalAssistantTargetProfile::Gemma4(target),
             crate::composite_execution::ExternalPredictionCaptureRequest::SharedAttention {
                 final_hidden_path,
+                ..
             },
         ) => {
             let assistant = prepared.selected.config();

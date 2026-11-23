@@ -69,7 +69,9 @@ pub trait ParameterStorageBinding<B: NeuralBackend> {
     /// Exact host transfer allocation capacity for the proposed bindings.
     fn unit_host_capacity(&self, bindings: &[WeightBinding]) -> Result<u64, BackendFailure>;
 
-    /// Provides native streams at the selected transfer placement.
+    /// Provides native contexts for the selected transfer placement.
+    /// Asynchronous targets use a distinct queue when requested. Eager
+    /// targets complete transfers synchronously on their execution context.
     fn unit_residency_context(
         &self,
         distinct_transfer_stream: bool,

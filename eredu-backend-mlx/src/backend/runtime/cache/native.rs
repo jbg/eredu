@@ -320,6 +320,7 @@ impl<R: 'static> eredu_core::cache::mechanisms::CacheReadSubmission
 
 impl eredu_core::cache::mechanisms::LiveCacheReadSubmissionBackend for MlxCacheBackend {
     fn begin_cache_read(
+        _: &Stream,
         retention: impl Sized + 'static,
     ) -> Result<impl eredu_core::cache::mechanisms::CacheReadSubmission, BackendFailure> {
         crate::backend::submission_recovery::Recovery::begin(CacheReadRetention(retention))
@@ -328,11 +329,12 @@ impl eredu_core::cache::mechanisms::LiveCacheReadSubmissionBackend for MlxCacheB
 }
 
 pub(super) fn with_cache_read<R: 'static, T>(
+    queue: &Stream,
     retention: R,
     read: impl FnOnce() -> Result<T, safemlx::error::Exception>,
 ) -> Result<T, BackendFailure> {
     use eredu_core::cache::mechanisms::{CacheReadSubmission, LiveCacheReadSubmissionBackend};
-    let scope = MlxCacheBackend::begin_cache_read(retention)?;
+    let scope = MlxCacheBackend::begin_cache_read(queue, retention)?;
     let value = read().map_err(BackendFailure::from_error)?;
     scope.settle()?;
     Ok(value)
@@ -347,7 +349,7 @@ impl eredu_core::cache::mechanisms::LiveCacheSelectedReadBackend for MlxCacheBac
         retention: impl Sized + 'static,
     ) -> Result<Array, BackendFailure> {
         use eredu_core::cache::mechanisms::LiveCacheAppendBackend;
-        with_cache_read(retention, || {
+        with_cache_read(queue, retention, || {
             let part = Self::slice_tokens(tensor, axis, range, queue)
                 .map_err(safemlx::error::Exception::from_source)?;
             let part = part.contiguous(false, queue)?.deep_clone()?;
@@ -364,7 +366,7 @@ impl eredu_core::cache::mechanisms::LiveCacheSelectedReadBackend for MlxCacheBac
         retention: impl Sized + 'static,
     ) -> Result<[Array; 2], BackendFailure> {
         use safemlx::ops::indexing::{take_axis, TryIndexOp};
-        with_cache_read(retention, || {
+        with_cache_read(queue, retention, || {
             let indices = Array::from_slice(rows, &[rows.len() as i32]);
             let gather = |tensor: &Array| {
                 take_axis(

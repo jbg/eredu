@@ -89,8 +89,6 @@ where
     type Error: std::fmt::Display + From<eredu_core::parameters::ParameterError>;
 
     /// Called immediately before architecture construction begins.
-    fn construction_started(&mut self) {}
-
     /// Supplies native residency data for the paired predictor.
     fn prediction_weight_options<A>(
         &self,
@@ -183,8 +181,6 @@ where
     type Error: std::fmt::Display;
 
     /// Called immediately before architecture construction begins.
-    fn construction_started(&mut self) {}
-
     /// Concrete executable for this completed route.
     type BoundRouted<A>: From<BoundRoutedText<B, A, P, Self::Mechanisms<A>, Self, ()>>
         + crate::executable_binding::TextExecutableRoute<Self::Output>
@@ -1068,9 +1064,6 @@ where
     where
         A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static;
 
-    /// Records when portable dispatch starts constructing model modules.
-    fn observe_construction(&self) {}
-
     /// Borrows the exact execution context.
     fn session_context(&self) -> &B::Executor;
 
@@ -1119,10 +1112,6 @@ where
     where
         A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static;
 
-    fn observe_construction(&self) {
-        <N::Values as eredu_core::checkpoint_mechanisms::NativeTextWeights>::observe_text_construction();
-    }
-
     fn session_context(&self) -> &B::Executor {
         self.component_execution()
     }
@@ -1134,9 +1123,6 @@ where
     where
         A: LayeredArchitecture<B, S, Error = eredu_nn::Error> + 'static,
     {
-        <N::Values as eredu_core::checkpoint_mechanisms::NativeTextWeights>::observe_text_binding(
-            false,
-        );
         super::route_assembly::weights::TextRouteWeights::new(source, self.text_components())
     }
 }
@@ -1159,9 +1145,6 @@ where
     type Output;
     /// Backend binding failure.
     type Error: std::fmt::Display;
-
-    /// Records that validated dispatch is about to construct architecture modules.
-    fn construction_started(&mut self);
 
     /// Concrete executable for this completed route.
     type BoundComposite<A>: From<
@@ -1246,8 +1229,6 @@ where
     type Error: std::fmt::Display + From<eredu_core::parameters::ParameterError>;
 
     /// Records that validated dispatch is about to construct architecture modules.
-    fn construction_started(&mut self) {}
-
     /// Configures native resources for the paired prediction extension.
     fn prediction_weight_options<A>(
         &self,

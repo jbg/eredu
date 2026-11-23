@@ -1,9 +1,6 @@
 //! Device-side compatibility repair for value-only cutoff ties.
 use safemlx::{error::Exception, Array, Stream};
 
-#[path = "partial.rs"]
-mod partial;
-
 pub(super) fn repair(
     descending: &Array,
     indices: &Array,
@@ -134,7 +131,7 @@ pub(super) fn unranked(scores: &Array, count: i32, stream: &Stream) -> Result<Ar
         for (index, id) in ids.iter_mut().enumerate() {
             *id = index;
         }
-        partial::partition_ids(row, &mut ids, count as usize - 1);
+        eredu_nn::routing_selection::partition_ids(row, &mut ids, count as usize - 1);
         output.extend(ids[..count as usize].iter().map(|&id| id as i32));
     }
     Array::from_slice(&output, &[scores.dim(0), count]).copy(stream)

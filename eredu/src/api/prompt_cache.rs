@@ -1,47 +1,208 @@
-//! Automatic input reuse through the ordinary prompt-cache store operations.
-use super::{
-    GenerationOutput, GenerationRequest, LoadedModel, PreparedChatError, PreparedChatInput,
-};
+//! Automatic reuse and publication for local plain-text generation.
+use super::{LoadedModel, PreparedChatError};
 use eredu_core::{
     cache::{
-        prompt_cache_token_fingerprint, PromptCacheDescriptor, PromptCacheOptions, PromptCacheStore,
+        prompt_cache_token_fingerprint, PromptCacheDescriptor, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheRead, PromptCacheStore, PromptCacheStoreError,
     },
-    AutomaticPromptCacheSession, FinishReason, GenerationCancellationToken, PrefillChunkPolicy,
-    SemanticEvent, TextExecutionSession, TextGenerationBackend, TextGenerationConfig,
-    TextGenerationDriver, TokenFilter, TokenFilterController,
+    AutomaticPromptCacheSession, BackendFailure, GenerationCancellationToken, ModelRuntime,
+    PrefillChunkPolicy, TextExecutionSession, TextGenerationBackend, TextGenerationConfig,
 };
-use std::{
-    convert::Infallible,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-/// Metadata for ordinary generation using a configured prompt-cache store.
+/// Metadata for generation using a configured prompt-cache store.
 #[derive(Debug, Clone, Default)]
 pub struct PromptCacheStats {
     /// Complete input extent before cache reuse.
     pub input_tokens: usize,
     /// Exact prefix restored without replay.
     pub reused_tokens: usize,
-    /// Restore, completed prefix prefill and publication time.
+    /// Time spent looking up, restoring, and publishing cache state.
     pub prefill_time: Duration,
     /// Store bytes retained after publication.
     pub retained_bytes: u64,
-    /// Conservative export allowance, including staging and metadata.
+    /// Estimated export cost before the store admits the exact staging reservation.
     pub capture_estimate_bytes: Option<u64>,
 }
-struct PrefillOnly;
-impl TokenFilterController for PrefillOnly {
-    type Error = Infallible;
-    fn current_filter(&mut self) -> Result<TokenFilter, Infallible> {
-        Ok(TokenFilter::All)
+/// Retains the exact operations proved when the application attaches a store.
+pub(super) struct AttachedPromptCache<B: TextGenerationBackend, S: TextExecutionSession<B>> {
+    checkpoint: String,
+    pub(super) store: Box<dyn PromptCacheStore>,
+    identity: fn(&ModelRuntime<B, S>) -> Result<PromptCacheModelIdentity, BackendFailure>,
+    fingerprint: fn(&ModelRuntime<B, S>, &[u32]) -> Result<String, BackendFailure>,
+    restore: fn(
+        &mut ModelRuntime<B, S>,
+        &dyn PromptCacheRead,
+        &PromptCacheDescriptor,
+        &[u32],
+    ) -> Result<eredu_core::cache::PromptCacheManifest, BackendFailure>,
+    estimate: fn(&ModelRuntime<B, S>) -> Result<Option<u64>, BackendFailure>,
+    save: fn(
+        &mut ModelRuntime<B, S>,
+        &dyn PromptCacheStore,
+        PromptCacheDescriptor,
+        &[u32],
+        &PromptCacheOptions,
+    ) -> Result<eredu_core::cache::PromptCacheManifest, BackendFailure>,
+}
+
+pub(super) struct PromptCacheRun<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> {
+    attached: &'a AttachedPromptCache<B, S>,
+    pub(super) stats: PromptCacheStats,
+    publication: Option<(u64, Vec<u32>)>,
+}
+
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> PromptCacheRun<'_, B, S> {
+    pub(super) fn publication_due(&self, step: u64, cancel: &GenerationCancellationToken) -> bool {
+        !cancel.is_cancelled()
+            && self
+                .publication
+                .as_ref()
+                .is_some_and(|(expected, _)| step == *expected)
     }
-    fn commit_token(&mut self, _: u32) -> Result<(), Infallible> {
+
+    pub(super) fn publish(
+        &mut self,
+        runtime: &mut ModelRuntime<B, S>,
+        cancel: &GenerationCancellationToken,
+    ) -> Result<(), PreparedChatError> {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let Some((_, prefix)) = self.publication.take() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        self.stats.capture_estimate_bytes = (self.attached.estimate)(runtime)
+            .map_err(PreparedChatError::Backend)?
+            .and_then(eredu_runtime::prompt_cache_export_allowance);
+        let identity = (self.attached.identity)(runtime).map_err(PreparedChatError::Backend)?;
+        let descriptor = self.attached.descriptor(runtime, identity, &prefix)?;
+        let options = PromptCacheOptions::new(None, true)
+            .map_err(backend)?
+            .with_cancellation(cancel.clone());
+        if !cancel.is_cancelled() {
+            match (self.attached.save)(
+                runtime,
+                &*self.attached.store,
+                descriptor,
+                &prefix,
+                &options,
+            ) {
+                Ok(_) => {}
+                Err(error) if PromptCacheStoreError::publication_declined(&error) => {}
+                Err(error) => return Err(PreparedChatError::Backend(error)),
+            }
+        }
+        self.stats.prefill_time += started.elapsed();
+        self.stats.retained_bytes = self.attached.store.retained_bytes();
         Ok(())
     }
-    fn is_complete(&mut self) -> Result<bool, Infallible> {
-        Ok(false)
+}
+
+impl<B: TextGenerationBackend, S: TextExecutionSession<B>> AttachedPromptCache<B, S> {
+    fn eligible(runtime: &ModelRuntime<B, S>, config: &TextGenerationConfig) -> Option<usize> {
+        let PrefillChunkPolicy::Bounded(chunk) = config.prefill_chunk_policy() else {
+            return None;
+        };
+        (matches!(
+            config
+                .decoding_mode()
+                .unwrap_or_else(|| runtime.session().default_decoding_mode()),
+            eredu_core::decoding::DecodingMode::Autoregressive
+        ) && config.sampling().max_new_tokens != Some(0)
+            && config.refinement_canvas().is_none()
+            && runtime.session().active_parameter_overlay().is_none()
+            && runtime.session().text_prefill_chunking_support().is_ok()
+            && !runtime.session().supports_block_refinement())
+        .then_some(chunk.get())
+    }
+
+    fn descriptor(
+        &self,
+        runtime: &ModelRuntime<B, S>,
+        identity: PromptCacheModelIdentity,
+        prefix: &[u32],
+    ) -> Result<PromptCacheDescriptor, PreparedChatError> {
+        PromptCacheDescriptor::from_model_identity(
+            identity,
+            &self.checkpoint,
+            (self.fingerprint)(runtime, prefix).map_err(PreparedChatError::Backend)?,
+            1,
+        )
+        .map_err(backend)
+    }
+
+    fn restore_prefix(
+        &self,
+        runtime: &mut ModelRuntime<B, S>,
+        identity: PromptCacheModelIdentity,
+        tokens: &[u32],
+    ) -> Result<usize, PreparedChatError> {
+        let Some(read) = self.store.open()? else {
+            return Ok(0);
+        };
+        let manifest = read.manifest();
+        let n = manifest.total_prefix_tokens;
+        if n == 0
+            || n >= tokens.len()
+            || manifest.prefix_sha256 != prompt_cache_token_fingerprint(&tokens[..n])
+        {
+            return Ok(0);
+        }
+        let descriptor = self.descriptor(runtime, identity, &tokens[..n])?;
+        if manifest
+            .validate_compatibility(&descriptor, &tokens[..n])
+            .is_err()
+        {
+            return Ok(0);
+        }
+        (self.restore)(runtime, &*read, &descriptor, &tokens[..n])
+            .map_err(PreparedChatError::Backend)?;
+        Ok(n)
+    }
+
+    pub(super) fn prepare(
+        &self,
+        runtime: &mut ModelRuntime<B, S>,
+        config: &TextGenerationConfig,
+        tokens: &[u32],
+        cancel: &GenerationCancellationToken,
+    ) -> Result<Option<PromptCacheRun<'_, B, S>>, PreparedChatError> {
+        let Some(chunk) = Self::eligible(runtime, config) else {
+            return Ok(None);
+        };
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let identity = (self.identity)(runtime).map_err(PreparedChatError::Backend)?;
+        let topology = identity.topology();
+        if [topology.stage(), topology.shard(), topology.addressable()]
+            .into_iter()
+            .flatten()
+            .any(|(size, _)| size > 1)
+        {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        runtime.reset().map_err(PreparedChatError::Backend)?;
+        let reused = self.restore_prefix(runtime, identity, tokens)?;
+        let chunks = tokens.len().saturating_sub(1) / chunk;
+        Ok(Some(PromptCacheRun {
+            attached: self,
+            publication: (reused == 0 && chunks != 0)
+                .then(|| (chunks as u64, tokens[..chunks * chunk].to_vec())),
+            stats: PromptCacheStats {
+                input_tokens: tokens.len(),
+                reused_tokens: reused,
+                prefill_time: started.elapsed(),
+                retained_bytes: self.store.retained_bytes(),
+                capture_estimate_bytes: None,
+            },
+        }))
     }
 }
+
 fn backend(error: impl std::error::Error + Send + Sync + 'static) -> PreparedChatError {
     PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
 }
@@ -51,7 +212,9 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B> + AutomaticPromptCache
     /// Uses the same prompt-cache format and import/export path with any store.
     /// The fingerprint must identify the exact admitted checkpoint. It is also
     /// used for directory stores across loads; a model path alone is insufficient
-    /// if its contents can change. Full inputs are still supplied to `generate`.
+    /// if its contents can change. Supply the full prompt to generation.
+    /// Automatic reuse applies to local plain text with
+    /// bounded autoregressive prefill and no activation capture or edits.
     pub fn set_prompt_cache_store(
         &mut self,
         checkpoint_fingerprint: impl Into<String>,
@@ -67,220 +230,23 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B> + AutomaticPromptCache
             .into());
         }
         S::prompt_cache_model_identity(&self.runtime).map_err(PreparedChatError::Backend)?;
-        self.prompt_cache_store = Some((checkpoint, store));
+        self.prompt_cache_store = Some(AttachedPromptCache {
+            checkpoint,
+            store,
+            identity: S::prompt_cache_model_identity,
+            fingerprint: S::prompt_cache_prefix_fingerprint,
+            restore: S::restore_prompt_cache,
+            estimate: S::estimate_prompt_cache_state,
+            save: S::save_prompt_cache,
+        });
         Ok(())
     }
     /// Configured store, including its explicit capture allowance and retained bytes.
     pub fn prompt_cache_store(&self) -> Option<&dyn PromptCacheStore> {
-        self.prompt_cache_store.as_ref().map(|(_, s)| &**s)
+        self.prompt_cache_store.as_ref().map(|cache| &*cache.store)
     }
     /// Disables automatic reuse and releases this model's store owner.
     pub fn remove_prompt_cache_store(&mut self) {
         self.prompt_cache_store = None;
-    }
-
-    pub(super) fn generate_with_store<F: FnMut(SemanticEvent)>(
-        &mut self,
-        mut request: GenerationRequest<'_, S::Prompt, F>,
-        started: Instant,
-    ) -> Result<GenerationOutput, PreparedChatError> {
-        let (checkpoint, store) = self
-            .prompt_cache_store
-            .take()
-            .expect("configured prompt-cache store");
-        let cancel = request.cancellation.clone();
-        let result = (|| {
-            self.reset().map_err(PreparedChatError::Backend)?;
-            let chat = request.input.prepared_chat();
-            request
-                .input
-                .validate_session(&self.session_identity)
-                .map_err(PreparedChatError::Backend)?;
-            let original =
-                std::mem::replace(&mut request.input, PreparedChatInput::rendered_prompt(chat));
-            let tokens = match original {
-                PreparedChatInput::TokenIds { token_ids, .. } => Some(token_ids),
-                PreparedChatInput::RenderedPrompt(_) => {
-                    Some(self.encode(chat.rendered_prompt(), false)?)
-                }
-                other => {
-                    request.input = other;
-                    None
-                }
-            };
-            let mut stats = PromptCacheStats::default();
-            if let Some(tokens) = tokens {
-                stats.input_tokens = tokens.len();
-                let (config, _) = self.resolve_text_generation_settings(request.settings)?;
-                let suffix = if request.control_handle.is_none() {
-                    self.prefill_with_store(
-                        &tokens,
-                        config,
-                        &cancel,
-                        &*store,
-                        &checkpoint,
-                        &mut stats,
-                    )?
-                } else {
-                    store.clear()?;
-                    tokens
-                };
-                request.input = PreparedChatInput::token_ids(chat, suffix);
-            } else {
-                store.clear()?;
-            }
-            let mode = request.output_mode;
-            let output = self.generate_prepared(request, None, started, mode, None)?;
-            Ok(output.map_stats(|mut s| {
-                s.prompt_cache = Some(stats);
-                s
-            }))
-        })();
-        let cancelled = cancel.is_cancelled()
-            || result
-                .as_ref()
-                .is_ok_and(|o: &GenerationOutput| o.finish_reason() == FinishReason::Cancelled);
-        let cleanup = self.reset().map_err(PreparedChatError::Backend);
-        let eviction = if result.is_err() || cancelled || cleanup.is_err() {
-            store.clear().map_err(PreparedChatError::from)
-        } else {
-            Ok(())
-        };
-        self.prompt_cache_store = Some((checkpoint, store));
-        cleanup?;
-        eviction?;
-        result
-    }
-    fn prefill_with_store(
-        &mut self,
-        tokens: &[u32],
-        config: TextGenerationConfig,
-        cancel: &GenerationCancellationToken,
-        store: &dyn PromptCacheStore,
-        checkpoint: &str,
-        stats: &mut PromptCacheStats,
-    ) -> Result<Vec<u32>, PreparedChatError> {
-        let now = Instant::now();
-        if cancel.is_cancelled()
-            || !matches!(
-                config.prefill_chunk_policy(),
-                PrefillChunkPolicy::Bounded(_)
-            )
-            || !matches!(
-                config
-                    .decoding_mode()
-                    .unwrap_or_else(|| self.runtime.session().default_decoding_mode()),
-                eredu_core::decoding::DecodingMode::Autoregressive
-            )
-            || self
-                .runtime
-                .session()
-                .text_prefill_chunking_support()
-                .is_err()
-            || self.runtime.session().supports_block_refinement()
-        {
-            store.clear()?;
-            return Ok(tokens.to_vec());
-        }
-        let identity = match S::prompt_cache_model_identity(&self.runtime) {
-            Ok(i) => i,
-            Err(e) => return Err(PreparedChatError::Backend(e)),
-        };
-        let mut reused = 0;
-        if let Some(read) = store.open()? {
-            let manifest = read.manifest();
-            let n = manifest.total_prefix_tokens;
-            if n > 0
-                && n < tokens.len()
-                && manifest.prefix_sha256 == prompt_cache_token_fingerprint(&tokens[..n])
-            {
-                let descriptor = PromptCacheDescriptor::from_model_identity(
-                    identity.clone(),
-                    checkpoint,
-                    S::prompt_cache_prefix_fingerprint(&self.runtime, &tokens[..n])
-                        .map_err(PreparedChatError::Backend)?,
-                    1,
-                )
-                .map_err(|e| backend(e))?;
-                if manifest
-                    .validate_compatibility(&descriptor, &tokens[..n])
-                    .is_ok()
-                {
-                    S::load_prompt_cache(&mut self.runtime, store, &descriptor, &tokens[..n])
-                        .map_err(PreparedChatError::Backend)?;
-                    reused = n;
-                }
-            }
-        }
-        // Keep the original exact prefix on hits. A suffix prepared in isolation
-        // cannot attest the provenance of an extended composite input.
-        if reused > 0 {
-            stats.reused_tokens = reused;
-            stats.prefill_time = now.elapsed();
-            stats.retained_bytes = store.retained_bytes();
-            return Ok(tokens[reused..].to_vec());
-        }
-        store.clear()?;
-        let PrefillChunkPolicy::Bounded(chunk) = config.prefill_chunk_policy() else {
-            unreachable!()
-        };
-        let consumed = tokens.len().saturating_sub(1) / chunk.get() * chunk.get();
-        if consumed == 0 {
-            return Ok(tokens.to_vec());
-        }
-        let prompt = S::prepare_text_prompt(self.runtime.backend(), tokens[..consumed].to_vec())
-            .map_err(backend)?;
-        let mut driver = TextGenerationDriver::new(&mut self.runtime);
-        let mut state = driver.start(prompt, config, PrefillOnly).map_err(backend)?;
-        state.set_cancellation_token(cancel.clone());
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            let advanced = driver.advance_prefill(&mut state);
-            let drained = driver.take_completed_step(&mut state);
-            let advanced = advanced.map_err(backend)?;
-            drained.map_err(backend)?;
-            if !advanced {
-                break;
-            }
-        }
-        if cancel.is_cancelled() {
-            drop(state);
-            drop(driver);
-            return Ok(tokens[consumed..].to_vec());
-        }
-        let completed = driver.complete_prefill(state).map_err(backend)?;
-        drop(driver);
-        if !completed {
-            self.reset().map_err(PreparedChatError::Backend)?;
-            return Ok(tokens.to_vec());
-        }
-        if consumed > 0 && !cancel.is_cancelled() {
-            if let Some(bytes) = S::estimate_prompt_cache_state(&self.runtime)
-                .map_err(PreparedChatError::Backend)?
-                .and_then(eredu_runtime::prompt_cache_export_allowance)
-            {
-                stats.capture_estimate_bytes = Some(bytes);
-                if bytes <= store.max_bytes().saturating_sub(store.retained_bytes()) {
-                    let prefix = &tokens[..consumed];
-                    let descriptor = PromptCacheDescriptor::from_model_identity(
-                        identity,
-                        checkpoint,
-                        S::prompt_cache_prefix_fingerprint(&self.runtime, prefix)
-                            .map_err(PreparedChatError::Backend)?,
-                        1,
-                    )
-                    .map_err(backend)?;
-                    let options = PromptCacheOptions::new(None, true).map_err(backend)?;
-                    S::save_prompt_cache(&mut self.runtime, store, descriptor, prefix, &options)
-                        .map_err(PreparedChatError::Backend)?;
-                }
-            }
-        }
-        stats.reused_tokens = reused;
-        stats.prefill_time = now.elapsed();
-        stats.retained_bytes = store.retained_bytes();
-        Ok(tokens[consumed..].to_vec())
     }
 }

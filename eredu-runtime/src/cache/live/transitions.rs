@@ -265,7 +265,7 @@ impl<M: LiveCacheBackend> CacheResidencyManager<M> {
             transfer_in_flight_bytes: reserved_host_bytes,
             ..CachePoolUsage::default()
         })?;
-        let device = state.transfer_device.unwrap_or(M::host_device());
+        let device = state.transfer_device.clone().unwrap_or_else(M::host_device);
         let ticket = self.inner.host_demotion_worker.submit(
             id,
             arrays.clone(),

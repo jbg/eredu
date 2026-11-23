@@ -1347,7 +1347,7 @@ fn gemma_audio(
         })?,
         "Gemma audio second convolution channels",
     )?;
-    let conv_workspace = checked_add(
+    let mut conv_workspace = checked_add(
         checked_mul(
             6,
             checked_mul(
@@ -1368,6 +1368,24 @@ fn gemma_audio(
         )?,
         "Gemma convolution workspace",
     )?;
+    if config.published_gguf {
+        for (frames, frequency, input_channels, output_channels) in [
+            (first_frames, 64, 1, first_channels),
+            (sequence, 32, first_channels, second_channels),
+        ] {
+            let output_grid = checked_mul(frames, frequency, "Gemma audio unfolded output grid")?;
+            let taps = checked_mul(9, input_channels, "Gemma audio unfolded row width")?;
+            let patches = checked_mul(output_grid, taps, "Gemma audio unfolded patches")?;
+            let filters = checked_mul(output_channels, taps, "Gemma audio unfolded kernels")?;
+            let copies = checked_mul(
+                5,
+                checked_add(patches, filters, "Gemma audio unfolded storage")?,
+                "Gemma audio unfolded storage and precision conversions",
+            )?;
+            conv_workspace =
+                checked_add(conv_workspace, copies, "Gemma GGUF convolution workspace")?;
+        }
+    }
     let output = positive(config.output_proj_dims, "Gemma audio output size")?;
     let output_workspace = checked_mul(
         positions,

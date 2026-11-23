@@ -77,6 +77,21 @@ pub struct BankTransfer<T> {
     pub transfer: T,
 }
 
+impl<T> BankTransfer<T> {
+    pub(crate) fn begin_loan<L, E>(
+        self,
+        open: impl FnOnce(T) -> Result<L, E>,
+    ) -> Result<BankTransfer<L>, E> {
+        Ok(BankTransfer {
+            identities: self.identities,
+            demand: self.demand,
+            scratch_bytes: self.scratch_bytes,
+            access: self.access,
+            transfer: open(self.transfer)?,
+        })
+    }
+}
+
 /// Admits a grouped request and orders the selected device copy before execution.
 pub fn acquire_grouped_bank<B, G>(
     bank: &G,
@@ -108,7 +123,8 @@ where
     .map_err(eredu_core::BackendFailure::from_error)?;
     let transfer = acquire_addressable_demand(&guard, resources, plan, request.access(), queue)
         .map_err(eredu_core::BackendFailure::from_error)?;
-    Ok(transfer.into())
+    drop(guard);
+    bank.begin_consumption(transfer, queue)
 }
 
 /// Acquires an admitted exact demand and updates telemetry alongside it.

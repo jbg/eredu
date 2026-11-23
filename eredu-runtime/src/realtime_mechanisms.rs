@@ -359,7 +359,7 @@ impl<M: CategoricalRealtimeNative> Drop for CategoricalSubmissionGuard<'_, M> {
                 .model_state()
                 .visit_retained_tensors(&mut |value| roots.push(value.clone()));
             roots.extend(state.payload_history().retained_values().cloned());
-            roots.extend(branch.random_state().map(M::random_root));
+            roots.extend(branch.random_state().and_then(M::random_root));
             let completion = M::FrameQueue::abandon(scope, roots);
             let _ = branch.attach_submission_completion(completion);
         }
@@ -416,13 +416,13 @@ pub type SpeechRealtimeState<M> = JointRealtimeState<<M as SpeechRealtimeNative>
 pub type SpeechRealtimeStateBranch<M> =
     JointRealtimeBranch<<M as SpeechRealtimeNative>::CacheBackend>;
 /// Unpublished realtime generation and native completion during submission.
-pub type RealtimeSubmissionBranch<M, S, Q, P, A> = RealtimeGenerationBranch<
+pub type SpeechRealtimeSubmissionBranch<M, S, Q, P, A> = RealtimeGenerationBranch<
     S,
     Q,
     P,
     A,
-    <M as RealtimeStartupMechanisms>::Random,
-    <M as RealtimeStartupMechanisms>::Completion,
+    eredu_core::sampling::host_random::HostRandomState,
+    <<M as SpeechRealtimeNative>::Queue as RealtimeQueue>::Completion,
 >;
 
 /// Begins exact native submission after portable invocation preflight.
@@ -450,18 +450,21 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn submit_speech_realtime_frame<M, C, S, Q, P, A, I, O, H>(
     owner: &SharedRealtimeExecution<C, M::Queue>,
-    branch: &mut RealtimeSubmissionBranch<M, S, Q, P, A>,
+    branch: &mut SpeechRealtimeSubmissionBranch<M, S, Q, P, A>,
     input: &I,
     joint: impl Fn(&S) -> &SpeechRealtimeStateBranch<M>,
     visit: impl for<'a> Fn(&'a S, &mut dyn FnMut(&'a SpeechTensor<M>)),
     observer: H,
     invoke: impl FnOnce(
         &mut C,
-        &mut RealtimeSubmissionBranch<M, S, Q, P, A>,
+        &mut SpeechRealtimeSubmissionBranch<M, S, Q, P, A>,
         &Context<M>,
-        &mut BeginRealtimeSubmission<'_, RealtimeSubmissionBranch<M, S, Q, P, A>>,
+        &mut BeginRealtimeSubmission<'_, SpeechRealtimeSubmissionBranch<M, S, Q, P, A>>,
     ) -> Result<O, BackendFailure>,
-) -> Result<PrepublicationRealtimeFrame<O, M::Completion, H>, BackendFailure>
+) -> Result<
+    PrepublicationRealtimeFrame<O, <M::Queue as RealtimeQueue>::Completion, H>,
+    BackendFailure,
+>
 where
     M: SpeechRealtimeMechanisms,
     C: 'static,
@@ -479,13 +482,12 @@ where
     }
     let mut components = owner.open_components()?;
     let context = owner.queue().context();
-    let gather_roots = |branch: &RealtimeSubmissionBranch<M, S, Q, P, A>| {
+    let gather_roots = |branch: &SpeechRealtimeSubmissionBranch<M, S, Q, P, A>| {
         let (backbone, speech) = joint(branch.model_state()).parts();
         let mut roots = Vec::new();
         let mut retain = |value: &SpeechTensor<M>| roots.push(value.clone());
         backbone.visit_retained_tensors(&mut retain);
         speech.visit_retained_tensors(&mut retain);
-        roots.extend(branch.random_state().map(M::random_root));
         visit(branch.model_state(), &mut |tensor| {
             roots.push(tensor.clone())
         });
@@ -494,7 +496,7 @@ where
     let mut guard = SpeechSubmissionGuard {
         branch,
         scope: None,
-        abandon: |branch: &mut RealtimeSubmissionBranch<M, S, Q, P, A>, scope| {
+        abandon: |branch: &mut SpeechRealtimeSubmissionBranch<M, S, Q, P, A>, scope| {
             let completion = M::Queue::abandon(scope, gather_roots(branch));
             let _ = branch.attach_submission_completion(completion);
         },

@@ -3,8 +3,7 @@
 use eredu_core::automatic::{ColdPlanPlacement, ExecutionPlanNativeFactory};
 use eredu_core::{
     AutomaticPlanningError, BackendFailure, BackendId, DevicePlan, DraftPlacementPlan,
-    HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile,
-    Observed,
+    HardwareBackendProfile, HardwareDeviceProfile, HardwareProfile, Observed,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -51,17 +50,13 @@ impl eredu_core::preparation::BackendInspection for MlxBackendFactory {
 
     fn allocator_observation(
         &self,
-    ) -> Result<
-        Option<(
-            eredu_core::AllocatorCachePolicyReport,
-            eredu_core::AllocatorTelemetry,
-        )>,
-        BackendFailure,
-    > {
-        Ok(Some((
-            crate::allocator_cache_policy().map_err(BackendFailure::from_error)?,
-            allocator_telemetry()?,
-        )))
+    ) -> Result<Option<eredu_core::AllocatorObservation>, BackendFailure> {
+        Ok(Some(eredu_core::AllocatorObservation {
+            cache_policy: Some(
+                crate::allocator_cache_policy().map_err(BackendFailure::from_error)?,
+            ),
+            telemetry: allocator_telemetry()?,
+        }))
     }
 }
 
@@ -75,11 +70,7 @@ fn native_cache_limit(bytes: u64) -> Result<usize, BackendFailure> {
 fn allocator_telemetry() -> Result<eredu_core::AllocatorTelemetry, BackendFailure> {
     let memory = crate::allocator_memory()
         .map_err(|error| BackendFailure::from_error(error).with_operation("allocator telemetry"))?;
-    Ok(eredu_core::AllocatorTelemetry {
-        peak_bytes: memory.peak_bytes(),
-        active_bytes: memory.active_bytes(),
-        cache_bytes: memory.cached_bytes(),
-    })
+    Ok(memory.into())
 }
 
 impl eredu_core::decision::DecisionBindingFactory for MlxBackendFactory {
@@ -136,26 +127,21 @@ impl MlxBackendFactory {
 
 /// Discovers hardware facts visible to the MLX adapter.
 pub fn discover_hardware() -> HardwareProfile {
-    let (physical_memory_bytes, available_memory_bytes, semantics) = match available_memory() {
-        Ok(memory) => (
-            memory.physical_memory_bytes,
-            memory.available_memory_bytes,
-            memory.physical_semantics.into(),
-        ),
-        Err(error) => (
-            Observed::unavailable(error.to_string()),
-            Observed::unavailable(error.to_string()),
-            HardwareMemorySemantics::Unknown,
-        ),
-    };
+    let memory = available_memory().unwrap_or_else(|error| eredu_core::AvailableMemory {
+        physical_memory_bytes: Observed::unavailable(error.to_string()),
+        available_memory_bytes: Observed::unavailable(error.to_string()),
+        device: None,
+        physical_semantics: eredu_core::PhysicalMemorySemantics::Unknown,
+    });
+    let cpu_memory = memory.selected_capacity(true);
     #[allow(unused_mut)] // Native-device probes are target and feature gated.
     let mut devices = vec![HardwareDeviceProfile {
         id: "cpu:0".into(),
         kind: eredu_core::HardwareDeviceKind::Cpu,
         family: "cpu".into(),
         index: 0,
-        total_memory_bytes: physical_memory_bytes.clone(),
-        available_memory_bytes: available_memory_bytes.clone(),
+        total_memory_bytes: cpu_memory.total_bytes,
+        available_memory_bytes: cpu_memory.available_bytes,
     }];
     #[allow(unused_mut)] // Native-device probe diagnostics are target and feature gated.
     let mut details: Vec<String> = Vec::new();
@@ -167,24 +153,14 @@ pub fn discover_hardware() -> HardwareProfile {
             Err(error) => (false, Some(error.to_string())),
         };
         if available {
-            let (total, available) = if semantics == HardwareMemorySemantics::Unified {
-                (
-                    physical_memory_bytes.clone(),
-                    available_memory_bytes.clone(),
-                )
-            } else {
-                (
-                    Observed::unavailable("MLX does not expose discrete Metal capacity"),
-                    Observed::unavailable("MLX does not expose discrete Metal availability"),
-                )
-            };
+            let capacity = memory.selected_capacity(false);
             devices.push(HardwareDeviceProfile {
                 id: "metal:0".into(),
                 kind: eredu_core::HardwareDeviceKind::Gpu,
                 family: "metal".into(),
                 index: 0,
-                total_memory_bytes: total,
-                available_memory_bytes: available,
+                total_memory_bytes: capacity.total_bytes,
+                available_memory_bytes: capacity.available_bytes,
             });
         } else if let Some(detail) = detail {
             details.push(format!("Metal: {detail}"));
@@ -216,9 +192,9 @@ pub fn discover_hardware() -> HardwareProfile {
     }
 
     HardwareProfile::observe_host(
-        physical_memory_bytes,
-        available_memory_bytes,
-        semantics,
+        memory.physical_memory_bytes,
+        memory.available_memory_bytes,
+        memory.physical_semantics.into(),
         vec![HardwareBackendProfile {
             backend: BackendId::new("mlx").expect("MLX is a valid backend identifier"),
             available: true,
@@ -324,15 +300,10 @@ impl ExecutionPlanNativeFactory for MlxBackendFactory {
                 let world = safemlx::distributed::init(true, backend).map_err(|error| {
                     planning_backend_error("initialize_distributed_world", error)
                 })?;
-                if (world.size(), world.rank()) != (rank.world_size(), rank.global_rank()) {
-                    return Err(AutomaticPlanningError::Invalid(format!(
-                        "native world size/rank {}/{} differs from retained selection {}/{}",
-                        world.size(),
-                        world.rank(),
-                        rank.world_size(),
-                        rank.global_rank(),
-                    )));
-                }
+                eredu_core::automatic::validate_realized_world(
+                    (rank.world_size(), rank.global_rank()),
+                    (world.size(), world.rank()),
+                )?;
                 Some(world)
             }
             None => None,
@@ -382,22 +353,9 @@ struct RealizedMlxDevice {
 fn parse_mlx_device(
     device: &DevicePlan,
 ) -> Result<(Option<MlxAcceleratorFamily>, i32), AutomaticPlanningError> {
-    if device.backend().as_str() != "mlx" {
-        return Err(AutomaticPlanningError::Invalid(format!(
-            "MLX cannot probe backend {}",
-            device.backend()
-        )));
-    }
-    let (family, index) = device.device().split_once(':').ok_or_else(|| {
-        AutomaticPlanningError::Invalid(format!(
-            "MLX device identifier {:?} must be family:index",
-            device.device()
-        ))
-    })?;
-    let index = i32::try_from(index.parse::<usize>().map_err(|error| {
-        AutomaticPlanningError::Invalid(format!("invalid MLX device index: {error}"))
-    })?)
-    .map_err(|_| AutomaticPlanningError::Invalid("MLX device index exceeds i32".into()))?;
+    let (family, index) = eredu_core::automatic::parse_indexed_device(device, "mlx")?;
+    let index = i32::try_from(index)
+        .map_err(|_| AutomaticPlanningError::Invalid("MLX device index exceeds i32".into()))?;
     let accelerator_family = match family {
         "cpu" => None,
         "metal" => Some(MlxAcceleratorFamily::Metal),
@@ -408,13 +366,6 @@ fn parse_mlx_device(
             )))
         }
     };
-    let canonical_id = format!("{family}:{index}");
-    if device.device() != canonical_id {
-        return Err(AutomaticPlanningError::Invalid(format!(
-            "MLX device identifier {:?} is not canonical; use {canonical_id:?}",
-            device.device()
-        )));
-    }
     if let Some(family) = accelerator_family {
         if !family.is_compiled() {
             return Err(AutomaticPlanningError::Invalid(format!(

@@ -228,6 +228,7 @@ fn observed_availability_gives_a_verdict_without_an_application_budget() {
             kind: eredu_core::ObservationKind::Estimated,
             source: "point-in-time host observation".into(),
         },
+        device: None,
         physical_semantics: eredu_core::PhysicalMemorySemantics::Unified,
     };
     request.domains[0].budget = MemoryBudget::from_available_memory(&available, None, 1024);
@@ -494,6 +495,9 @@ fn static_report(semantics: PhysicalMemorySemantics) -> StaticMemoryReport {
         planned_disk_backed_bytes: Observed::exact(0, "test"),
         backend_active_allocation_bytes: Observed::exact(1000, "global, not extra"),
         backend_allocator_cache_bytes: Observed::exact(1000, "global, not extra"),
+        backend_device_allocated_bytes: eredu_core::Observed::unavailable(
+            "device total was not measured",
+        ),
         physical_semantics: semantics,
         currently_cached_shards: Observed::exact(0, "test"),
     }
@@ -501,26 +505,42 @@ fn static_report(semantics: PhysicalMemorySemantics) -> StaticMemoryReport {
 
 #[test]
 fn unified_capacity_is_not_assumed_to_mean_shared_backing() {
+    let placement = eredu_core::capability::ExecutionMemoryPlacement {
+        device: eredu_core::DevicePlan::new("test", "gpu:2").unwrap(),
+        host_execution: false,
+        allocator: None,
+    };
     let report = static_report(PhysicalMemorySemantics::Unified);
-    let unknown = static_parameter_placement(&report, None).unwrap();
+    let unknown = static_parameter_placement(&report, &placement, None)
+        .unwrap()
+        .1;
     assert_eq!(
         (unknown[0].1.lower_bytes, unknown[0].1.upper_bytes),
         (100, Some(200))
     );
-    let views = static_parameter_placement(&report, Some(100)).unwrap();
+    let views = static_parameter_placement(&report, &placement, Some(100))
+        .unwrap()
+        .1;
     assert_eq!(
         (views[0].1.lower_bytes, views[0].1.upper_bytes),
         (100, Some(100))
     );
-    let copies = static_parameter_placement(&report, Some(0)).unwrap();
+    let copies = static_parameter_placement(&report, &placement, Some(0))
+        .unwrap()
+        .1;
     assert_eq!(
         (copies[0].1.lower_bytes, copies[0].1.upper_bytes),
         (200, Some(200))
     );
-    assert!(static_parameter_placement(&report, Some(101)).is_err());
-    let separate =
-        static_parameter_placement(&static_report(PhysicalMemorySemantics::SeparateTiers), None)
-            .unwrap();
+    assert!(static_parameter_placement(&report, &placement, Some(101)).is_err());
+    let (execution, separate) = static_parameter_placement(
+        &static_report(PhysicalMemorySemantics::SeparateTiers),
+        &placement,
+        None,
+    )
+    .unwrap();
+    assert_eq!(execution, MemoryDomain::Device("test/gpu:2".into()));
+    assert_eq!(separate[1].0, execution);
     assert_eq!(separate.len(), 2);
     assert_eq!(separate[0].1.lower_bytes, 100);
     assert_eq!(separate[1].1.lower_bytes, 100);

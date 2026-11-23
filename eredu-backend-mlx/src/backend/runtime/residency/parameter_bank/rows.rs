@@ -52,7 +52,7 @@ impl RowDecode<MlxNeuralBackend, MlxResidencyResources> for MlxRowDecoder {
 
     type Loan = super::movement::MlxParameterLoan;
 
-    fn begin_loan(transfer: ResidentTransfer) -> Result<Self::Loan, Error> {
+    fn begin_loan(transfer: ResidentTransfer, _: &Stream) -> Result<Self::Loan, Error> {
         Self::Loan::begin(transfer)
     }
 
@@ -188,7 +188,7 @@ impl NativeRowLookupSupport for MlxRowLookupSupport {
         )?;
         let scalar_bytes = if let Some(scale) = request.scalar {
             let Ok(workspace) =
-                crate::backend::runtime::checkpoint::recipe::native_recipe_workspace(
+                eredu_core::checkpoint_mechanisms::recipe_execution::conservative_workspace_bytes(
                     scale.recipe,
                     &scale,
                 )

@@ -295,6 +295,13 @@ impl NeuralBackend for MlxNeuralBackend {
         compute_tensor(nn::gelu_approximate(input.into_array(), context))
     }
 
+    fn gelu_approximate_f16(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
+        compute_tensor(common::layers::gelu_approximate_f16(
+            input.into_array(),
+            context,
+        ))
+    }
+
     fn sigmoid(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
         compute_tensor(common::layers::sigmoid(input.into_array(), context))
     }

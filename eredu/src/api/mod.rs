@@ -107,6 +107,3 @@ mod tests;
 pub mod decision;
 
 pub use crate::runtime::model_loading::TextSessionComposition;
-
-#[cfg(feature = "mlx")]
-mod mlx;

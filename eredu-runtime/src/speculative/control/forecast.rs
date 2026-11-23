@@ -189,7 +189,7 @@ where
                     available: observation.available,
                     allocator_cache_limit: observation.allocator_cache_limit,
                 },
-                host_execution: profile.host_execution,
+                placement: profile.placement.clone(),
                 residency: profile.residency.clone(),
                 parameter_bounds: profile.parameter_bounds.clone(),
                 parameter_loading: profile.parameter_loading.clone(),

@@ -2,6 +2,9 @@
 
 #[cfg(test)]
 use crate::backend::BoundedCompletionOutcome;
+/// Opt-in timing and shared component telemetry.
+pub mod timing;
+
 use crate::{
     backend::{
         BoundedCompletion, BoundedCompletionWait, Completion, CompletionCancellationMode,
@@ -422,14 +425,12 @@ pub struct SpeculativeStats {
     optimistic_draft_time: Duration,
     /// Host wall time retained target verification remained in flight.
     verification_in_flight_time: Duration,
-    /// Whether architecture component timings were collected.
+    /// Whether eager component timings were collected.
     component_timings_collected: bool,
     /// Device execution time spent encoding committed target context.
     draft_context_time: Duration,
     /// Device execution time spent executing assistant proposal blocks.
     draft_assistant_time: Duration,
-    /// Device execution time spent projecting proposal states to logits.
-    draft_head_time: Duration,
     /// Device execution time spent executing target verification passes.
     target_verification_time: Duration,
     /// Scheduler operations performed for this request.
@@ -551,10 +552,6 @@ impl SpeculativeStats {
     pub const fn draft_assistant_time(&self) -> Duration {
         self.draft_assistant_time
     }
-    /// Draft-head device time.
-    pub const fn draft_head_time(&self) -> Duration {
-        self.draft_head_time
-    }
     /// Target-verification device time.
     pub const fn target_verification_time(&self) -> Duration {
         self.target_verification_time
@@ -572,17 +569,15 @@ impl SpeculativeStats {
         self.elapsed
     }
 
-    /// Adds backend-measured component timings without exposing mutable fields.
+    /// Adds eager component timings without exposing mutable fields.
     pub fn add_component_timings(
         &mut self,
         draft_context: Duration,
         draft_assistant: Duration,
-        draft_head: Duration,
         target_verification: Duration,
     ) {
         self.draft_context_time += draft_context;
         self.draft_assistant_time += draft_assistant;
-        self.draft_head_time += draft_head;
         self.target_verification_time += target_verification;
         self.component_timings_collected = true;
     }
@@ -1144,17 +1139,9 @@ pub trait SpeculativeExecutor {
         false
     }
 
-    /// Resolves and drains assistant telemetry since the previous call.
-    fn take_telemetry(&mut self) -> Result<Self::Telemetry, Self::Error> {
-        Ok(Self::Telemetry::default())
-    }
-
-    /// Resolves telemetry retained by one target verification output.
-    fn take_verification_telemetry(
-        &mut self,
-        _output: &mut Self::Verification,
-    ) -> Result<Self::Telemetry, Self::Error> {
-        Ok(Self::Telemetry::default())
+    /// Drains measurements accrued during the current request action.
+    fn take_telemetry(&mut self) -> Self::Telemetry {
+        Self::Telemetry::default()
     }
 
     /// Whether cloned assistant state can be promoted after an exact bonus match.
@@ -1789,7 +1776,7 @@ where
     let draft_probability =
         sampler.probability_at(draft, proposed, SamplingPlacement::Target, context)?;
     let acceptance = speculative_acceptance_probability(target_probability, draft_probability);
-    if sampler.sample_unit_interval(randomness.as_deref_mut(), context)? <= acceptance {
+    if sampler.sample_unit_interval(randomness.as_deref_mut(), context)? < acceptance {
         return Ok(ProposalDecision::Accept);
     }
 
@@ -2812,15 +2799,13 @@ where
 
 /// Settled causal state and next-token scores after appending a committed suffix.
 /// Sampling, publication and proposal randomness do not advance at this boundary.
-pub struct SettledCommittedSuffix<S, L, T> {
+pub struct SettledCommittedSuffix<S, L> {
     /// Source seed aligned with the completed canonical append.
     pub state: S,
     /// Causal next-token row retained for the next generation action.
     pub logits: L,
     /// Additional input evaluations needed to retain the accepted prefix.
     pub replayed_tokens: usize,
-    /// Component observations collected after exact completion.
-    pub telemetry: T,
 }
 
 /// Appends a nonempty committed suffix through the executor's zero-proposal
@@ -2837,10 +2822,7 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
         &mut dyn FnMut(SpeculativeLifecycleStage) -> Result<(), SpeculativeOutputError>,
     >,
     context: E::Context<'a>,
-) -> Result<
-    SettledCommittedSuffix<E::TargetState, E::Logits, E::Telemetry>,
-    SpeculativeDriverError<E::Error>,
-> {
+) -> Result<SettledCommittedSuffix<E::TargetState, E::Logits>, SpeculativeDriverError<E::Error>> {
     let mut observe = observe;
     let mut observe_stage = |stage| match observe.as_deref_mut() {
         Some(observer) => observer(stage),
@@ -2893,13 +2875,13 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
             observe_stage(SpeculativeLifecycleStage::Observation)
                 .map_err(SpeculativeDriverError::Output)?;
             let output = retained_output
-                .as_mut()
+                .as_ref()
                 .expect("suffix verification is retained");
-            let telemetry = executor.take_verification_telemetry(output)?;
-            let logits = executor.verification_logits(output, tokens.len() - 1, context)?;
-            Ok((telemetry, logits))
+            executor
+                .verification_logits(output, tokens.len() - 1, context)
+                .map_err(SpeculativeDriverError::Backend)
         })();
-        let (telemetry, logits) = coordination::ready_result(executor, computed, context)?;
+        let logits = coordination::ready_result(executor, computed, context)?;
         let observed = observe_stage(SpeculativeLifecycleStage::CachePersistence)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
@@ -2920,7 +2902,6 @@ pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
             state: committed.state,
             logits,
             replayed_tokens: committed.replayed_tokens,
-            telemetry,
         })
     })();
     if result.is_err() {
@@ -2944,15 +2925,13 @@ pub enum SpeculativePublicationStatus<S, D> {
 }
 
 /// Backend and portable state after exact commit and legal publication.
-pub struct PublishedSpeculativeVerification<TargetState, DraftState, Distribution, RandomState, T> {
+pub struct PublishedSpeculativeVerification<TargetState, DraftState, Distribution, RandomState> {
     /// Target state matching the committed backend cache.
     target_state: TargetState,
     /// Canonical target randomness after resolution.
     target_randomness: Option<RandomState>,
     /// Updated portable request telemetry.
     stats: SpeculativeStats,
-    /// Backend component telemetry observed at exact completion.
-    telemetry: T,
     /// Request continuation selected after publication.
     status: SpeculativePublicationStatus<DraftState, Distribution>,
     /// Published suffix that has not yet entered causal KV.
@@ -2966,7 +2945,6 @@ pub type PublishedSpeculativeResult<E, S> = Result<
         <E as SpeculativeExecutor>::DraftState,
         <S as SpeculativeSampling>::Distribution,
         <S as SpeculativeSampling>::RandomState,
-        <E as SpeculativeExecutor>::Telemetry,
     >,
     SpeculativeDriverError<<E as SpeculativeExecutor>::Error>,
 >;
@@ -3019,9 +2997,6 @@ where
                 Ok(())
             };
             coordination::settle_completion::<E>(&mut completion, policy, observed)?;
-            let telemetry = executor.take_verification_telemetry(
-                verification.as_mut().expect("pending verification"),
-            )?;
             stats.verification_in_flight_time += submitted.elapsed();
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::Observation)
@@ -3060,15 +3035,14 @@ where
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::CachePersistence)
                 .map_err(SpeculativeDriverError::Output)?;
-            Ok((resolved, continuation, telemetry))
+            Ok((resolved, continuation))
         })();
-        let (mut resolved, mut continuation, telemetry) =
-            crate::run_preparation::finish_preparation(
-                stage,
-                prepared,
-                |status| executor.agree_text_preparation(stage, status, context),
-                SpeculativeDriverError::Preparation,
-            )?;
+        let (mut resolved, mut continuation) = crate::run_preparation::finish_preparation(
+            stage,
+            prepared,
+            |status| executor.agree_text_preparation(stage, status, context),
+            SpeculativeDriverError::Preparation,
+        )?;
         let terminal = resolved.finish_reason;
         let committed_tokens = resolved.committed_tokens;
         let pending_committed_tokens = if committed_tokens.len() + 1 > resolved.verified_inputs {
@@ -3126,7 +3100,6 @@ where
             target_state: commit.state,
             target_randomness,
             stats,
-            telemetry,
             status,
             pending_committed_tokens,
         })
@@ -3149,7 +3122,7 @@ pub fn cancel_pending_verification<'a, E, S, C, P>(
     mut stats: SpeculativeStats,
     completion_wait: BoundedCompletionWait,
     context: E::Context<'a>,
-) -> Result<(SpeculativeStats, E::Telemetry), SpeculativeDriverError<E::Error>>
+) -> Result<SpeculativeStats, SpeculativeDriverError<E::Error>>
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
@@ -3174,9 +3147,6 @@ where
         let prepared = (|| {
             let observed = runtime.observe_lifecycle(SpeculativeLifecycleStage::Completion);
             coordination::settle_completion::<E>(&mut completion, Ok(completion_wait), observed)?;
-            let telemetry = executor.take_verification_telemetry(
-                verification.as_mut().expect("pending verification"),
-            )?;
             stats.verification_in_flight_time += submitted.elapsed();
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::Observation)
@@ -3189,9 +3159,9 @@ where
                 .constraint()
                 .fork()
                 .map_err(SpeculativeDriverError::Output)?;
-            Ok((constraint, runtime.sequence().clone(), telemetry))
+            Ok((constraint, runtime.sequence().clone()))
         })();
-        let (mut constraint, mut sequence, telemetry) = crate::run_preparation::finish_preparation(
+        let (mut constraint, mut sequence) = crate::run_preparation::finish_preparation(
             stage,
             prepared,
             |status| executor.agree_text_preparation(stage, status, context),
@@ -3224,7 +3194,7 @@ where
             SpeculativeDriverError::Preparation,
         )?;
         runtime.install_committed_state(runtime.sampler().clone(), constraint, sequence);
-        Ok((stats, telemetry))
+        Ok(stats)
     })();
     if result.is_err() {
         executor.restore_checkpoint(cache, &checkpoint, context)?;
@@ -3691,7 +3661,6 @@ where
                     context,
                 )
             })?;
-            settled.telemetry.record(&mut self.stats);
             self.stats.target_tokens +=
                 self.pending_committed_tokens.len() + settled.replayed_tokens;
             self.target_state = Some(settled.state);
@@ -3868,7 +3837,6 @@ where
                     context,
                 )
             })?;
-            settled.telemetry.record(&mut self.stats);
             self.stats.target_tokens +=
                 self.pending_committed_tokens.len() + settled.replayed_tokens;
             self.target_state = Some(settled.state);
@@ -4234,7 +4202,6 @@ where
             self.stats.draft_tokens += proposals.len();
             block.proposals.extend(proposals);
         }
-        executor.take_telemetry()?.record(&mut self.stats);
         self.block = Some(block);
         self.transition(SpeculativeRequestStatus::ReadyToSubmitVerification)?;
         Ok(additional > 0)
@@ -4362,7 +4329,7 @@ where
             .take()
             .expect("resolving request has an in-flight verification");
         if self.lifecycle.cancellation_pending() || self.runtime.cancellation().is_cancelled() {
-            let (mut stats, telemetry) = with_activation_origin(executor, origin, |executor| {
+            let stats = with_activation_origin(executor, origin, |executor| {
                 cancel_pending_verification(
                     executor,
                     &mut self.cache,
@@ -4375,13 +4342,12 @@ where
                     context,
                 )
             })?;
-            telemetry.record(&mut stats);
             self.stats = stats;
             self.transition(SpeculativeRequestStatus::Cancelled)?;
             self.stats.elapsed = self.started.elapsed();
             return Ok(());
         }
-        let mut published = with_activation_origin(executor, origin, |executor| {
+        let published = with_activation_origin(executor, origin, |executor| {
             resolve_commit_and_publish(
                 executor,
                 &mut self.cache,
@@ -4394,7 +4360,6 @@ where
                 context,
             )
         })?;
-        published.telemetry.record(&mut published.stats);
         self.target_state = Some(published.target_state);
         self.pending_committed_tokens = published.pending_committed_tokens;
         self.target_randomness = published.target_randomness;
@@ -4801,12 +4766,11 @@ where
                 SpeculativeDriverError::Preparation,
             )?;
             if executor.uses_completed_decisions() {
-                let state = executor
-                    .prepare_decision_source(input, cache, context)
-                    .map_err(SpeculativeDriverError::Backend)?
-                    .ok_or(SpeculativeDriverError::Coordination(
-                        "completed decision source preparation",
-                    ))?;
+                let state = executor.prepare_decision_source(input, cache, context);
+                executor.take_telemetry().record(&mut stats);
+                let state = state.map_err(SpeculativeDriverError::Backend)?.ok_or(
+                    SpeculativeDriverError::Coordination("completed decision source preparation"),
+                )?;
                 self.requests.push(SpeculativeRequest {
                     completed_decision: None,
                     control_identity: Arc::new(()),
@@ -4855,6 +4819,7 @@ where
                     executor.prefill(input, cache, context)
                 })
                 .map_err(SpeculativeDriverError::Backend);
+                let telemetry = executor.take_telemetry();
                 let prefill = match coordination::ready_result(executor, prefilling, context) {
                     Ok(prefill) => prefill,
                     Err(error) => {
@@ -4862,6 +4827,7 @@ where
                         return Err(error);
                     }
                 };
+                telemetry.record(&mut stats);
                 stats.target_tokens = prefill.evaluated_tokens;
                 let mut lifecycle = SpeculativeRequestLifecycle::new();
                 lifecycle
@@ -4974,6 +4940,7 @@ where
                     submission_to_first_token,
                 ))
             })();
+            let telemetry = executor.take_telemetry();
             let (
                 evaluated_tokens,
                 target_state,
@@ -4989,6 +4956,7 @@ where
                 }
             };
             stats.submission_to_first_token = Some(submission_to_first_token);
+            telemetry.record(&mut stats);
             stats.target_tokens = evaluated_tokens;
             stats.scheduler_turns = 1;
             stats.emitted_tokens = 1;
@@ -5192,6 +5160,10 @@ where
                 request.request_cancellation()?;
             }
             let changed = request.settle_requested_mode(executor, self.schedule.options(), context);
+            let telemetry = executor.take_telemetry();
+            if changed.is_ok() {
+                telemetry.record(&mut request.stats);
+            }
             match changed {
                 Ok(true) => {
                     self.stats.turns += 1;
@@ -5351,13 +5323,16 @@ where
             }
             Ok(true)
         })();
+        let telemetry = executor.take_telemetry();
         let result = crate::run_preparation::finish_preparation(
             stage,
             completed,
             |status| executor.agree_text_preparation(stage, status, context),
             SpeculativeDriverError::Preparation,
         );
-        if result.is_err() {
+        if result.is_ok() {
+            telemetry.record(&mut self.requests[index].stats);
+        } else {
             self.requests[index].decoding.finish();
         }
         result
@@ -5813,6 +5788,7 @@ mod tests {
 
     struct MockGenerationTypes;
     impl GenerationExecutorTypes for MockGenerationTypes {
+        type Binding = ();
         type Logits = Vec<f32>;
         type Context<'a> = ();
         type Completion = Done;
@@ -5823,7 +5799,7 @@ mod tests {
         }
     }
     impl GenerationExecutorCacheFactory<MockGenerationTypes> for MockExecutor {
-        fn new_cache<'a>(&mut self, _: ()) -> Result<Vec<u32>, Infallible>
+        fn new_cache<'a>(&mut self, _: &(), _: ()) -> Result<Vec<u32>, Infallible>
         where
             Self: 'a,
         {
@@ -7952,7 +7928,7 @@ mod tests {
         let cancellation = GenerationCancellationToken::new();
         cancellation.cancel();
         let mut runtime = mock_output_runtime(cancellation, Some(trace.clone()));
-        let (stats, ()) = cancel_pending_verification(
+        let stats = cancel_pending_verification(
             &mut executor,
             &mut cache,
             pending,

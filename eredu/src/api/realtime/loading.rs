@@ -20,7 +20,7 @@ pub struct SpeechSessionOptions {
     pub max_branch_bytes: u64,
     /// Cumulative copy budget shared by isolated descendants.
     pub max_total_copy_bytes: u64,
-    /// Initial neural random state; host phrase streams have their own explicit seeds.
+    /// Seed for the shared speech sampler. Phrase streams have separate seeds.
     pub seed: u64,
 }
 

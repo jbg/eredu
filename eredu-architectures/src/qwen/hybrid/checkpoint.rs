@@ -402,15 +402,6 @@ fn add_gguf_unit_transforms(
             );
         }
     }
-    let a_log = format!("{root}.linear_attn.A_log");
-    if store.source_metadata(&a_log).is_ok() {
-        recipes.insert(
-            a_log.clone(),
-            DerivedWeightRecipe::NegLog {
-                input: Box::new(DerivedWeightRecipe::source(a_log, TensorSelection::Full)),
-            },
-        );
-    }
     let shared_gate = format!("{root}.mlp.shared_expert_gate.weight");
     if let Ok(metadata) = store.source_metadata(&shared_gate) {
         if metadata.logical_shape.len() == 1 {
@@ -643,7 +634,7 @@ pub fn gguf_plan(config: &HybridConfig) -> Result<GgufCheckpointPlan, String> {
         let scope = super::BlockParameters::at(config, &root, policy).map_err(|e| e.to_string())?;
         if let super::specs::MixerParameters::Recurrent(spec) = &scope.mixer {
             convolutions.insert(spec.convolution.weight.id.as_str().to_owned());
-            dense_vectors.insert(spec.transition_log.id.as_str().to_owned());
+            dense_vectors.insert(spec.transition.id.as_str().to_owned());
             if config.variant == HybridVariant::Qwen3Next {
                 for projection in [
                     &spec.input_qkv,
@@ -1007,7 +998,7 @@ fn add_linear_attention(
     {
         if [
             &spec.decay_bias.id,
-            &spec.transition_log.id,
+            &spec.transition.id,
             &spec.normalization_weight.id,
         ]
         .contains(&&declaration.parameter.id)

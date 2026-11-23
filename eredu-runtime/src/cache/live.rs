@@ -449,7 +449,7 @@ mod acquisition;
 mod io;
 mod lifecycle;
 mod persistence;
-mod prompt_cache;
+pub(crate) mod prompt_cache;
 mod reporting;
 mod state;
 mod stream;

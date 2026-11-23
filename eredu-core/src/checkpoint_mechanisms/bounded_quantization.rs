@@ -18,6 +18,16 @@ pub struct QuantizationTileLimits {
     pub elements: NonZeroUsize,
 }
 
+impl QuantizationTileLimits {
+    /// Limits for encoders that index tile elements with signed 32-bit offsets.
+    pub const fn signed_indexed(slots: NonZeroUsize) -> Self {
+        Self {
+            slots,
+            elements: NonZeroUsize::new(i32::MAX as usize).unwrap(),
+        }
+    }
+}
+
 /// Native context for packing exact checkpoint recipe tiles.
 pub trait BoundedQuantizationBackend {
     /// Versioned identity of the encoder, platform, and execution device.

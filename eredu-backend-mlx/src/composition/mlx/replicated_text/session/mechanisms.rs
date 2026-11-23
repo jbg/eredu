@@ -5,14 +5,6 @@ use super::*;
 impl eredu_core::checkpoint_mechanisms::NativeTextWeights for MlxTextValues {
     type Parameters = MlxNeuralBackend;
 
-    fn observe_text_construction() {}
-
-    fn observe_text_binding(ranked: bool) {
-        let _ = ranked;
-    }
-
-    fn observe_text_state_allocation() {}
-
     fn text_output_row(
         output: MlxTensor,
         sequence_index: i32,
@@ -25,20 +17,12 @@ impl eredu_core::checkpoint_mechanisms::NativeTextWeights for MlxTextValues {
             .map_err(Into::into)
     }
 
-    fn text_parameter_memory() -> Result<Option<eredu_core::capability::ParameterMemoryFacts>, Error>
-    {
-        Ok(Some(eredu_core::capability::ParameterMemoryFacts {
-            native: crate::composition::mlx::capability::native_memory_facts(),
-            available: crate::composition::mlx::capability::available_memory()
-                .map_err(|error| Error::Other(Box::new(error)))?,
-            allocator_cache_limit: match crate::allocator_cache_policy() {
-                Ok(policy) => eredu_core::Observed::exact(
-                    policy.limit_bytes,
-                    "current MLX allocator-cache policy",
-                ),
-                Err(error) => eredu_core::Observed::unavailable(error.to_string()),
-            },
-        }))
+    fn text_parameter_memory(
+        queue: &Stream,
+    ) -> Result<Option<eredu_core::capability::ParameterMemoryFacts>, Error> {
+        crate::composition::mlx::capability::placement_memory(queue)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     fn complete_text_output(

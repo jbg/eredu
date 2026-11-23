@@ -139,6 +139,8 @@ pub(super) struct PatchEmbed<B: NeuralBackend + eredu_nn::DistributedNeuralBacke
     bias: Parameter<B::Tensor>,
     #[parameter(skip)]
     spec: FlattenedPatchSpec,
+    #[parameter(skip)]
+    split_temporal: bool,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
@@ -151,13 +153,45 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
             weight: Parameter::unloaded(spec.weight, &shape, context)?,
             bias: Parameter::unloaded(spec.bias, &[spec.geometry.output], context)?,
             spec: spec.geometry,
+            split_temporal: spec.split_temporal,
         })
     }
     fn forward(
         &self,
         input: &B::Tensor,
+        fp16: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        if self.split_temporal {
+            let channels = self.spec.channels;
+            let temporal = self.spec.temporal;
+            let area = self.spec.height * self.spec.width;
+            let width = channels * area;
+            let input = input.reshape(&[-1, channels, temporal, area], context)?;
+            let weight = self
+                .weight
+                .as_ref()
+                .reshape(&[self.spec.output, channels, temporal, area], context)?;
+            let project = |frame| {
+                let slice = [Index::Full, Index::Full, Index::At(frame), Index::Full];
+                let input = input
+                    .index(&slice, context)?
+                    .reshape(&[-1, width], context)?;
+                let weight = weight
+                    .index(&slice, context)?
+                    .reshape(&[self.spec.output, width], context)?;
+                if fp16 {
+                    B::Tensor::linear_f16_fused_accumulation(&input, &weight, context)
+                } else {
+                    B::Tensor::linear(&input, &weight, None, context)
+                }
+            };
+            let mut hidden = project(0)?;
+            for frame in 1..temporal {
+                hidden = hidden.add(&project(frame)?, context)?;
+            }
+            return hidden.add(self.bias.as_ref(), context);
+        }
         project_flattened_patches(
             input,
             self.weight.as_ref(),
@@ -173,6 +207,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
 pub(super) struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) qkv: B::Linear,
     pub(super) output: B::Linear,
+    rotary: B::Rotary,
     #[parameter(skip)]
     heads: i32,
     #[parameter(skip)]
@@ -193,6 +228,16 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         Ok(Self {
             qkv: B::linear(spec.qkv, context)?,
             output: B::linear(spec.output, context)?,
+            rotary: B::rotary(
+                eredu_nn::PreparedRotarySpec {
+                    arithmetic: eredu_nn::RotaryArithmetic::Native,
+                    dimensions: geometry.key_dimensions(),
+                    base: SPATIAL_ROTARY_BASE,
+                    traditional: false,
+                    algorithm: eredu_nn::PreparedRotaryAlgorithm::Standard { factor: 1.0 },
+                },
+                context,
+            )?,
             heads: geometry.query_heads(),
             head_dim: geometry.key_dimensions(),
             scale: (geometry.key_dimensions() as f32).sqrt().recip(),
@@ -231,8 +276,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
             )?
             .squeeze_axes(&[1], context)
         };
-        let query = apply_rotary(&select(0)?, cos, sin, context)?;
-        let key = apply_rotary(&select(1)?, cos, sin, context)?;
+        use eredu_nn::RotaryOperator;
+        let mut rotate = |value: &B::Tensor| {
+            let heads = value
+                .transpose_axes(&[1, 0, 2], context)?
+                .expand_dims(0, context)?;
+            self.rotary
+                .forward(
+                    &heads,
+                    eredu_nn::RotaryPosition::Embeddings {
+                        cosine: cos,
+                        sine: sin,
+                    },
+                    context,
+                )?
+                .squeeze_axes(&[0], context)?
+                .transpose_axes(&[1, 0, 2], context)
+        };
+        let query = rotate(&select(0)?)?;
+        let key = rotate(&select(1)?)?;
         let value = select(2)?;
         let attention = SegmentedAttentionInput {
             queries: &query,
@@ -370,7 +432,7 @@ pub(super) struct Merger<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
     #[parameter(skip)]
     postshuffle: bool,
     #[parameter(skip)]
-    approximate: bool,
+    activation: eredu_nn::UnaryActivation,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
@@ -384,7 +446,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
         let width = fc1.input;
         let unit = width / declaration.config().hidden_size;
         let postshuffle = index > 0;
-        let approximate = index == 0 && declaration.config().mode == VisionMode::WindowScheduled;
+        let activation = if declaration.config().fp16_gelu {
+            eredu_nn::UnaryActivation::GeluApproximateF16
+        } else if index == 0 && declaration.config().mode == VisionMode::WindowScheduled {
+            eredu_nn::UnaryActivation::GeluApproximate
+        } else {
+            eredu_nn::UnaryActivation::Gelu
+        };
         Ok(Self {
             norm: eredu_nn::LayerNorm::new(normalization.clone(), context)?,
             fc1: B::linear(fc1, context)?,
@@ -392,7 +460,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
             unit,
             width,
             postshuffle,
-            approximate,
+            activation,
         })
     }
     fn forward_impl(
@@ -415,11 +483,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
                 .reshape(&[-1, self.width], context)?
         };
         let hidden = self.fc1.forward(&hidden, context)?;
-        let hidden = if self.approximate {
-            B::gelu_approximate(hidden, context)?
-        } else {
-            B::Tensor::gelu(&hidden, context)?
-        };
+        let hidden = self.activation.apply::<B>(hidden, context)?;
 
         match parallel {
             Some(parallel) => B::row_parallel_linear(&mut self.fc2, &hidden, parallel, context),
@@ -589,6 +653,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         input: VisionInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        self.begin_with_fp16_patch_ranges(input, &[], context)
+    }
+
+    pub(in crate::qwen) fn begin_with_fp16_patch_ranges(
+        &mut self,
+        input: VisionInput<'_, B::Tensor>,
+        fp16_ranges: &[std::ops::Range<i32>],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
         validate_patch_grid(
             input.grid,
             self.config.spatial_merge_size,
@@ -603,8 +676,44 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             .patch
             .as_mut()
             .ok_or_else(|| Error::backend("vision ingress does not own patch parameters"))?;
-        let mut hidden = patch.forward(input.pixels, context)?;
+        let mut hidden = if fp16_ranges.is_empty() {
+            patch.forward(input.pixels, false, context)?
+        } else {
+            let mut chunks = Vec::new();
+            let mut previous = 0;
+            let end = input.pixels.dim(0);
+            for range in fp16_ranges {
+                if range.start < previous || range.end <= range.start || range.end > end {
+                    return Err(Error::backend("invalid FP16 vision patch span"));
+                }
+                if previous < range.start {
+                    let span = input
+                        .pixels
+                        .index(&[Index::Range(previous, range.start)], context)?;
+                    chunks.push(patch.forward(&span, false, context)?);
+                }
+                let span = input
+                    .pixels
+                    .index(&[Index::Range(range.start, range.end)], context)?;
+                chunks.push(patch.forward(&span, true, context)?);
+                previous = range.end;
+            }
+            if previous < end {
+                let span = input
+                    .pixels
+                    .index(&[Index::Range(previous, end)], context)?;
+                chunks.push(patch.forward(&span, false, context)?);
+            }
+            if chunks.len() == 1 {
+                chunks.pop().expect("one projected span")
+            } else {
+                B::Tensor::concatenate(&chunks, 0, context)?
+            }
+        };
         let positions = match self.config.mode {
+            VisionMode::DeepStack if self.config.antialias_positions => {
+                antialiased_positions::<B>(position, input.grid, &self.config, context)?
+            }
             VisionMode::DeepStack => interpolated_positions::<B>(
                 position,
                 input.grid,
@@ -867,6 +976,45 @@ fn gathered_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     )
 }
 
+fn antialiased_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+    embedding: &mut B::Embedding,
+    grids: &[(i32, i32, i32)],
+    config: &VisionConfig,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<B::Tensor, Error> {
+    let count = config.num_position_embeddings;
+    let side = (count as f64).sqrt() as i32;
+    if side * side != count {
+        return Err(Error::backend("vision position table is not square"));
+    }
+    let ids = B::Tensor::from_i32_slice(&(0..count).collect::<Vec<_>>(), &[count], context)?;
+    let table = embedding.forward(&ids, context)?;
+    let channels = table.dim(1);
+    let mut outputs = Vec::with_capacity(grids.len());
+    for &(time, height, width) in grids {
+        let resized = if height == side && width == side {
+            table.clone()
+        } else {
+            let table = table.cast_float(eredu_nn::TensorElementType::F32, context)?;
+            table
+                .reshape(&[side, side, channels], context)?
+                .resize_bilinear_antialiased(height, width, context)?
+                .reshape(&[-1, channels], context)?
+        };
+        let order = patch_positions(
+            &[(time, height, width)],
+            PatchTraversal::MergeMajor(config.spatial_merge_size),
+        )
+        .map_err(Error::backend)?
+        .into_iter()
+        .map(|[_, y, x]| y * width + x)
+        .collect::<Vec<_>>();
+        let ids = B::Tensor::from_i32_slice(&order, &[order.len() as i32], context)?;
+        outputs.push(resized.take_axis(&ids, 0, context)?);
+    }
+    B::Tensor::concatenate(&outputs, 0, context)
+}
+
 fn interpolated_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     embedding: &mut B::Embedding,
     grid: &[(i32, i32, i32)],
@@ -928,6 +1076,8 @@ fn rotary_embeddings<T: Tensor>(
     multi_axis_rotary_embeddings(&ids, &spec, context)
 }
 
+const SPATIAL_ROTARY_BASE: f32 = 10_000.0;
+
 impl VisionConfig {
     /// Exact spatial rotary policy shared by execution and resource descriptions.
     pub fn rotary_spec(&self) -> Result<MultiAxisRotarySpec, Error> {
@@ -944,7 +1094,7 @@ impl VisionConfig {
                     position_offset: 0,
                 },
             ],
-            base: 10_000.0,
+            base: SPATIAL_ROTARY_BASE,
             minimum_position: 0,
             layout: MultiAxisRotaryLayout::SplitHalves,
         };
@@ -955,25 +1105,4 @@ impl VisionConfig {
         }
         Ok(spec)
     }
-}
-
-fn apply_rotary<T: Tensor>(
-    value: &T,
-    cosine: &T,
-    sine: &T,
-    context: &T::Context,
-) -> Result<T, Error> {
-    let half = value.dim(2) / 2;
-    let first = value.index(&[Index::Full, Index::Full, Index::Range(0, half)], context)?;
-    let second = value.index(
-        &[Index::Full, Index::Full, Index::Range(half, value.dim(2))],
-        context,
-    )?;
-    let rotated = T::concatenate(&[second.multiply_scalar(-1.0, context)?, first], 2, context)?;
-    value
-        .multiply(&cosine.expand_dims(1, context)?, context)?
-        .add(
-            &rotated.multiply(&sine.expand_dims(1, context)?, context)?,
-            context,
-        )
 }

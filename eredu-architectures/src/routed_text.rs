@@ -530,6 +530,25 @@ where
     )
 }
 
+fn qwen_routed_args(
+    architecture: &crate::processor_plan::ArtifactArchitecturePlan,
+) -> Option<&crate::qwen::ModelArgs> {
+    match (
+        architecture.safetensors_architecture(),
+        architecture.gguf_plan(),
+    ) {
+        (Some(plan), None) => match plan.model() {
+            crate::configuration::SafetensorsModelConfig::Qwen(args) if args.is_moe() => Some(args),
+            _ => None,
+        },
+        (None, Some(plan)) => match plan.model() {
+            crate::configuration::GgufModelConfig::Qwen(args) if args.is_moe() => Some(args),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn prepare_qwen_routed_text_architecture<B, S>(
     inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
     selected: SelectedRoutedTextRealization,
@@ -540,7 +559,7 @@ fn prepare_qwen_routed_text_architecture<B, S>(
     RoutedTextPreparationError,
 >
 where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    B: eredu_nn::GroupedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>,
 {
@@ -555,20 +574,8 @@ where
         eredu_runtime::SourceHandoffScope::Primary,
     )
     .map_err(|handoff| RoutedTextPreparationError::Invalid(handoff.to_string()))?;
-    let args = match (
-        inspection.architecture_plan().safetensors_architecture(),
-        inspection.architecture_plan().gguf_plan(),
-    ) {
-        (Some(plan), None) => match plan.model() {
-            crate::configuration::SafetensorsModelConfig::Qwen(args) if args.is_moe() => args,
-            _ => return Err(RoutedTextPreparationError::Ineligible),
-        },
-        (None, Some(plan)) => match plan.model() {
-            crate::configuration::GgufModelConfig::Qwen(args) if args.is_moe() => args,
-            _ => return Err(RoutedTextPreparationError::Ineligible),
-        },
-        _ => return Err(RoutedTextPreparationError::Ineligible),
-    };
+    let args = qwen_routed_args(inspection.architecture_plan())
+        .ok_or(RoutedTextPreparationError::Ineligible)?;
     let (text, bank_residency, banks, rows) = selected.into_parts();
     let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
@@ -1442,7 +1449,7 @@ pub fn visit_relu2_routed_text_architecture<B, S, V>(
     selected: SelectedRoutedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -1453,7 +1460,6 @@ where
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
-    visitor.construction_started();
     let prepared = prepare_nemotron_h_routed_text_architecture::<B, S>(
         inspection,
         selected,
@@ -1581,8 +1587,7 @@ where
         }
         (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(_)), None)
         | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(_))) => {
-            let mut visitor = dispatcher.into_gated_visitor();
-            visitor.construction_started();
+            let visitor = dispatcher.into_gated_visitor();
             let prepared = prepare_qwen_hybrid_routed_text_architecture::<B, D::GatedState>(
                 inspection,
                 selected,
@@ -1594,8 +1599,7 @@ where
         }
         (Some(crate::configuration::SafetensorsModelConfig::NemotronH(_)), None)
         | (None, Some(crate::configuration::GgufModelConfig::NemotronH(_))) => {
-            let mut visitor = dispatcher.into_gated_visitor();
-            visitor.construction_started();
+            let visitor = dispatcher.into_gated_visitor();
             let prepared = prepare_nemotron_h_routed_text_architecture::<B, D::GatedState>(
                 inspection,
                 selected,
@@ -1618,7 +1622,7 @@ pub fn visit_gated_routed_prediction_target_architecture<B, S, M, V>(
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -1634,7 +1638,6 @@ where
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: RoutedPredictionTargetVisitor<B, S, M, SelectedRoutedBank>,
 {
-    visitor.construction_started();
     let prepared = prepare_deepseek_v3_routed_text_architecture::<B, S>(
         inspection,
         selected,
@@ -1652,7 +1655,7 @@ pub fn visit_pooling_routed_prediction_target_architecture<B, S, M, V>(
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -1666,7 +1669,6 @@ where
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: RoutedPredictionTargetVisitor<B, S, M, SelectedRoutedBank>,
 {
-    visitor.construction_started();
     let prepared = prepare_deepseek_v4_routed_text_architecture::<B, S>(
         inspection,
         selected,
@@ -1740,7 +1742,7 @@ pub fn visit_pooling_routed_text_architecture<B, S, V>(
     selected: SelectedRoutedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -1752,7 +1754,6 @@ where
     S::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
     V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
-    visitor.construction_started();
     let prepared = prepare_deepseek_v4_routed_text_architecture::<B, S>(
         inspection,
         selected,
@@ -1769,7 +1770,7 @@ pub fn visit_routed_text_architecture<B, S, V>(
     selected: SelectedRoutedTextRealization,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, RoutedTextDispatchError<V::Error>>
 where
     B: eredu_core::SubmissionBackend<
@@ -1784,7 +1785,6 @@ where
         + eredu_nn::CompressedAttentionCache<B::Tensor>,
     V: RoutedTextArchitectureVisitor<B, S, SelectedRoutedBank>,
 {
-    visitor.construction_started();
     if diffusion_args(inspection).is_some() {
         let prepared = prepare_diffusion_text_architecture::<B, S>(
             inspection,
@@ -4276,7 +4276,7 @@ where
     /// Constructs complete unweighted outputs in original route-slot order.
     fn execute_uncombined<Bank>(
         _bank: &mut Bank,
-        _acquisition: &Bank::Acquisition,
+        _acquisition: &mut Bank::Acquisition,
         _spec: &Self::Spec,
         _input: &B::Tensor,
         _routes: &GroupSelection<B::Tensor>,
@@ -4295,7 +4295,7 @@ where
     /// Constructs and executes the exact grouped equation over acquired storage.
     fn execute<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4315,7 +4315,7 @@ where
     /// Constructs unweighted rank-local expert outputs and replicated bias.
     fn execute_uncombined_tensor_parallel<Bank>(
         _bank: &mut Bank,
-        _acquisition: &Bank::Acquisition,
+        _acquisition: &mut Bank::Acquisition,
         _spec: &Self::Spec,
         _input: &B::Tensor,
         _routes: &GroupSelection<B::Tensor>,
@@ -4335,7 +4335,7 @@ where
     /// Constructs and executes one acquired rank-local grouped partial.
     fn execute_tensor_parallel<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4371,7 +4371,7 @@ where
 {
     fn execute_uncombined<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4389,7 +4389,7 @@ where
 
     fn execute<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4415,7 +4415,7 @@ where
 {
     fn execute_uncombined_tensor_parallel<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4442,7 +4442,7 @@ where
 
     fn execute_tensor_parallel<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4492,7 +4492,7 @@ where
 {
     fn execute<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4518,7 +4518,7 @@ where
 {
     fn execute_tensor_parallel<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,
@@ -4891,7 +4891,7 @@ where
         output_kind: GroupedOutputKind,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, RoutedTextExecutionError> {
-        let (acquisition, compact_spec, compact_routes) =
+        let (mut acquisition, compact_spec, compact_routes) =
             self.acquire_chunk(spec, owner_unit, routes, access, context)?;
         let output = eredu_runtime::with_provider_unit_observer(
             unit_observer,
@@ -4906,7 +4906,7 @@ where
                 };
                 execute(
                     &mut self.bank,
-                    &acquisition,
+                    &mut acquisition,
                     &compact_spec,
                     input,
                     &compact_routes,
@@ -4917,7 +4917,7 @@ where
         )
         .map_err(RoutedTextExecutionError::from_error)?;
         self.bank
-            .complete(acquisition, &output, context)
+            .complete(acquisition, &output)
             .map_err(RoutedTextExecutionError::from_error)?;
         Ok(output)
     }
@@ -5185,7 +5185,7 @@ where
         output_kind: GroupedOutputKind,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_nn::TensorParallelGroupedOutput<B::Tensor>, RoutedTextExecutionError> {
-        let (acquisition, compact_spec, compact_routes) =
+        let (mut acquisition, compact_spec, compact_routes) =
             self.acquire_chunk(spec, owner_unit, routes, access, context)?;
         let output = eredu_runtime::with_provider_unit_observer(
             unit_observer,
@@ -5202,7 +5202,7 @@ where
                 };
                 execute(
                     &mut self.bank,
-                    &acquisition,
+                    &mut acquisition,
                     &compact_spec,
                     input,
                     &compact_routes,
@@ -5214,7 +5214,7 @@ where
         )
         .map_err(RoutedTextExecutionError::from_error)?;
         self.bank
-            .complete(acquisition, output.reducible(), context)
+            .complete(acquisition, output.reducible())
             .map_err(RoutedTextExecutionError::from_error)?;
         Ok(output)
     }
@@ -5906,7 +5906,7 @@ impl RoutedGroupedOperationValidation for LinearOperation {
 impl<B: GroupedNeuralBackend> RoutedGroupedOperation<B> for LinearOperation {
     fn execute<Bank>(
         bank: &mut Bank,
-        acquisition: &Bank::Acquisition,
+        acquisition: &mut Bank::Acquisition,
         spec: &Self::Spec,
         input: &B::Tensor,
         routes: &GroupSelection<B::Tensor>,

@@ -15,15 +15,7 @@ pub struct SamplingGrowthCosts {
 }
 
 /// Storage facts and value copies for an already admitted execution scope.
-pub trait TextSnapshotNative: TextGenerationBackend + SeededRandomKey {
-    /// Native causal score row.
-    type CausalScores;
-    /// Native token block.
-    type RefinementTokens;
-    /// Native position scores.
-    type RefinementScores;
-    /// Native boolean position mask.
-    type RefinementMask;
+pub trait TextSnapshotNative: TextGenerationBackend {
     /// Reports physical facts for an owned prompt tensor.
     fn prompt_tensor_identity(tensor: &Self::InputTensor) -> Option<crate::InputTensorIdentity>;
 
@@ -48,6 +40,18 @@ pub trait TextSnapshotNative: TextGenerationBackend + SeededRandomKey {
     ) -> Result<(), Self::Error>
     where
         Self::InputTensor: 'a;
+}
+
+/// Mode-specific storage for advanced continuations.
+pub trait TextModeSnapshotNative: TextSnapshotNative + SeededRandomKey {
+    /// Native causal score row.
+    type CausalScores;
+    /// Native token block.
+    type RefinementTokens;
+    /// Native position scores.
+    type RefinementScores;
+    /// Native boolean position mask.
+    type RefinementMask;
 
     /// Reports native allocation bounds and retained sampler geometry for continuation growth.
     fn sampling_growth_costs() -> SamplingGrowthCosts;
@@ -68,8 +72,6 @@ pub trait TextSnapshotNative: TextGenerationBackend + SeededRandomKey {
     fn refinement_score_bytes(value: &Self::RefinementScores) -> Option<u64>;
     /// Native storage bound for a position mask.
     fn refinement_mask_bytes(value: &Self::RefinementMask) -> Option<u64>;
-    /// Native storage bound for an immutable proposal key.
-    fn proposal_random_bytes(random: &Self::Key) -> Option<u64>;
     /// Deep copies one independent random key.
     fn copy_random(backend: &Self, random: &Self::Key) -> Result<Self::Key, Self::Error>;
     /// Deep copies one retained next-token score tensor.

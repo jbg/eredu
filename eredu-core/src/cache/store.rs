@@ -70,11 +70,24 @@ pub enum PromptCacheStoreError {
         /// Configured store limit.
         limit: u64,
     },
+    /// Cancellation prevented a staged publication from committing.
+    #[error("prompt-cache publication cancelled")]
+    Cancelled,
     /// Storage implementation failure, retaining its original error source.
     #[error("prompt cache store: {0}")]
     Storage(#[source] crate::BackendFailure),
 }
 impl PromptCacheStoreError {
+    /// Finds a declined publication through neutral adapter errors.
+    pub fn publication_declined(error: &(dyn std::error::Error + 'static)) -> bool {
+        std::iter::successors(Some(error), |error| error.source()).any(|error| {
+            matches!(
+                error.downcast_ref::<Self>(),
+                Some(Self::Budget { .. } | Self::Cancelled)
+            )
+        })
+    }
+
     /// Preserves an implementation error behind the neutral backend failure type.
     pub fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Storage(crate::BackendFailure::from_error(error))

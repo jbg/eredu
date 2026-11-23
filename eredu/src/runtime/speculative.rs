@@ -165,3 +165,58 @@ where
     }
     .map_err(SpeculativeBatchExecutionError::Backend)
 }
+
+use eredu_core::BackendFailure;
+use eredu_runtime::speculative::autoregressive::{
+    execute_local_causal_batch, execute_local_embedded_batch, execute_local_shared_batch,
+    LocalCausalBackend, LocalCausalDraft, LocalCausalSession,
+};
+use eredu_runtime::text_session_driver::TextPromptFor;
+
+impl<B> SpeculativeBatchBackend<LocalCausalSession<B>> for B
+where
+    B: LocalCausalBackend,
+{
+    fn execute_resident_batch<C, V>(
+        runtime: &mut ModelRuntime<B, LocalCausalSession<B>>,
+        route: ResidentBatchRoute,
+        lanes: Vec<SpeculativeGenerationLane<'_, TextPromptFor<B>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, BackendFailure>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        match route {
+            ResidentBatchRoute::Target => execute_local_causal_batch(runtime, None, lanes, visitor),
+            ResidentBatchRoute::SharedBackbone => {
+                execute_local_shared_batch(runtime, lanes, visitor)
+            }
+        }
+    }
+
+    fn execute_external_batch<C, V>(
+        runtime: &mut ModelRuntime<B, LocalCausalSession<B>>,
+        draft: &mut LocalCausalDraft<B>,
+        lanes: Vec<SpeculativeGenerationLane<'_, TextPromptFor<B>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, BackendFailure>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        execute_local_causal_batch(runtime, Some(draft), lanes, visitor)
+    }
+
+    fn execute_embedded_batch<C, V>(
+        runtime: &mut ModelRuntime<B, LocalCausalSession<B>>,
+        lanes: Vec<SpeculativeGenerationLane<'_, TextPromptFor<B>, C>>,
+        visitor: V,
+    ) -> Result<SpeculativeGenerationBatchOutput, BackendFailure>
+    where
+        C: SpeculativeTokenFilterController + 'static,
+        V: SpeculativeGenerationVisitor,
+    {
+        execute_local_embedded_batch(runtime, lanes, visitor)
+    }
+}

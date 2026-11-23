@@ -9,11 +9,14 @@ pub struct MlxAutoregressiveMechanisms;
 
 impl InstalledSpeculationOperators for MlxAutoregressiveMechanisms {
     type Text = crate::composition::mlx::replicated_text::MlxTextValues;
-    type Memory = crate::composition::mlx::capability::MlxAllocatorObservations;
+    fn placement_memory(
+        queue: &safemlx::Stream,
+    ) -> Result<eredu_core::capability::ParameterMemoryFacts, eredu_core::BackendFailure> {
+        crate::composition::mlx::capability::placement_memory(queue)
+    }
     type Capture = MlxSpeculativeCaptureMechanisms;
     type Refinement = MlxSamplingBackend;
     type Completion = MlxSpeculativeCompletion;
-    type Telemetry = scheduler::SpeculativeComponentTimings;
     type Error = Exception;
 
     fn causal_tokens(tokens: &[u32]) -> Result<Array, Exception> {

@@ -189,6 +189,19 @@ impl<Tensor> PreparedModelInput<Tensor> {
         &self.parts
     }
 
+    /// Retains a contiguous subset of the prepared parts and their validated descriptors.
+    pub fn slice_parts(&self, parts: std::ops::Range<usize>) -> Option<Self>
+    where
+        Tensor: Clone,
+    {
+        let identity =
+            PreparedInputIdentity::new(self.identity.parts().get(parts.clone())?.to_vec()).ok()?;
+        Some(Self {
+            parts: self.parts.get(parts)?.to_vec(),
+            identity,
+        })
+    }
+
     /// Number of ordered parts.
     pub fn len(&self) -> usize {
         self.parts.len()

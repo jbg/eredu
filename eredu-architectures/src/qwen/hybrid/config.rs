@@ -141,6 +141,8 @@ pub struct HybridPolicy {
     pub linear_num_key_heads: i32,
     /// Value heads for recurrent layers.
     pub linear_num_value_heads: i32,
+    /// Arithmetic and transition representation of the recurrent mixer.
+    pub recurrent_arithmetic: crate::gated_delta::GatedDeltaArithmetic,
     /// Dense SwiGLU intermediate width.
     pub intermediate_size: i32,
     /// Routed-expert intermediate width.
@@ -494,6 +496,7 @@ impl HybridConfigSource {
             linear_value_head_dim: self.linear_value_head_dim,
             linear_num_key_heads: self.linear_num_key_heads,
             linear_num_value_heads: self.linear_num_value_heads,
+            recurrent_arithmetic: crate::gated_delta::GatedDeltaArithmetic::LogTransition,
             intermediate_size: self.intermediate_size,
             moe_intermediate_size: self.moe_intermediate_size,
             shared_expert_intermediate_size: self.shared_expert_intermediate_size,
@@ -818,6 +821,7 @@ pub fn model_args_from_gguf_catalog(
         linear_value_head_dim: gguf_i32(metadata, &key("ssm.state_size"))?,
         linear_num_key_heads: gguf_i32(metadata, &key("ssm.group_count"))?,
         linear_num_value_heads: gguf_i32(metadata, &key("ssm.time_step_rank"))?,
+        recurrent_arithmetic: crate::gated_delta::GatedDeltaArithmetic::NegativeTransition,
         intermediate_size: if is_moe {
             0
         } else {
@@ -1064,7 +1068,13 @@ pub fn prompt_cache_architecture_fingerprint(config: &HybridPolicy) -> String {
                 "linear_formats",
                 crate::cache_identity::debug_map(Some(&config.linear_formats)),
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            (config.recurrent_arithmetic
+                == crate::gated_delta::GatedDeltaArithmetic::NegativeTransition)
+                .then(|| ("recurrent_arithmetic", "negative_transition".into())),
+        ),
     )
 }
 

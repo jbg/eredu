@@ -77,7 +77,7 @@ pub trait ErasedExternalPredictionExecutable<M: TextExecutableTypes>: 'static {
     ) -> Result<M::Tensor, M::Error>;
 }
 
-pub(super) fn text_token_ids<M: TextExecutableTypes>(
+pub(crate) fn text_token_ids<M: TextExecutableTypes>(
     input: TextPromptView<'_, M::InputTensor>,
     context: &M::Context,
 ) -> Result<Vec<u32>, M::Error> {
@@ -125,9 +125,7 @@ pub trait ErasedTextExecutable<M: TextExecutableTypes>:
     AttentionState = M::PredictionState,
 >
 {
-    fn realized_session_capabilities(&self) -> eredu_core::SessionCapabilities {
-        eredu_core::SessionCapabilities::new(true, true, true)
-    }
+    fn realized_session_capabilities(&self) -> eredu_core::SessionCapabilities;
 
     fn forecast_state_offset(&self) -> Result<Option<i32>, M::StateError> {
         Ok(None)

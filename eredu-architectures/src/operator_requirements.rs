@@ -9,8 +9,13 @@ pub const KIMI_LINEAR: C = C::SIGMOID
     .union(C::RMS_NORM_WITHOUT_WEIGHT)
     .union(C::GATED_DELTA_SCAN);
 
-/// Qwen3-Next and Qwen3.5 hybrid execution requirements.
+/// Qwen hybrid execution requirements for log-transition arithmetic.
 pub const QWEN_HYBRID: C = crate::gated_delta::REQUIRED_OPERATORS;
+
+/// Qwen hybrid execution requirements for the selected arithmetic.
+pub const fn qwen_hybrid(config: &crate::qwen::hybrid::HybridPolicy) -> C {
+    config.recurrent_arithmetic.required_operators()
+}
 
 /// Nemotron-H Mamba execution requirements.
 pub const NEMOTRON_H: C = C::GATED_GROUP_RMS_NORM
@@ -66,8 +71,43 @@ pub const GEMMA4: C = C::SIGMOID
     .union(C::CLIP)
     .union(C::SOFTMAX_AXIS)
     .union(C::CONV2D)
+    .union(C::CAST_FLOAT)
     .union(C::MULTI_AXIS_ROTARY_EMBEDDINGS)
-    .union(C::MASKED_OUTPUT_PROJECTION);
+    .union(C::EQUAL_I32)
+    .union(C::WHERE_CONDITION);
+
+/// Gemma 4 operators including the configured decoder activations.
+pub fn gemma4(args: &crate::gemma4::ModelArgs) -> C {
+    let mut requirements = GEMMA4.union(
+        args.dense_gated_product()
+            .activation()
+            .required_operator_capabilities(),
+    );
+    if args.num_experts.is_some() {
+        requirements = requirements.union(
+            args.approximate_gelu_policy()
+                .activation()
+                .required_operator_capabilities(),
+        );
+    }
+    requirements
+}
+
+/// Gemma 4 operators including the configured vision activation.
+pub fn gemma4_family(args: &crate::gemma4::FamilyConfig) -> C {
+    let mut requirements = gemma4(&args.text);
+    if let Some(vision) = &args.vision {
+        requirements = requirements.union(if vision.published_gguf {
+            C::GELU_APPROXIMATE_F16
+        } else {
+            C::GELU_APPROXIMATE
+        });
+    }
+    if let Some(audio) = &args.audio {
+        requirements = requirements.union(audio.arithmetic_capabilities());
+    }
+    requirements
+}
 
 /// Shared Muse text and media execution requirements.
 pub const MUSE: C = C::SIGMOID

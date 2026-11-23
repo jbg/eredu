@@ -50,6 +50,10 @@ pub struct ModelArgs {
     pub rope_theta: f32,
     /// Whether RoPE rotates adjacent pairs.
     pub rope_traditional: bool,
+    /// Arithmetic used for the rotary angles and products.
+    pub rotary_arithmetic: eredu_nn::RotaryArithmetic,
+    /// Precision at the attention score and probability boundaries.
+    pub attention_arithmetic: eredu_nn::AttentionArithmetic,
     /// Per-head attention width.
     pub head_dim: i32,
     /// Whether output projection shares the embedding table.
@@ -73,6 +77,10 @@ pub struct ModelArgs {
 #[derive(Debug, Clone, Deserialize)]
 struct ModelArgsSource {
     model_type: String,
+    #[serde(default)]
+    dtype: Option<String>,
+    #[serde(default)]
+    torch_dtype: Option<String>,
     #[serde(default)]
     hidden_act: Option<String>,
     #[serde(default)]
@@ -198,6 +206,13 @@ impl Config for ModelArgs {
     fn rms_norm_epsilon(&self) -> f32 {
         self.rms_norm_eps
     }
+    fn normalization_reduction(&self) -> eredu_nn::NormalizationReduction {
+        if self.attention_arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+            eredu_nn::NormalizationReduction::EightLaneInputPrecision
+        } else {
+            eredu_nn::NormalizationReduction::Native
+        }
+    }
     fn vocabulary_size(&self) -> i32 {
         self.vocab_size
     }
@@ -232,9 +247,12 @@ impl Config for ModelArgs {
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization> {
         self.weight_quantization_for(name)
     }
+    fn attention_arithmetic(&self) -> eredu_nn::AttentionArithmetic {
+        self.attention_arithmetic
+    }
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
-            arithmetic: eredu_nn::RotaryArithmetic::Native,
+            arithmetic: self.rotary_arithmetic,
             dimensions,
             base: self.rope_theta,
             traditional: self.rope_traditional,
@@ -341,6 +359,15 @@ pub fn model_args_from_gguf_catalog(
         num_key_value_heads,
         max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
         rope_theta,
+        rotary_arithmetic: if matches!(
+            crate::rotary::normalize_algorithm(rope_scaling.as_ref()),
+            Ok(eredu_nn::RotaryAlgorithm::Default | eredu_nn::RotaryAlgorithm::Linear { .. })
+        ) {
+            eredu_nn::RotaryArithmetic::RecurrentFloat32
+        } else {
+            eredu_nn::RotaryArithmetic::Native
+        },
+        attention_arithmetic: eredu_nn::AttentionArithmetic::Float32,
         // Phi GGUF retains the HF half-head rotary layout in its fused QKV.
         rope_traditional: architecture != "phi3",
         head_dim,
@@ -496,6 +523,10 @@ fn normalize_model_args(mut source: ModelArgsSource) -> Result<ModelArgs, Config
         (Some(value), _) | (_, Some(value)) => Some(value),
         (None, None) => None,
     };
+    let bf16 = matches!(
+        source.dtype.as_deref().or(source.torch_dtype.as_deref()),
+        Some("bfloat16")
+    );
     let args = ModelArgs {
         model_type: source.model_type,
         hidden_size: source.hidden_size,
@@ -507,6 +538,16 @@ fn normalize_model_args(mut source: ModelArgsSource) -> Result<ModelArgs, Config
         num_key_value_heads: source.num_key_value_heads,
         max_position_embeddings: source.max_position_embeddings,
         rope_theta: source.rope_theta,
+        rotary_arithmetic: if bf16 {
+            eredu_nn::RotaryArithmetic::InputProducts
+        } else {
+            eredu_nn::RotaryArithmetic::Native
+        },
+        attention_arithmetic: if bf16 {
+            eredu_nn::AttentionArithmetic::InputScores
+        } else {
+            eredu_nn::AttentionArithmetic::Fused
+        },
         rope_traditional: source.rope_traditional,
         head_dim: source.head_dim,
         tie_word_embeddings: source.tie_word_embeddings,
@@ -640,10 +681,16 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
         })
         .unwrap_or_default();
     quantized_weight_configs.sort_unstable();
+    let reduction = args.normalization_reduction();
     derive_prompt_cache_architecture_fingerprint(
         "llama",
         [
             ("model_type", args.model_type.clone()),
+            ("rotary_arithmetic", format!("{:?}", args.rotary_arithmetic)),
+            (
+                "attention_arithmetic",
+                format!("{:?}", args.attention_arithmetic),
+            ),
             ("hidden_size", args.hidden_size.to_string()),
             ("num_hidden_layers", args.num_hidden_layers.to_string()),
             ("intermediate_size", args.intermediate_size.to_string()),
@@ -675,7 +722,12 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
                 "quantized_weight_configs",
                 quantized_weight_configs.join(";"),
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            (reduction != eredu_nn::NormalizationReduction::Native)
+                .then(|| ("normalization_reduction", format!("{reduction:?}"))),
+        ),
     )
 }
 

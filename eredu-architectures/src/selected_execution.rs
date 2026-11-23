@@ -777,7 +777,7 @@ impl SelectedExecution {
         (bank_targets, excluded)
     }
 
-    fn routed_realization(&self) -> Option<&SelectedRoutedTextRealization> {
+    pub(crate) fn routed_realization(&self) -> Option<&SelectedRoutedTextRealization> {
         match self.kind.as_ref() {
             SelectedExecutionKind::Routed(selected) => Some(selected),
             SelectedExecutionKind::PartitionedRouted(selected) => Some(selected.base()),

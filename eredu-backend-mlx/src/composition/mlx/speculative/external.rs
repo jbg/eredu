@@ -3,7 +3,7 @@
 use super::{assistant::MlxAssistantBinder, MlxSpeculativeCompletion};
 use crate::{
     backend::{nn::shared::MlxNeuralBackend, runtime::cache::MlxCacheBackend},
-    composition::mlx::{capability::MlxAllocatorObservations, replicated_text::MlxTextValues},
+    composition::mlx::replicated_text::MlxTextValues,
     MlxTensor,
 };
 use eredu_core::speculative::assistant::ExternalAssistantOperators;
@@ -22,13 +22,16 @@ impl ExternalAssistantOperators for MlxExternalAssistantMechanisms {
         crate::composition::mlx::session::bounded_capture::MlxSpeculativeCaptureMechanisms;
     type NeuralBackend = MlxNeuralBackend;
     type Binder = MlxAssistantBinder;
-    type Memory = MlxAllocatorObservations;
+    fn placement_memory(
+        queue: &safemlx::Stream,
+    ) -> Result<eredu_core::capability::ParameterMemoryFacts, eredu_core::BackendFailure> {
+        crate::composition::mlx::capability::placement_memory(queue)
+    }
     type Cache = MlxCacheBackend;
     type Text = MlxTextValues;
     type Tensor = MlxTensor;
     type Logits = Array;
     type Completion = MlxSpeculativeCompletion;
-    type Telemetry = super::scheduler::SpeculativeComponentTimings;
     type Error = Exception;
 
     fn target_input(tokens: &MlxTensor) -> Array {
@@ -81,8 +84,7 @@ impl ExternalAssistantOperators for MlxExternalAssistantMechanisms {
             .checked_add(4096)
     }
     fn sequence_len(value: &Self::Tensor) -> Result<usize, Self::Error> {
-        usize::try_from(value.as_array().dim(1))
-            .map_err(|_| Exception::custom("external assistant sequence length exceeds usize"))
+        eredu_nn::sequence::length(value).map_err(Exception::from_source)
     }
 
     fn sequence_row(
@@ -91,16 +93,8 @@ impl ExternalAssistantOperators for MlxExternalAssistantMechanisms {
         retain_dimension: bool,
         stream: &Stream,
     ) -> Result<Self::Tensor, Self::Error> {
-        let row = i32::try_from(row)
-            .map_err(|_| Exception::custom("external assistant row exceeds i32"))?;
-        let array = if retain_dimension {
-            value
-                .as_array()
-                .try_index_device((.., row..row + 1, ..), stream)?
-        } else {
-            value.as_array().try_index_device((.., row, ..), stream)?
-        };
-        Ok(MlxTensor::from_array(array))
+        eredu_nn::sequence::row(value, row, retain_dimension, stream)
+            .map_err(Exception::from_source)
     }
 
     fn into_logits(value: Self::Tensor) -> Self::Logits {
@@ -140,29 +134,29 @@ impl ExternalAssistantOperators for MlxExternalAssistantMechanisms {
         end: usize,
         stream: &Stream,
     ) -> Result<Self::Tensor, Self::Error> {
-        let end = i32::try_from(end)
-            .map_err(|_| Exception::custom("external assistant prefix exceeds i32"))?;
-        value
-            .as_array()
-            .try_index_device((.., ..end), stream)
-            .map(MlxTensor::from_array)
+        eredu_nn::sequence::span(value, 0..end, stream).map_err(Exception::from_source)
     }
 
     fn target_tokens(
         tokens: &[u32],
-        destination: Option<&Stream>,
+        destination: &Stream,
+        crosses_devices: bool,
     ) -> Result<Self::Tensor, Self::Error> {
         let width = i32::try_from(tokens.len())
             .map_err(|_| Exception::custom("external assistant token count exceeds i32"))?;
         let mut value = Array::from_slice(tokens, &[1, width]);
-        if let Some(stream) = destination {
-            value = value.copy(stream)?;
+        if crosses_devices {
+            value = value.copy(destination)?;
         }
         Ok(MlxTensor::from_array(value))
     }
 
     fn tensor_root(value: &MlxTensor) -> &Array {
         value.as_array()
+    }
+
+    fn can_share_tensor(_: &MlxTensor, _: &Stream) -> bool {
+        true
     }
 
     fn copy_tensor(value: &MlxTensor, destination: &Stream) -> Result<MlxTensor, Exception> {

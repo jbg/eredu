@@ -42,6 +42,9 @@ pub trait TextInvocationMechanisms: TextTensorMechanisms {
 
     /// Clones a prepared decode handle for composite ingress.
     fn decode_prompt_tokens(tokens: &Self::Decode) -> Self::InputTensor;
+
+    /// Reads decoder token IDs for exact persisted-prefix provenance.
+    fn decoder_token_ids(value: &Self::Tensor) -> Result<Vec<u32>, Self::Error>;
 }
 
 /// Native queue and communication retained by a bound text session.
@@ -339,6 +342,12 @@ where
         stream: &M::Context,
     ) -> Result<M::Scores, M::Error> {
         let tokens = text_tokens::<M>(input, stream).map_err(eredu_nn::Error::backend_source);
+        let committed = self.session.tracks_local_tokens().then(|| {
+            tokens
+                .as_ref()
+                .ok()
+                .and_then(|tokens| M::decoder_token_ids(tokens).ok())
+        });
         let output = self
             .execute_text(
                 ReplicatedTextInvocation::FinalPositionPrefill(tokens),
@@ -346,6 +355,9 @@ where
                 &mut crate::NoopObserver,
             )
             .map_err(session_failure::<M, _, _>)?;
+        if let Some(committed) = committed {
+            self.session.record_local_tokens(committed.as_deref());
+        }
         Ok(publish::<M>(output))
     }
 
@@ -474,7 +486,25 @@ where
         self.session.prompt_cache_model_identity()
     }
 
-    fn prompt_cache(&mut self) -> Option<TextPromptCache<'_, M::Context>> {
+    fn prompt_cache_prefix_identity(
+        &self,
+        prefix: &[u32],
+        input: Option<&crate::PreparedInputCacheIdentity>,
+    ) -> String {
+        if self.session.tracks_local_tokens() {
+            eredu_core::cache::prompt_cache_token_fingerprint(prefix)
+        } else {
+            input.map_or_else(
+                || eredu_core::cache::prompt_cache_token_fingerprint(prefix),
+                |identity| identity.prefix_content_fingerprint().to_owned(),
+            )
+        }
+    }
+
+    fn prompt_cache<'a>(
+        &'a mut self,
+        _: &'a M::Context,
+    ) -> Option<TextPromptCache<'a, M::Context>> {
         Some(
             self.session
                 .prompt_cache(self.native.context(), PromptCacheInput::Tokens),
@@ -504,6 +534,12 @@ where
         let tokens = input
             .and_then(|input| text_tokens::<M>(input, stream))
             .map_err(eredu_nn::Error::backend_source);
+        let committed = self.session.tracks_local_tokens().then(|| {
+            tokens
+                .as_ref()
+                .ok()
+                .and_then(|tokens| M::decoder_token_ids(tokens).ok())
+        });
         let mask = mask.map(invocation_tensor::<M>);
         let mut observer =
             crate::inspection::MappedActivationObserver::<_, M::TensorObserver>::new(observer);
@@ -518,6 +554,9 @@ where
                 &mut observer,
             )
             .map_err(session_failure::<M, _, _>)?;
+        if let Some(committed) = committed {
+            self.session.record_local_tokens(committed.as_deref());
+        }
         Ok(publish::<M>(output))
     }
 
@@ -528,6 +567,12 @@ where
         observer: &mut dyn crate::ActivationObserver<M::InvocationTensor, M::Error>,
     ) -> Result<M::Scores, M::Error> {
         let tokens = tokens.map(M::decode_tensor);
+        let committed = self.session.tracks_local_tokens().then(|| {
+            tokens
+                .as_ref()
+                .ok()
+                .and_then(|tokens| M::decoder_token_ids(tokens).ok())
+        });
         let mut observer =
             crate::inspection::MappedActivationObserver::<_, M::TensorObserver>::new(observer);
         let output = self
@@ -537,6 +582,9 @@ where
                 &mut observer,
             )
             .map_err(session_failure::<M, _, _>)?;
+        if let Some(committed) = committed {
+            self.session.record_local_tokens(committed.as_deref());
+        }
         Ok(publish::<M>(output))
     }
 }
@@ -821,7 +869,10 @@ where
         self.session.prompt_cache_model_identity()
     }
 
-    fn prompt_cache(&mut self) -> Option<TextPromptCache<'_, M::Context>> {
+    fn prompt_cache<'a>(
+        &'a mut self,
+        _: &'a M::Context,
+    ) -> Option<TextPromptCache<'a, M::Context>> {
         Some(
             self.session
                 .prompt_cache(self.native.context(), PromptCacheInput::PreparedInput),

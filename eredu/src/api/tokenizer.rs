@@ -192,9 +192,7 @@ pub(crate) fn load_gguf_tokenizer_from_metadata(
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
 ) -> Result<GgufTokenizer, TextMetadataError> {
     let sidecar_dir = gguf_sidecar_dir(gguf_file);
-    if let Some(mut embedded) = gguf_tokenizer::from_metadata(metadata)
-        .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))?
-    {
+    if let Some(mut embedded) = embedded_gguf_tokenizer(metadata)? {
         embedded
             .template_kwargs
             .extend(load_tokenizer_template_kwargs(sidecar_dir)?);
@@ -204,6 +202,42 @@ pub(crate) fn load_gguf_tokenizer_from_metadata(
         tokenizer: Tokenizer::from_file(sidecar_dir.join("tokenizer.json"))?,
         template_kwargs: load_tokenizer_template_kwargs(sidecar_dir)?,
     })
+}
+
+fn embedded_gguf_tokenizer(
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+) -> Result<Option<GgufTokenizer>, TextMetadataError> {
+    gguf_tokenizer::from_metadata(metadata)
+        .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))
+}
+
+pub(crate) fn load_optional_tokenizer_json(
+    directory: &Path,
+) -> Result<Option<Tokenizer>, TextMetadataError> {
+    match std::fs::read(directory.join("tokenizer.json")) {
+        Ok(bytes) => Ok(Some(Tokenizer::from_bytes(bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Resolves optional assistant vocabulary without consulting chat-template metadata.
+pub(crate) fn load_optional_gguf_tokenizer(
+    sidecar_dir: &Path,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+) -> Result<Option<Tokenizer>, TextMetadataError> {
+    if let Some(embedded) = embedded_gguf_tokenizer(metadata)? {
+        return Ok(Some(embedded.tokenizer));
+    }
+    if ["tokenizer.huggingface.json", "tokenizer.ggml.tokens"]
+        .iter()
+        .any(|key| metadata.contains_key(*key))
+    {
+        return Err(TextMetadataError::GgufTokenizer(
+            "cannot verify the declared assistant vocabulary".into(),
+        ));
+    }
+    load_optional_tokenizer_json(sidecar_dir)
 }
 
 pub(crate) fn load_chat_template(

@@ -201,22 +201,32 @@ impl VisionOwner {
 pub struct VisionConfig {
     policy: VisionPolicy,
     owner: VisionOwner,
+    pub(crate) published_gguf: bool,
     pinned: std::sync::Arc<specs::StaticSpec>,
     layers: std::sync::Arc<Vec<specs::BlockSpec>>,
 }
 impl VisionConfig {
     /// Validates external policy and prepares all parameter owners before allocation.
     pub fn new(policy: VisionPolicy, owner: VisionOwner) -> Result<Self, VisionConfigError> {
+        Self::with_source(policy, owner, false)
+    }
+
+    pub(crate) fn with_source(
+        policy: VisionPolicy,
+        owner: VisionOwner,
+        published_gguf: bool,
+    ) -> Result<Self, VisionConfigError> {
         policy.validate()?;
         let pinned =
             specs::StaticSpec::at(&policy, owner.root()).map_err(vision_declaration_error)?;
         let layers = (0..policy.num_hidden_layers as usize)
-            .map(|layer| specs::BlockSpec::at(&policy, layer, owner.root()))
+            .map(|layer| specs::BlockSpec::at(&policy, layer, owner.root(), published_gguf))
             .collect::<Result<Vec<_>, _>>()
             .map_err(vision_declaration_error)?;
         let exact = Self {
             policy,
             owner,
+            published_gguf,
             pinned: pinned.into(),
             layers: layers.into(),
         };
@@ -355,6 +365,8 @@ pub struct MediaLinear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub linear: B::Linear,
     /// Learned clipping selected by the artifact's equations.
     pub bounds: Option<ClipBounds<B::Tensor>>,
+    #[parameter(skip)]
+    rounded_weight_inputs: bool,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MediaLinear<B> {
@@ -366,6 +378,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MediaLinear<B> {
         spec.validate()?;
         Ok(Self {
             linear: B::linear(spec.linear, context)?,
+            rounded_weight_inputs: false,
             bounds: spec
                 .bounds
                 .map(|bounds| {
@@ -381,6 +394,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MediaLinear<B> {
         })
     }
 
+    pub(crate) fn with_rounded_weight_inputs(mut self, enabled: bool) -> Self {
+        self.rounded_weight_inputs = enabled;
+        self
+    }
+
     /// Applies input clip, projection, and output clip without host access.
     pub fn forward(
         &mut self,
@@ -394,13 +412,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MediaLinear<B> {
                     bounds.input_max.as_ref(),
                     context,
                 )?;
-                self.linear.forward(&input, context)?.clip(
+                super::media::forward_linear(
+                    &mut self.linear,
+                    &input,
+                    self.rounded_weight_inputs,
+                    context,
+                )?
+                .clip(
                     bounds.output_min.as_ref(),
                     bounds.output_max.as_ref(),
                     context,
                 )
             }
-            None => self.linear.forward(input, context),
+            None => super::media::forward_linear(
+                &mut self.linear,
+                input,
+                self.rounded_weight_inputs,
+                context,
+            ),
         }
     }
 }
@@ -524,6 +553,7 @@ struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
     fn new(
         spec: specs::AttentionSpec,
+        rounded_weight_inputs: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         spec.logical_parameters()?;
@@ -534,10 +564,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
             input_score_arithmetic: spec.input_score_arithmetic,
             key_value_heads: heads.key_value_heads(),
             head_dim: heads.key_dimensions(),
-            query: MediaLinear::new(query, context)?,
-            key: MediaLinear::new(key, context)?,
-            value: MediaLinear::new(value, context)?,
-            output: MediaLinear::new(output, context)?,
+            query: MediaLinear::new(query, context)?
+                .with_rounded_weight_inputs(rounded_weight_inputs),
+            key: MediaLinear::new(key, context)?.with_rounded_weight_inputs(rounded_weight_inputs),
+            value: MediaLinear::new(value, context)?
+                .with_rounded_weight_inputs(rounded_weight_inputs),
+            output: MediaLinear::new(output, context)?
+                .with_rounded_weight_inputs(rounded_weight_inputs),
             query_norm: B::normalization(spec.query_norm, context)?,
             key_norm: B::normalization(spec.key_norm, context)?,
         })
@@ -615,14 +648,20 @@ struct VisionMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
-    fn new(spec: specs::MlpSpec, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+    fn new(
+        spec: specs::MlpSpec,
+        rounded_weight_inputs: bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let policy = spec.product.policy;
         let [gate, up, down] = spec.into_projections()?;
         Ok(Self {
             policy,
-            gate: MediaLinear::new(gate, context)?,
-            up: MediaLinear::new(up, context)?,
-            down: MediaLinear::new(down, context)?,
+            gate: MediaLinear::new(gate, context)?
+                .with_rounded_weight_inputs(rounded_weight_inputs),
+            up: MediaLinear::new(up, context)?.with_rounded_weight_inputs(rounded_weight_inputs),
+            down: MediaLinear::new(down, context)?
+                .with_rounded_weight_inputs(rounded_weight_inputs),
         })
     }
 
@@ -632,12 +671,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
-        let gate = match self.policy.activation() {
-            eredu_nn::GatedProductActivation::GeluApproximate => {
-                B::gelu_approximate(gate, context)?
-            }
-            _ => return Err(Error::backend("unsupported Gemma vision gated equation")),
-        };
+        let gate = self.policy.activation().apply::<B>(gate, context)?;
         let up = self.up.forward(input, context)?;
         self.down.forward(&gate.multiply(&up, context)?, context)
     }
@@ -675,8 +709,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         let spec = config.layer(layer, root)?.clone();
         let [input, post_attention, pre_feed_forward, post_feed_forward] = spec.norms;
         Ok(Self {
-            attention: VisionAttention::new(spec.attention, context)?,
-            mlp: VisionMlp::new(spec.mlp, context)?,
+            attention: VisionAttention::new(spec.attention, config.published_gguf, context)?,
+            mlp: VisionMlp::new(spec.mlp, config.published_gguf, context)?,
             input_norm: B::normalization(input, context)?,
             post_attention_norm: B::normalization(post_attention, context)?,
             pre_feed_forward_norm: B::normalization(pre_feed_forward, context)?,

@@ -6,10 +6,12 @@ use eredu_core::AttentionPolicy;
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ExternalPredictionCaptureRequest {
-    /// Final decoder hidden state and every architecture-published shared K/V class.
+    /// Final decoder hidden state and selected shared K/V classes in consumption order.
     SharedAttention {
         /// Exact final decoder unit-output observation path.
         final_hidden_path: String,
+        /// Exact attention classes in the capture schema's order.
+        policies: Box<[AttentionPolicy]>,
     },
     /// Ordered decoder-unit outputs consumed by an assistant.
     OrderedLayerOutputs {

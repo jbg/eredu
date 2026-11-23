@@ -1,8 +1,8 @@
-//! Allocation-free scalar decoding for block layouts without native row kernels.
+//! Bounded, allocation-free scalar decoding of packed GGML blocks.
 //! Equations: ggml-quants.c at 2145525a4081d66ff1a87cf43ef809f95a85ac0c.
-use crate::{Endian, Error, GgmlType, Result};
+use std::ops::Range;
 
-const FP4_CODES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+use crate::{packed_words::FP4_CODES, Endian, Error, GgmlType, Result};
 
 /// A checked block decoder writing into caller-owned F32 storage. It never expands
 /// a table, allocates conversion companions or rounds scales/biases through F16.
@@ -14,8 +14,7 @@ pub struct BlockDecoder {
     bytes: usize,
 }
 impl BlockDecoder {
-    /// Supported generic scalar mechanisms. Other encodings retain their existing
-    /// native/codebook decoders; this is not a model-family support predicate.
+    /// Selects the scalar decoder for an encoding and byte order.
     pub fn new(encoding: GgmlType, endian: Endian) -> Result<Self> {
         if !matches!(
             encoding,
@@ -31,7 +30,8 @@ impl BlockDecoder {
                 | GgmlType::Q3K
                 | GgmlType::MxFp4
                 | GgmlType::NvFp4
-        ) {
+        ) && !encoding.is_iq()
+        {
             return Err(Error::UnsupportedTensorType(encoding.code()));
         }
         let (values, bytes) = encoding.block_and_bytes()?;
@@ -63,17 +63,58 @@ impl BlockDecoder {
                 "decoded output length differs from encoded blocks",
             ));
         }
+        if self.encoding.is_iq() {
+            return crate::iquant::decode_into(self.encoding, encoded, self.endian, output);
+        }
+        if self.encoding == GgmlType::NvFp4
+            && encoded
+                .chunks_exact(self.bytes)
+                .any(|block| block[..4].iter().any(|&scale| scale >= 0x7f))
+        {
+            return Err(Error::tensor("<blocks>", "invalid NVFP4 UE4M3 scale"));
+        }
         for (block, output) in encoded
             .chunks_exact(self.bytes)
             .zip(output.chunks_exact_mut(self.values))
         {
-            if self.encoding == GgmlType::NvFp4 && block[..4].iter().any(|&scale| scale >= 0x7f) {
-                return Err(Error::tensor("<blocks>", "invalid NVFP4 UE4M3 scale"));
-            }
             self.block(block, output);
         }
         Ok(())
     }
+    /// Borrows packed storage as a flat sequence of physical rows. Each row
+    /// contains whole blocks and the supplied extent must match the bytes exactly.
+    pub fn packed_rows(
+        self,
+        encoded: &[u8],
+        physical_rows: usize,
+        columns: usize,
+    ) -> Result<PackedRows<'_>> {
+        if columns == 0 || !columns.is_multiple_of(self.values) {
+            return Err(Error::tensor(
+                "<blocks>",
+                "packed row requires whole blocks",
+            ));
+        }
+        let row_bytes = (columns / self.values)
+            .checked_mul(self.bytes)
+            .ok_or(Error::Overflow("packed row bytes"))?;
+        let expected = physical_rows
+            .checked_mul(row_bytes)
+            .ok_or(Error::Overflow("packed storage bytes"))?;
+        if encoded.len() != expected {
+            return Err(Error::tensor(
+                "<blocks>",
+                "packed storage differs from row geometry",
+            ));
+        }
+        Ok(PackedRows {
+            decoder: self,
+            encoded,
+            physical_rows,
+            row_bytes,
+        })
+    }
+
     fn half(self, bytes: &[u8]) -> f32 {
         half::f16::from_bits(self.endian.u16([bytes[0], bytes[1]])).to_f32()
     }
@@ -119,17 +160,9 @@ impl BlockDecoder {
                 let q5 = self.encoding == GgmlType::Q5K;
                 let d = self.half(b);
                 let dm = self.half(&b[2..]);
-                let s = &b[4..16];
+                let scales = unpack_k_scale_min(b[4..16].try_into().expect("K-block scale table"));
                 let qs = &b[if q5 { 48 } else { 16 }..];
-                for g in 0..8 {
-                    let (sc, min) = if g < 4 {
-                        (s[g] & 63, s[g + 4] & 63)
-                    } else {
-                        (
-                            (s[g + 4] & 15) | ((s[g - 4] >> 6) << 4),
-                            (s[g + 4] >> 4) | ((s[g] >> 6) << 4),
-                        )
-                    };
+                for (g, (sc, min)) in scales.into_iter().enumerate() {
                     let scale = d * sc as f32;
                     let minimum = dm * min as f32;
                     for i in 0..32 {
@@ -193,29 +226,16 @@ impl BlockDecoder {
             GgmlType::MxFp4 => {
                 // Pinned GGML uses doubled FP4 integers and a halved E8M0
                 // scale, including exponents 0/1/255. Byte order is irrelevant.
-                let exponent = u32::from(b[0]);
-                let d = f32::from_bits(if exponent < 2 {
-                    0x0020_0000 << exponent
-                } else {
-                    (exponent - 1) << 23
-                });
                 for i in 0..16 {
-                    y[i] = f32::from(FP4_CODES[(b[i + 1] & 15) as usize]) * d;
-                    y[i + 16] = f32::from(FP4_CODES[(b[i + 1] >> 4) as usize]) * d;
+                    y[i] = crate::packed_words::mxfp4_value(b[i + 1] & 15, b[0]);
+                    y[i + 16] = crate::packed_words::mxfp4_value(b[i + 1] >> 4, b[0]);
                 }
             }
             GgmlType::NvFp4 => {
                 // Each 16-value group has its own unsigned E4M3 scale.
                 // FP4_CODES doubles the code values, so halve the scale.
                 for (group, &scale) in b[..4].iter().enumerate() {
-                    let exponent = u32::from(scale >> 3);
-                    let mantissa = f32::from(scale & 7);
-                    let d = if exponent == 0 {
-                        mantissa / 1024.0
-                    } else {
-                        let half_scale_exponent = exponent + 127 - 7 - 1;
-                        (1.0 + mantissa / 8.0) * f32::from_bits(half_scale_exponent << 23)
-                    };
+                    let d = nvfp4_half_scale(scale);
                     for (i, &codes) in b[4 + group * 8..][..8].iter().enumerate() {
                         y[group * 16 + i] = d * f32::from(FP4_CODES[usize::from(codes & 15)]);
                         y[group * 16 + i + 8] = d * f32::from(FP4_CODES[usize::from(codes >> 4)]);
@@ -224,5 +244,63 @@ impl BlockDecoder {
             }
             _ => unreachable!("checked decoder encoding"),
         }
+    }
+}
+
+/// Checked borrowed storage for bounded packed row decoding.
+pub struct PackedRows<'a> {
+    decoder: BlockDecoder,
+    encoded: &'a [u8],
+    physical_rows: usize,
+    row_bytes: usize,
+}
+
+impl PackedRows<'_> {
+    /// Decodes one physical row into an exactly sized FP32 destination.
+    pub fn decode_row(&self, row: usize, output: &mut [f32]) -> Result<()> {
+        let end = row
+            .checked_add(1)
+            .ok_or(Error::Overflow("packed row index"))?;
+        self.decode_rows(row..end, output)
+    }
+
+    /// Decodes a contiguous physical row range into an exactly sized destination.
+    /// Bytes outside the selected range are left encoded.
+    pub fn decode_rows(&self, rows: Range<usize>, output: &mut [f32]) -> Result<()> {
+        if rows.start > rows.end || rows.end > self.physical_rows {
+            return Err(Error::tensor(
+                "<blocks>",
+                "packed row range exceeds storage",
+            ));
+        }
+        // The constructor checked the entire physical extent.
+        let encoded = &self.encoded[rows.start * self.row_bytes..rows.end * self.row_bytes];
+        self.decoder.decode_into(encoded, output)
+    }
+}
+
+/// Extracts the eight six-bit scale/min pairs shared by Q4_K and Q5_K blocks.
+pub fn unpack_k_scale_min(table: &[u8; 12]) -> [(u8, u8); 8] {
+    std::array::from_fn(|group| {
+        if group < 4 {
+            (table[group] & 63, table[group + 4] & 63)
+        } else {
+            let packed = table[group + 4];
+            (
+                (packed & 15) | ((table[group - 4] >> 6) << 4),
+                (packed >> 4) | ((table[group] >> 6) << 4),
+            )
+        }
+    })
+}
+
+pub(crate) fn nvfp4_half_scale(scale: u8) -> f32 {
+    let exponent = u32::from(scale >> 3);
+    let mantissa = f32::from(scale & 7);
+    if exponent == 0 {
+        mantissa / 1024.0
+    } else {
+        let half_scale_exponent = exponent + 127 - 7 - 1;
+        (1.0 + mantissa / 8.0) * f32::from_bits(half_scale_exponent << 23)
     }
 }

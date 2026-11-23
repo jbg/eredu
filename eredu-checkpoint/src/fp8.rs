@@ -203,3 +203,19 @@ mod tests {
         }
     }
 }
+
+/// Decodes the finite-number E4M3 format used by checkpoint tensors.
+pub fn decode_e4m3(value: u8) -> f32 {
+    let sign = if value & 0x80 == 0 { 1. } else { -1. };
+    let exponent = i32::from((value >> 3) & 15);
+    let mantissa = i32::from(value & 7);
+    if exponent == 15 && mantissa == 7 {
+        return f32::NAN;
+    }
+    let (significand, exponent) = if exponent == 0 {
+        (mantissa, -9)
+    } else {
+        (8 + mantissa, exponent - 10)
+    };
+    sign * significand as f32 * 2f32.powi(exponent)
+}

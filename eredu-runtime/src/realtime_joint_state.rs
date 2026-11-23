@@ -435,10 +435,16 @@ impl<M: HybridCacheStorage + CacheCopySubmission> IsolatedStateCopy for JointRea
     }
 
     fn validate_isolated_restore(&self, saved: &Self) -> Result<(), Self::Error> {
-        if self.admission.active.load(Ordering::Acquire)
-            || saved.admission.active.load(Ordering::Acquire)
-        {
-            return Err(JointStateError::Busy);
+        let copy_active = || {
+            self.admission.active.load(Ordering::Acquire)
+                || saved.admission.active.load(Ordering::Acquire)
+        };
+        if copy_active() {
+            // Native retirement can hold a completed invocation's copy permit.
+            M::reclaim_copies();
+            if copy_active() {
+                return Err(JointStateError::Busy);
+            }
         }
         self.generation
             .checked_add(1)

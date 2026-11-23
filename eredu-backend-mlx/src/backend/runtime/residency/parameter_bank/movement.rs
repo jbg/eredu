@@ -160,7 +160,7 @@ pub(super) fn compact_binding(
 
 struct ParameterLoanResources {
     transfer: ResidentTransfer,
-    output: Option<MlxTensor>,
+    roots: Vec<MlxTensor>,
 }
 
 impl crate::backend::submission_recovery::Retention for ParameterLoanResources {
@@ -178,7 +178,7 @@ impl MlxParameterLoan {
         let recovery =
             crate::backend::submission_recovery::Recovery::begin(ParameterLoanResources {
                 transfer,
-                output: None,
+                roots: Vec::new(),
             })?;
         Ok(Self { recovery })
     }
@@ -197,12 +197,16 @@ impl eredu_core::residency::ParameterLoan<MlxTensor, Stream> for MlxParameterLoa
         })?;
         let value =
             MlxTensor::from_array(lease.device_value(binding)?.ensure_device_storage(stream)?);
-        self.recovery.retention_mut().output = Some(value.clone());
+        self.retain(&value);
         Ok(value)
     }
 
+    fn retain(&mut self, tensor: &MlxTensor) {
+        self.recovery.retention_mut().roots.push(tensor.clone());
+    }
+
     fn finish(mut self, output: &MlxTensor) -> Result<(), Error> {
-        self.recovery.retention_mut().output = Some(output.clone());
+        self.retain(output);
         let submitted = eval([output.as_array()]);
         self.recovery.seal();
         submitted?;

@@ -154,6 +154,8 @@ pub struct ModelArgs {
     pub quantized_weights: Option<HashSet<String>>,
     /// Exact per-parameter encodings for mixed GGUF artifacts.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+    pub(super) packed_linear_formats: HashMap<String, LinearFormat>,
+    pub(super) gguf_source: bool,
 }
 
 impl ModelArgs {
@@ -171,7 +173,7 @@ impl ModelArgs {
         }
         source.enable_moe_block = source.num_experts.is_some();
         source.attention_k_eq_v = true;
-        let mut args = normalize_geometry(source)?;
+        let mut args = normalize_geometry(source, false)?;
         args.apply_diffusion_equations();
         Ok(args)
     }
@@ -189,6 +191,22 @@ impl ModelArgs {
         self.rotary_arithmetic = eredu_nn::RotaryArithmetic::InputProducts;
         self.routing_scoring = eredu_nn::GroupScoring::Softmax;
         self.normalize_selected_routes = true;
+    }
+
+    pub(crate) const fn approximate_gelu_policy(&self) -> eredu_nn::GatedProductPolicy {
+        if self.gguf_source {
+            eredu_nn::GatedProductPolicy::gelu_approximate_f16()
+        } else {
+            eredu_nn::GatedProductPolicy::ordinary_gelu_approximate()
+        }
+    }
+
+    pub(crate) const fn dense_gated_product(&self) -> eredu_nn::GatedProductPolicy {
+        if self.approximate_gelu {
+            self.approximate_gelu_policy()
+        } else {
+            eredu_nn::GatedProductPolicy::ordinary_gelu()
+        }
     }
 
     pub(crate) fn normalization(
@@ -211,7 +229,11 @@ impl ModelArgs {
     }
     /// Parses and validates a Hugging Face text configuration document.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
-        normalize(serde_json::from_slice(bytes)?)
+        normalize(serde_json::from_slice(bytes)?, false)
+    }
+
+    pub(super) fn from_assistant_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
+        normalize(serde_json::from_slice(bytes)?, true)
     }
 
     /// Parses strict Gemma 4 GGUF metadata and catalog-dependent storage
@@ -219,6 +241,14 @@ impl ModelArgs {
     pub fn from_gguf_metadata<C: GgufTensorCatalog + ?Sized>(
         catalog: &C,
         metadata: &HashMap<String, MetadataValue>,
+    ) -> Result<Self, ConfigError> {
+        Self::from_gguf_source(catalog, metadata, false)
+    }
+
+    pub(super) fn from_gguf_source<C: GgufTensorCatalog + ?Sized>(
+        catalog: &C,
+        metadata: &HashMap<String, MetadataValue>,
+        external_kv: bool,
     ) -> Result<Self, ConfigError> {
         let layers = gguf_i32(metadata, "gemma4.block_count")?;
         if layers <= 0 {
@@ -290,7 +320,7 @@ impl ModelArgs {
             .into_iter()
             .any(|local| catalog.contains(&format!("blk.{layer}.{local}")))
         });
-        let vocabulary = gguf_vocab_size(metadata, "gemma4.vocab_size")?;
+        let vocabulary = gguf_i32(metadata, "gemma4.vocab_size")?;
         let global_head = gguf_i32(metadata, "gemma4.attention.key_length")?;
         let local_head =
             gguf_optional_i32(metadata, "gemma4.attention.key_length_swa")?.unwrap_or(global_head);
@@ -300,6 +330,7 @@ impl ModelArgs {
             gguf_optional_f32(metadata, "gemma4.rope.freq_base_swa")?.unwrap_or(10_000.0);
         let value = serde_json::json!({
             "model_type": "gemma4",
+            "hidden_activation": "gelu_pytorch_tanh",
             "hidden_size": gguf_i32(metadata, "gemma4.embedding_length")?,
             "num_hidden_layers": layers,
             "intermediate_size": feed_forward[0],
@@ -332,7 +363,9 @@ impl ModelArgs {
                 "sliding_attention": {"rope_type":"default", "rope_theta":local_rope}
             }
         });
-        Self::from_hf_json(&serde_json::to_vec(&value)?)
+        let mut args = normalize(serde_json::from_value(value)?, external_kv)?;
+        args.gguf_source = true;
+        Ok(args)
     }
 
     /// Number of decoder layers.
@@ -492,7 +525,20 @@ impl ModelArgs {
                     "quantized_weight_configs",
                     crate::cache_identity::debug_map(self.quantized_weight_configs.as_ref()),
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(self.gguf_source.then(|| {
+                (
+                    "gguf_decoder_arithmetic",
+                    crate::cache_identity::debug_map(Some(&self.packed_linear_formats)),
+                )
+            }))
+            .chain(self.gguf_source.then(|| {
+                (
+                    "gguf_gelu",
+                    format!("{:?}", self.approximate_gelu_policy().activation()),
+                )
+            })),
         )
     }
 
@@ -502,6 +548,13 @@ impl ModelArgs {
     /// modules under a released layer root look them up by that root, so
     /// the raw name is tried first and the canonical one second.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
+        if let Some(format) = self
+            .packed_linear_formats
+            .get(name)
+            .or_else(|| self.packed_linear_formats.get(&canonical_weight_name(name)))
+        {
+            return *format;
+        }
         if let Some(format) = self.quantized_weight_configs.as_ref().and_then(|formats| {
             formats
                 .get(name)
@@ -587,6 +640,8 @@ struct ModelArgsSource {
     #[serde(default)]
     feed_forward_lengths: Option<Vec<i32>>,
     num_attention_heads: i32,
+    #[serde(default, alias = "hidden_act")]
+    hidden_activation: Option<String>,
     rms_norm_eps: f32,
     vocab_size: i32,
     #[serde(default)]
@@ -650,7 +705,7 @@ fn default_true() -> bool {
     true
 }
 
-fn normalize(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
+fn normalize(source: ModelArgsSource, external_kv: bool) -> Result<ModelArgs, ConfigError> {
     if !matches!(
         source.model_type.as_str(),
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text"
@@ -660,10 +715,13 @@ fn normalize(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
             source.model_type
         )));
     }
-    normalize_geometry(source)
+    normalize_geometry(source, external_kv)
 }
 
-fn normalize_geometry(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
+fn normalize_geometry(
+    source: ModelArgsSource,
+    external_kv: bool,
+) -> Result<ModelArgs, ConfigError> {
     let layers = usize::try_from(source.num_hidden_layers)
         .ok()
         .filter(|layers| *layers > 0)
@@ -763,6 +821,7 @@ fn normalize_geometry(source: ModelArgsSource) -> Result<ModelArgs, ConfigError>
         first_shared,
         &values,
         source.enable_moe_block,
+        external_kv,
     )?;
     validate_moe(&source)?;
     crate::rotary::normalize_algorithm(source.rope_scaling.as_ref()).map_err(invalid)?;
@@ -772,14 +831,17 @@ fn normalize_geometry(source: ModelArgsSource) -> Result<ModelArgs, ConfigError>
         }
     }
     Ok(ModelArgs {
-        float32_normalization: false,
-        approximate_gelu: false,
+        float32_normalization: true,
+        approximate_gelu: matches!(
+            source.hidden_activation.as_deref(),
+            Some("gelu_pytorch_tanh")
+        ),
         attention_arithmetic: eredu_nn::AttentionArithmetic::Fused,
         expert_reduction: eredu_nn::GroupReduction::Sum,
         routing_arithmetic: eredu_nn::RoutingArithmetic::uniform(
             eredu_nn::RoutingPrecision::Preserve,
         ),
-        rotary_arithmetic: eredu_nn::RotaryArithmetic::Native,
+        rotary_arithmetic: eredu_nn::RotaryArithmetic::InputProducts,
         routing_scoring: eredu_nn::GroupScoring::SelectedSoftmax,
         normalize_selected_routes: false,
         model_type: source.model_type,
@@ -804,6 +866,8 @@ fn normalize_geometry(source: ModelArgsSource) -> Result<ModelArgs, ConfigError>
         weight_quantization: source.weight_quantization,
         quantized_weights: source.quantized_weights,
         quantized_weight_configs: source.quantized_weight_configs,
+        packed_linear_formats: HashMap::new(),
+        gguf_source: false,
     })
 }
 
@@ -852,6 +916,7 @@ fn layer_schedule(
     first_shared: usize,
     values: &[AttentionValueSource],
     enable_moe: bool,
+    external_kv: bool,
 ) -> Result<LayerSchedule<LayerPolicy>, ConfigError> {
     let layers = attention.len();
     let shared_attention = attention
@@ -870,7 +935,7 @@ fn layer_schedule(
                 .last()
         })
         .collect::<HashSet<_>>();
-    for layer in first_shared..layers {
+    for layer in (if external_kv { layers } else { first_shared })..layers {
         let layer_attention = *attention
             .get(layer)
             .expect("validated Gemma 4 layer schedule");
@@ -918,7 +983,7 @@ fn layer_schedule(
                 attention,
                 head_dim: head_dimension(layer, head_dims[layer])?,
                 num_key_value_heads: positive("KV heads", layer, kv_heads[layer])?,
-                key_value: if layer >= first_shared {
+                key_value: if external_kv || layer >= first_shared {
                     AttentionStateSource::Shared
                 } else if publishers.contains(&layer) {
                     AttentionStateSource::Publish {
@@ -1018,13 +1083,6 @@ fn gguf_layer_i32_values(
                 .ok_or_else(|| invalid(format!("Gemma 4 GGUF {key:?} values must be positive i32")))
         })
         .collect()
-}
-
-fn gguf_vocab_size(
-    metadata: &HashMap<String, MetadataValue>,
-    fallback: &str,
-) -> Result<i32, ConfigError> {
-    gguf_i32(metadata, fallback)
 }
 
 fn gguf_i32(metadata: &HashMap<String, MetadataValue>, key: &str) -> Result<i32, ConfigError> {

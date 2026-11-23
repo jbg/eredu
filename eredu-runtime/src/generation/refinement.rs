@@ -12,6 +12,7 @@ pub mod block;
 
 /// Position-wise constrained commitment after block refinement.
 pub mod finalization;
+pub(crate) mod host;
 /// Confidence transfer and float64 masked-token selection equations.
 pub mod masked;
 

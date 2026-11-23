@@ -11,7 +11,7 @@ use eredu_core::residency::parameter_binding::WeightBinding;
 
 use eredu_checkpoint::store::CheckpointSource;
 use eredu_core::{
-    capability::NativeAllocatorObservations, residency::ParameterConversionRetentionEligibility,
+    capability::ParameterMemoryFacts, residency::ParameterConversionRetentionEligibility,
     BackendFailure,
 };
 use eredu_nn::{NeuralBackend, Tensor};
@@ -130,6 +130,7 @@ pub struct InstalledExternalAssistant<B: ExternalAssistantBinder, A: ExternalAss
         B::Logits,
         B::ObservationError,
     >,
+    execution_queue: <<B::Backend as NeuralBackend>::Tensor as Tensor>::Context,
     memory_topology: Option<ConditionedPredictionTopology>,
     parameter_memory_bounds: Option<ParameterResidencyMemoryBounds>,
     parameter_loading: ParameterLoadingMemoryProfile,
@@ -139,25 +140,22 @@ impl<B: ExternalAssistantBinder, A: ExternalAssistantModel> InstalledExternalAss
     /// Projects retained portable geometry together with native storage observations.
     pub fn memory_profile(
         &self,
-        host_execution: bool,
+        memory: ParameterMemoryFacts,
         residency: LayerWeightResidency,
-        observe: impl FnOnce() -> Result<
-            Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
-            BackendFailure,
-        >,
         native_workspace: MemoryBytes,
     ) -> Result<Option<crate::memory_forecast::ConditionedAssistantMemoryProfile>, BackendFailure>
     {
         let Some(topology) = &self.memory_topology else {
             return Ok(None);
         };
-        let Some(parameters) = observe()? else {
+        let placement = memory.placement.clone();
+        let Some(parameters) = self.parameter_memory_observation(memory)? else {
             return Ok(None);
         };
         Ok(Some(
             crate::memory_forecast::ConditionedAssistantMemoryProfile {
                 topology: topology.clone(),
-                host_execution,
+                placement,
                 residency,
                 parameter_bounds: self.parameter_memory_bounds.clone(),
                 parameter_loading: Some(self.parameter_loading.clone()),
@@ -177,9 +175,15 @@ impl<B: ExternalAssistantBinder, A: ExternalAssistantModel> InstalledExternalAss
         A::parameter_policy::<B::Backend, _>(&self.module).and_then(|policy| policy.units())
     }
 
+    /// The native queue retained when the assistant was bound.
+    pub fn execution_queue(&self) -> &<<B::Backend as NeuralBackend>::Tensor as Tensor>::Context {
+        &self.execution_queue
+    }
+
     /// Reads the selected parameter owner and combines its ledger with native counters.
-    pub fn parameter_memory_observation<N: NativeAllocatorObservations>(
+    pub fn parameter_memory_observation(
         &self,
+        memory: ParameterMemoryFacts,
     ) -> Result<
         Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
         BackendFailure,
@@ -194,15 +198,15 @@ impl<B: ExternalAssistantBinder, A: ExternalAssistantModel> InstalledExternalAss
                 Some(report),
                 std::iter::empty(),
                 [],
-                N::native_memory_facts(),
+                memory.native,
             )
             .map_err(BackendFailure::from_error)?;
         Ok(Some(
             eredu_core::speculative::SpeculativeParameterMemoryObservation {
                 parameters,
                 parameter_conversions,
-                available: N::available_memory()?,
-                allocator_cache_limit: N::allocator_cache_limit(),
+                available: memory.available,
+                allocator_cache_limit: memory.allocator_cache_limit,
             },
         ))
     }
@@ -420,6 +424,7 @@ where
         config,
         module: execution,
         observers: Default::default(),
+        execution_queue: context.clone(),
         memory_topology,
         parameter_memory_bounds: memory_bounds,
         parameter_loading: loading,
@@ -552,6 +557,24 @@ pub trait SelectedAssistantExecutionVisitor<B: ExternalAssistantBinder> {
         Dispatch: SelectedAssistantExecutor<A>;
 }
 
+/// Types shared by conditioned assistants at the final execution boundary.
+pub struct AssistantExecutorTypes<M>(std::marker::PhantomData<fn() -> M>);
+
+impl<M: ExternalAssistantExecutionMechanisms> eredu_core::speculative::GenerationExecutorTypes
+    for AssistantExecutorTypes<M>
+{
+    type Binding = crate::SelectedSpeculativeRealization;
+    type Logits = M::Logits;
+    type Context<'a> = M::Context<'a>;
+    type Completion = M::Completion;
+    type Telemetry = ();
+    type Error = M::Error;
+
+    fn erased_type_mismatch(value: &'static str) -> M::Error {
+        M::error(format!("conditioned executor state differs: {value}"))
+    }
+}
+
 /// Family-blind continuation invoked with an architecture-selected external executor.
 pub trait ExternalAssistantExecutorVisitor<
     A: ExternalAssistantModel,
@@ -572,9 +595,15 @@ pub trait ExternalAssistantExecutorVisitor<
                 Logits = M::Logits,
                 Context<'run> = M::Context<'run>,
                 Completion = M::Completion,
-                Telemetry = M::Telemetry,
+                Telemetry = (),
                 Error = M::Error,
-            > + 'run;
+            > + eredu_core::speculative::GenerationExecutorCacheFactory<AssistantExecutorTypes<M>>
+            + 'run,
+        E::Cache: 'static,
+        E::TargetState: 'static,
+        E::DraftState: 'static,
+        E::CacheCheckpoint: 'static,
+        E::Verification: 'static;
 }
 
 /// Device placement used by a family-neutral tensor primitive.
@@ -675,9 +704,9 @@ pub trait ExternalAssistantExecutionMechanisms: 'static {
         PredictionState = Self::NativeCache,
     >;
     /// Opaque native ordinary-target cache storage.
-    type NativeCache;
+    type NativeCache: 'static;
     /// Opaque native target-cache checkpoint storage.
-    type NativeCacheCheckpoint;
+    type NativeCacheCheckpoint: 'static;
     /// Retained native tensor.
     type Tensor: eredu_nn::Tensor + Clone;
     /// Native logits consumed by sampling.
@@ -686,6 +715,8 @@ pub trait ExternalAssistantExecutionMechanisms: 'static {
     type Context<'a>: Copy
     where
         Self: 'a;
+    /// Borrows the selected native context for the lifetime of one execution.
+    fn reborrow_context<'a: 'b, 'b>(context: Self::Context<'a>) -> Self::Context<'b>;
     /// Native transport and collector facts retained by the portable scheduler.
     type Capture: for<'a> crate::capture::SpeculativeCaptureMechanisms<
             Context<'a> = Self::Context<'a>,
@@ -694,8 +725,6 @@ pub trait ExternalAssistantExecutionMechanisms: 'static {
         > + 'static;
     /// Exact verification completion.
     type Completion: eredu_core::BoundedCompletion<Error = Self::Error>;
-    /// Optional component telemetry.
-    type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -737,8 +766,10 @@ pub trait ExternalAssistantExecutionMechanisms: 'static {
             .map(Some)
     }
 
-    /// Exact native memory telemetry, independent of the selected assistant.
-    type Memory: NativeAllocatorObservations;
+    /// Reads memory on the retained assistant execution queue.
+    fn placement_memory(
+        queue: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<ParameterMemoryFacts, BackendFailure>;
 
     /// Complete available backing upper allowance for one borrowed tensor survey.
     /// Unknown or foreign backing stays unknown; observation never evaluates work.
@@ -971,9 +1002,16 @@ where
     type Context<'a> = crate::capture::SpeculativeContextFor<'a, N::Capture>;
     type Capture = N::Capture;
     type Completion = N::Completion;
-    type Telemetry = N::Telemetry;
     type Error = N::Error;
-    type Memory = N::Memory;
+    fn placement_memory(
+        queue: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<ParameterMemoryFacts, BackendFailure> {
+        N::placement_memory(queue)
+    }
+
+    fn reborrow_context<'a: 'b, 'b>(context: Self::Context<'a>) -> Self::Context<'b> {
+        context
+    }
 
     fn control_logits_estimate(
         logits: &N::Logits,
@@ -1141,7 +1179,7 @@ where
         tokens: &[u32],
         context: Self::Context<'a>,
     ) -> Result<N::Tensor, N::Error> {
-        N::target_tokens(tokens, context.crosses_devices().then(|| context.target()))
+        N::target_tokens(tokens, context.target(), context.crosses_devices())
     }
 
     fn transfer<'a>(
@@ -1156,7 +1194,7 @@ where
             ExternalAssistantTransfer::TargetToDraft => context.draft(),
             ExternalAssistantTransfer::DraftToTarget => context.target(),
         };
-        if context.crosses_devices() {
+        if context.crosses_devices() || !N::can_share_tensor(value, destination) {
             return N::copy_tensor(value, destination);
         }
         let root = N::tensor_root(value);

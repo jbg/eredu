@@ -27,6 +27,7 @@ pub mod capability;
 pub mod capture;
 /// Portable causal submissions and observed input admission.
 pub mod causal;
+mod causal_generation;
 /// Loaded ordinary, continuation, and speculative memory forecasts.
 pub mod forecast;
 mod input;
@@ -75,7 +76,7 @@ pub struct TextSessionLayout {
 
 impl TextSessionLayout {
     /// Adopts placement and precision facts from the prepared executable.
-    pub(crate) fn new(
+    pub fn new(
         residency: crate::CacheResidencyPolicy,
         floating_state_dtype_bytes: std::num::NonZeroU8,
     ) -> Self {
@@ -98,7 +99,8 @@ impl TextSessionLayout {
 
 /// The selected text session. It owns a single executable for all execution
 /// and state operations.
-pub struct TextSessionDriver<R, N> {
+pub struct TextSessionDriver<R, N, G = eredu_core::backend::AdvancedTextGeneration> {
+    generation: std::marker::PhantomData<fn() -> G>,
     /// The resource root shared only with outstanding native work.
     payload: Rc<R>,
     /// Native submission mechanisms and session metadata.
@@ -116,7 +118,7 @@ pub struct TextSessionDriver<R, N> {
     intervention_identity: String,
 }
 
-impl<R: 'static, N> TextSessionDriver<R, N> {
+impl<R: 'static, N, G> TextSessionDriver<R, N, G> {
     /// Retains the same monotone agreement owner for speculative execution.
     pub fn preparation_coordinator(&self) -> Option<&Arc<TextPreparationCoordinator>> {
         self.preparation.as_ref()
@@ -360,10 +362,28 @@ pub trait TextExecutable<M: eredu_core::backend::TextExecutableTypes> {
     }
 
     /// Borrows the portable persistence driver for the installed state.
-    fn prompt_cache(
-        &mut self,
-    ) -> Option<crate::replicated_session::TextPromptCache<'_, Self::Context>> {
+    fn prompt_cache<'a>(
+        &'a mut self,
+        _context: &'a Self::Context,
+    ) -> Option<crate::replicated_session::TextPromptCache<'a, Self::Context>> {
         None
+    }
+
+    /// Derives the persistence identity for a plain token prefix.
+    fn prompt_cache_prefix_identity(
+        &self,
+        prefix: &[u32],
+        input: Option<&crate::PreparedInputCacheIdentity>,
+    ) -> String {
+        input.map_or_else(
+            || eredu_core::cache::prompt_cache_token_fingerprint(prefix),
+            |identity| identity.prefix_content_fingerprint().to_owned(),
+        )
+    }
+
+    /// Exportable byte extent, when the executable can enumerate it directly.
+    fn prompt_cache_storage_bytes(&self) -> Result<Option<u64>, BackendFailure> {
+        Ok(None)
     }
 
     /// Whether this executable can retain a cursor for the prepared input.
@@ -491,14 +511,14 @@ fn unsupported_text_invocation(operation: &'static str) -> BackendFailure {
     .with_operation(operation)
 }
 
-impl<R, N> TextSessionDriver<R, N> {
+impl<R, N, G> TextSessionDriver<R, N, G> {
     /// Observes submission exclusion without progressing native work.
     pub fn submission_idle(&self) -> Result<(), SessionAuthorityError> {
         self.authority.borrow().require_idle()
     }
 }
 
-impl<R, N: SessionRetirement> TextSessionDriver<R, N> {
+impl<R, N: SessionRetirement, G> TextSessionDriver<R, N, G> {
     /// Progresses retirement and verifies that the session is available.
     pub fn ensure_no_submission_in_flight(&self) -> Result<(), N::Error> {
         self.native.refresh_native_session()?;
@@ -528,7 +548,7 @@ impl<R, N: SessionRetirement> TextSessionDriver<R, N> {
     }
 }
 
-impl<R, N, M, T, V, Processor> TextSessionDriver<R, N>
+impl<R, N, M, T, V, Processor, G> TextSessionDriver<R, N, G>
 where
     R: DerefMut<Target = TextSessionResources<M, T, V, Processor>> + 'static,
     N: TextTransactionMechanisms,
@@ -573,22 +593,6 @@ where
         let (prefix, suffix) = input.split_plain_prompt(runtime.backend(), max_tokens)?;
         runtime.prefill(prefix)?.completion.wait()?;
         *input = suffix;
-        Ok(true)
-    }
-
-    /// Runs complete prefill under the installed parameter version and waits for publication.
-    fn complete_prefill<B, P>(
-        runtime: &mut eredu_core::ModelRuntime<B, Self>,
-        input: P,
-        epoch: &mut Option<u64>,
-    ) -> Result<bool, B::Error>
-    where
-        B: BackendProvider<Error = N::Error>,
-        Self: BackendSession<B, PrefillInput = P>,
-        B::Error: From<eredu_core::BackendError>,
-    {
-        runtime.session().validate_parameter_epoch(epoch)?;
-        runtime.prefill(input)?.completion.wait()?;
         Ok(true)
     }
 
@@ -760,8 +764,11 @@ where
 }
 
 /// Portable text driver instantiated with mechanism types chosen at composition.
-pub type PreparedTextDriver<B, M> =
-    TextSessionDriver<<M as TextSessionMechanisms<B>>::Resources, M>;
+pub type PreparedTextDriver<B, M> = TextSessionDriver<
+    <M as TextSessionMechanisms<B>>::Resources,
+    M,
+    <M as eredu_core::backend::TextSessionNative<B>>::Generation,
+>;
 
 struct ActiveTextInvocation<'a, R, S, T, E>
 where
@@ -811,7 +818,7 @@ fn invocation_observer<
 type RawTextSubmission<B, N> =
     Submission<TextScores<B, N>, <N as eredu_core::backend::TextSessionNative<B>>::Completion>;
 
-impl<R: 'static, N> TextSessionDriver<R, N> {
+impl<R: 'static, N, G> TextSessionDriver<R, N, G> {
     fn shared_backbone_policy<B>(
         &self,
     ) -> Option<crate::speculative::shared_backbone::SharedBackboneExecutionPolicy>
@@ -1278,10 +1285,11 @@ where
     }
 }
 
-impl<B, N> eredu_core::backend::ModelSessionInstaller<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> eredu_core::backend::ModelSessionInstaller<B>
+    for TextSessionDriver<N::Resources, N, G>
 where
     B: BackendProvider,
-    N: TextSessionMechanisms<B>,
+    N: TextSessionMechanisms<B, Generation = G>,
 {
     type Model = crate::executable_binding::LoadedTextExecutable<
         N::Model,
@@ -1297,8 +1305,7 @@ where
     ) -> Result<Self, B::Error> {
         N::validate_target(backend, &prepared.target)?;
         let admitted = prepared.capabilities();
-        let realized = N::target_capabilities(&prepared.target)
-            .unwrap_or_else(|| prepared.executable.as_ref().realized_session_capabilities());
+        let realized = prepared.executable.as_ref().realized_session_capabilities();
         SessionAdmission::new(admitted)
             .validate(realized)
             .map_err(|_| backend.session_capability_mismatch(admitted, realized))?;
@@ -1336,6 +1343,7 @@ where
             .transpose()
             .map_err(|error| N::preparation_error(BackendFailure::from_error(error)))?;
         let mut session = Self {
+            generation: std::marker::PhantomData,
             payload: Rc::new(resources),
             native,
             capture: capture::TextCaptureCatalog::new(Some(discovery)),
@@ -1355,7 +1363,7 @@ where
     }
 }
 
-impl<B, N> BackendSession<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> BackendSession<B> for TextSessionDriver<N::Resources, N, G>
 where
     B: BackendProvider,
     N: TextSessionMechanisms<B>,
@@ -1459,7 +1467,7 @@ where
     }
 }
 
-impl<B, N> TextSessionLifecycle<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> TextSessionLifecycle<B> for TextSessionDriver<N::Resources, N, G>
 where
     B: BackendProvider,
     N: TextSessionMechanisms<B>,
@@ -1579,7 +1587,7 @@ impl TextAdvanceRoute {
     }
 }
 
-impl<B, N> eredu_core::DistributedModelSession<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, G> eredu_core::DistributedModelSession<B> for TextSessionDriver<N::Resources, N, G>
 where
     B: BackendProvider,
     N: TextSessionMechanisms<B>,
@@ -1595,7 +1603,8 @@ where
     }
 }
 
-impl<B, N, T> eredu_core::MultimodalPreparationSession<B> for TextSessionDriver<N::Resources, N>
+impl<B, N, T, G> eredu_core::MultimodalPreparationSession<B>
+    for TextSessionDriver<N::Resources, N, G>
 where
     B: eredu_core::TextGenerationBackend<InputTensor = T>,
     B::Error: From<BackendFailure>,
@@ -1628,7 +1637,7 @@ where
         let processor = processor.ok_or_else(|| {
             Failure::Backend(unsupported_text_invocation("multimodal preparation").into())
         })?;
-        let scope = N::begin_processor().map_err(Failure::Backend)?;
+        let scope = self.native().begin_processor().map_err(Failure::Backend)?;
         let (input, identity) =
             crate::processor_binding::prepare_media(processor, request, scope, encode_text)?;
         Ok(PreparedTextPrompt::from_prepared_media(input, identity))

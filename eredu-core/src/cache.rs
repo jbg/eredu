@@ -26,5 +26,5 @@ pub use prompt::{
     validate_prompt_cache_model_identity, PromptCacheBlock, PromptCacheDescriptor,
     PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     PromptCacheStateSegment, PromptCacheStateTensor, PromptCacheStreamFrontier,
-    PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
+    PromptCacheTokenDigest, PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
 };

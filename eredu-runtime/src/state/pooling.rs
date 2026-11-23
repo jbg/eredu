@@ -933,12 +933,9 @@ impl<M: PoolingCacheStorage> PoolingAttentionCache<M::Value> for PoolingAttentio
             .local()
             .max_size()
             .ok_or_else(|| ComputeError::backend("local cache has no sliding-window policy"))?;
-        let end = offset
-            .checked_add(query_tokens)
-            .ok_or_else(|| ComputeError::backend("local query extent overflowed"))?;
-        let key_offset = offset.saturating_sub(window - 1).max(0);
-        M::local_visibility(offset..end, key_offset..end, window, stream)
-            .map_err(ComputeError::backend_source)
+        let geometry =
+            eredu_nn::attention_mask::LocalWindowVisibility::new(query_tokens, offset, window)?;
+        M::local_visibility(geometry, stream).map_err(ComputeError::backend_source)
     }
 
     fn accumulate_pooling_windows(

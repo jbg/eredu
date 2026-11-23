@@ -123,6 +123,7 @@ fn k_quant_supports_tiled_matmul(view: &NativeQuantizedTensor) -> bool {
 mod decode;
 mod dispatch;
 mod kernels;
+mod packed_metal;
 mod storage;
 
 pub use dispatch::native_grouped_linear_from_array;

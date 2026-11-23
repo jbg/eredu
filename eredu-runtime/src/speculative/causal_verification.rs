@@ -18,10 +18,6 @@ impl<O, I> CausalVerification<O, I> {
     pub fn inputs(&self) -> &I {
         &self.inputs
     }
-    /// Borrows output bookkeeping for completed telemetry delivery.
-    pub fn output_mut(&mut self) -> &mut O {
-        &mut self.output
-    }
     /// Moves completed output and inputs into source-specific cache commitment.
     pub fn into_parts(self) -> (O, I) {
         (self.output, self.inputs)

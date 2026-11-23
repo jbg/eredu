@@ -124,7 +124,7 @@ type SharedInput<M> = SharedBackboneInput<
 >;
 
 /// Composes a shared-backbone executor and its independent proposal and refinement streams.
-fn prepare_shared_batch<'model, 'lane, M, B, C, S, Seed, E>(
+pub(super) fn prepare_shared_batch<'model, 'lane, M, B, C, S, Seed, E>(
     target: &'model mut M::Model,
     lanes: Vec<SpeculativeGenerationLane<'lane, crate::text_session_driver::TextPromptFor<B>, C>>,
     context: M::Context<'_>,
@@ -140,27 +140,34 @@ where
     B: TextGenerationBackend,
     C: SpeculativeTokenFilterController,
     M: SharedBackboneMechanisms<Input = crate::text_session_driver::TextPromptFor<B>>,
-    E: From<GenerationError> + From<M::Error> + From<SpeculativeDriverError<M::Error>>,
+    E: From<eredu_core::BackendFailure>,
 {
+    use eredu_core::BackendFailure;
     let local: Result<_, E> = (|| {
-        let policy = M::shared_backbone_policy(target).ok_or_else(|| {
-            GenerationError::DecodingMode(DecodingModeError::Unsupported(
-                "selected execution has no shared-backbone draft declaration",
-            ))
-        })?;
+        let policy = M::shared_backbone_policy(target)
+            .ok_or_else(|| {
+                GenerationError::DecodingMode(DecodingModeError::Unsupported(
+                    "selected execution has no shared-backbone draft declaration",
+                ))
+            })
+            .map_err(BackendFailure::from_error)?;
         let prepared = lanes
             .into_iter()
             .map(|lane| {
                 prepare_batch_lane(
                     lane,
                     |input, config, generation| {
-                        let options = policy.prepare_lane(config, generation)?;
-                        let root = M::model_randomness_root(generation.seed()).map_err(E::from)?;
-                        let proposal =
-                            M::split_model_randomness(&root, 1, context).map_err(E::from)?;
-                        let refinement =
-                            M::split_model_randomness(&root, 2, context).map_err(E::from)?;
-                        M::settle_model_randomness(&[&proposal, &refinement]).map_err(E::from)?;
+                        let options = policy
+                            .prepare_lane(config, generation)
+                            .map_err(BackendFailure::from_error)?;
+                        let root = M::model_randomness_root(generation.seed())
+                            .map_err(BackendFailure::from_error)?;
+                        let proposal = M::split_model_randomness(&root, 1, context)
+                            .map_err(BackendFailure::from_error)?;
+                        let refinement = M::split_model_randomness(&root, 2, context)
+                            .map_err(BackendFailure::from_error)?;
+                        M::settle_model_randomness(&[&proposal, &refinement])
+                            .map_err(BackendFailure::from_error)?;
                         Ok(SharedBackboneInput::new(
                             input, options, proposal, refinement,
                         ))
@@ -176,7 +183,7 @@ where
         stage,
         local,
         |status| M::agree_text_preparation(stage, status, context),
-        |error| SpeculativeDriverError::<M::Error>::Preparation(error).into(),
+        |error| eredu_core::BackendFailure::from_error(error).into(),
     )?;
     Ok((SharedBackboneExecutor::new(target, capacity), prepared))
 }
@@ -220,9 +227,6 @@ where
 
     /// Retains the selected target queue without acquiring a submission lease.
     fn target_queue(backend: &B) -> BatchQueue<Self>;
-
-    /// Reports whether native component timing is enabled.
-    fn collect_component_timings() -> bool;
 
     /// Materializes the key for an explicitly stochastic request.
     fn sampling_seed(
@@ -291,10 +295,6 @@ where
 
     fn target_queue(backend: &B) -> BatchQueue<Self> {
         M::target_queue(backend)
-    }
-
-    fn collect_component_timings() -> bool {
-        M::collect_component_timings()
     }
 
     fn sampling_seed(seed: u64) -> Result<<Self::Sampling as eredu_core::speculative::sampling::SpeculativeSamplingPrimitives>::Seed, B::Error> {
@@ -381,7 +381,7 @@ where
             agreement_error,
         )
     };
-    let timings = M::collect_component_timings();
+    let timings = eredu_core::speculative::timing::component_timing_enabled();
     let session = runtime.session_mut();
 
     match route {

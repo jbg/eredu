@@ -197,7 +197,7 @@ pub(crate) fn normalization_spec(
     name: impl Into<String>,
 ) -> Result<NormalizationConstructionSpec, Error> {
     let spec = NormalizationConstructionSpec {
-        reduction: eredu_nn::NormalizationReduction::Native,
+        reduction: config.normalization_reduction(),
         groups: config.normalization_groups(),
         dimensions: config.hidden_size(),
         epsilon: config.rms_norm_epsilon(),

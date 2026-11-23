@@ -15,7 +15,7 @@ checkpoint recipes, equations, state geometry and parallel plans belong to
 | Table residency | Compact recipes expose 128 shards as one logical row source. Lookup deduplicates/coalesces rows, decodes required blocks and retains source/residency leases through completion. |
 | Embedded MTP | SafeTensors supports joint target/prediction construction. GGUF targets accept matching SafeTensors prediction companions through `ExecutionPlan::with_prediction_source`. Prediction state is independent; declared embedding/output parameters belong to the target. |
 | Parallel execution | Ordinary text and media construction supports TP, PP, EP and their combinations. Shared execution conformance covers partition, cache and controlled-session contracts; released distributed numerical parity is unvalidated. |
-| Chunked media/control | `prepare_observed_input` takes a prepared prompt and explicit original decoder IDs. Controlled steps commit one nonfinal chunk without sampling. Captures carry absolute spans; snapshots, restore and fork retain prepared media and completed encoder products. |
+| Chunked media/control | `prepare_observed_input` derives decoder IDs from the prepared prompt. Controlled steps commit one nonfinal chunk without sampling. Captures carry absolute spans; snapshots, restore and fork retain prepared media and completed encoder products. |
 | Tools | Pinned template/tokenizer fixtures exercise thinking controls, preserved reasoning, tagged parameters, EOS and tool-result replay through shared ordinary/controlled drivers. |
 
 The ordinary text/media path uses shared generation, preparation, sampling, termination and

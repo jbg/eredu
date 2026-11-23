@@ -55,6 +55,25 @@ pub enum StateStorageDtype {
 }
 
 impl StateStorageDtype {
+    /// Maps checkpoint storage to the matching floating state representation.
+    /// Encoded weights yield F32 only when the backend supplies that activation.
+    pub fn from_floating_source(
+        source: &TensorDtype,
+        supports_packed_activation: impl Fn(&TensorDtype) -> bool,
+    ) -> Option<Self> {
+        Some(match source {
+            TensorDtype::F16 => Self::F16,
+            TensorDtype::Bf16 => Self::Bf16,
+            TensorDtype::F32 => Self::F32,
+            TensorDtype::F64 => Self::F64,
+            TensorDtype::Complex64 => Self::Complex64,
+            TensorDtype::U32 | TensorDtype::Encoded(_) if supports_packed_activation(source) => {
+                Self::F32
+            }
+            _ => return None,
+        })
+    }
+
     /// Exact neutral tensor scalar representation used by typed state bindings.
     pub const fn element_type(self) -> eredu_nn::TensorElementType {
         use eredu_nn::TensorElementType as Element;
@@ -265,12 +284,12 @@ impl BackendMechanismFacts {
         self
     }
 
-    /// Declares independently addressable storage and exact capacity limits.
+    /// Declares independently addressable storage and its limits, when available.
     pub const fn with_addressable_storage(
         mut self,
-        capabilities: AddressableStorageCapabilities,
+        capabilities: Option<AddressableStorageCapabilities>,
     ) -> Self {
-        self.addressable_storage = Some(capabilities);
+        self.addressable_storage = capabilities;
         self
     }
 }
@@ -287,6 +306,12 @@ pub trait ReplicatedTextMechanismSupport {
 
     /// Reports native realization of one semantically valid direct descriptor.
     fn supports_direct(&self, descriptor: &WeightLoweringDescriptor) -> bool;
+
+    /// Whether a supported original encoding retains the native dot arithmetic
+    /// used for automatic checkpoint representation selection.
+    fn prefers_original_encoding(&self, _descriptor: &WeightLoweringDescriptor) -> bool {
+        false
+    }
 
     /// Reports native realization of one semantically valid transform descriptor.
     fn supports_transform(&self, descriptor: &WeightLoweringDescriptor) -> bool;
@@ -399,13 +424,10 @@ pub trait BackendInspection: PlanMechanismFacts {
         .with_operation("allocator cache policy"))
     }
 
-    /// Observes allocator overhead inputs if the backend exposes a retained cache.
+    /// Observes available allocator counters and any retained cache policy.
     fn allocator_observation(
         &self,
-    ) -> Result<
-        Option<(crate::AllocatorCachePolicyReport, crate::AllocatorTelemetry)>,
-        crate::BackendFailure,
-    > {
+    ) -> Result<Option<crate::AllocatorObservation>, crate::BackendFailure> {
         Ok(None)
     }
 }
@@ -417,6 +439,15 @@ pub trait PlanMechanismFacts: crate::automatic::ColdPlanPlacement {
 
     /// Reports mechanism support without selecting a candidate.
     fn preparation_mechanisms(&self) -> Self::Preparation;
+    /// Validates the requested draft device and reports its exact mechanism support.
+    fn draft_preparation_mechanisms(
+        &self,
+        device: &crate::DevicePlan,
+    ) -> Result<Self::Preparation, crate::AutomaticPlanningError> {
+        self.plan_placement(device, None)?;
+        Ok(self.preparation_mechanisms())
+    }
+
     /// Reports the configured diagnostic observations.
     fn residency_diagnostics(&self) -> ResidencyDiagnostics;
     /// Reports the available prepared-input conversion operations.

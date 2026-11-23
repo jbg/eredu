@@ -684,11 +684,12 @@ fn describe_selected(
                     for (name, reduction, left, right, output) in [
                         (
                             "score",
-                            super::matrix::batched_dot_reduction(
-                                queries,
-                                key_width,
-                                keys,
-                                super::matrix::BatchedDotReduction::Row32,
+                            super::matrix::BatchedDotReduction::for_scores(
+                                eredu_nn::arithmetic::Bf16DotGeometry {
+                                    rows: queries,
+                                    width: key_width,
+                                    columns: keys,
+                                },
                             ),
                             vec![batch, query_heads, tile.0, key_width],
                             vec![batch, kv_heads, key_width, tile.1],
@@ -696,11 +697,12 @@ fn describe_selected(
                         ),
                         (
                             "value",
-                            super::matrix::batched_dot_reduction(
-                                queries,
-                                keys,
-                                value_width,
-                                super::matrix::BatchedDotReduction::Native,
+                            super::matrix::BatchedDotReduction::for_native_values(
+                                eredu_nn::arithmetic::Bf16DotGeometry {
+                                    rows: queries,
+                                    width: keys,
+                                    columns: value_width,
+                                },
                             ),
                             vec![batch, query_heads, tile.0, tile.1],
                             vec![batch, kv_heads, tile.1, value_width],
@@ -796,6 +798,27 @@ fn describe_selected(
                     storage.backing = MechanismBacking::Unknown;
                     storage.detail = format!("selected {path:?} shared physical K/V heads; native layout/dtype conversion may alias input");
                     result.storage.push(storage);
+                }
+                if path == super::attention::AttentionMemoryPath::KeyTiles
+                    && arithmetic == eredu_nn::AttentionArithmetic::InputScores
+                    && element == TensorElementType::Bf16
+                    && cfg!(all(feature = "metal", not(feature = "cuda")))
+                    && device == Some(safemlx::DeviceType::Gpu)
+                {
+                    for (name, dimensions) in [
+                        ("bf16_softmax_lanes", vec![batch, query_heads, tile.0, 4, 2]),
+                        (
+                            "bf16_value_lanes",
+                            vec![batch, query_heads, tile.0, value_width, 4, 2],
+                        ),
+                    ] {
+                        result.storage.push(allocation(
+                            name,
+                            bytes(&dimensions, 4)?,
+                            MechanismStorageRole::Scratch,
+                            StorageRetention::Evaluation,
+                        ));
+                    }
                 }
                 result.missing.push(format!("selected {path:?}: lazy graph retention follows tile evaluation policy; tile count and overlap require lifetime composition"));
             }
@@ -1218,7 +1241,8 @@ fn describe_multi_axis_rotary(
                 "F32 concatenation of axis angles before repeating the half",
             );
         }
-        MultiAxisRotaryLayout::RoundRobinSections => {
+        MultiAxisRotaryLayout::RoundRobinSections
+        | MultiAxisRotaryLayout::RoundRobinSectionsWithZeroOverflow => {
             for name in [
                 "round_robin_host_inverse_frequencies",
                 "round_robin_host_inverse_tensor",
@@ -1253,7 +1277,11 @@ fn describe_multi_axis_rotary(
     if position_element != TensorElementType::I32 {
         result.missing.push("rotary position slicing, offset and clamp representation depends on MLX promotion with I32 scalars for non-I32 position inputs".into());
     }
-    if spec.layout == MultiAxisRotaryLayout::RoundRobinSections {
+    if matches!(
+        spec.layout,
+        MultiAxisRotaryLayout::RoundRobinSections
+            | MultiAxisRotaryLayout::RoundRobinSectionsWithZeroOverflow
+    ) {
         result.missing.push(format!("round-robin constructs {} per-frequency selected position views, offset sums and clamp results before concatenation; their backing, scalar constructors and retirement are undescribed", dimensions / 2));
     }
     result.missing.push("rotary scalar constructors, graph metadata, host Vec capacities, source tensor copying, view backing, fusion and intermediate retirement are not exposed; payloads cannot be summed as a live peak".into());

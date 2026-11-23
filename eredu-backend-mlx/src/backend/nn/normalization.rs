@@ -1,103 +1,18 @@
 //! Native realization of reproducible weighted-normalization arithmetic.
-use safemlx::{error::Exception, Array, Stream};
+use safemlx::{error::Exception, Array, Dtype, Stream};
 
-#[derive(Clone, Copy, Default)]
-struct Moments {
-    count: usize,
-    mean: [f32; 4],
-    square: [f32; 4],
-}
-impl Moments {
-    fn add(&mut self, other: Self) {
-        let count = self.count + other.count;
-        let coefficient = if count == 0 {
-            0.0
-        } else {
-            other.count as f32 / count as f32
-        };
-        for lane in 0..4 {
-            let delta = other.mean[lane] - self.mean[lane];
-            self.mean[lane] += coefficient * delta;
-            self.square[lane] +=
-                other.square[lane] + delta * delta * coefficient * self.count as f32;
-        }
-        self.count = count;
-    }
-}
-
-fn rowwise_moments(values: &[f32], reduced: bool) -> (f32, f32) {
-    let vector = if reduced { 8 } else { 4 };
-    let vectors = values.len() / vector;
-    let chunks = vectors.div_ceil(16);
-    let depth = usize::BITS as usize - chunks.saturating_sub(1).leading_zeros() as usize;
-    let mut stack = vec![Moments::default(); depth.max(1)];
-    for chunk in 0..chunks {
-        let count = 16.min(vectors - chunk * 16);
-        for half in 0..(vector / 4) {
-            let mut local = Moments {
-                count,
-                ..Moments::default()
-            };
-            for index in 0..count {
-                let coefficient = 1.0_f32 / (index + 1) as f32;
-                for lane in 0..4 {
-                    let value = values[(chunk * 16 + index) * vector + half * 4 + lane];
-                    let delta = value - local.mean[lane];
-                    local.mean[lane] += delta * coefficient;
-                    local.square[lane] += delta * (value - local.mean[lane]);
-                }
-            }
-            stack[0].add(local);
-        }
-        let mut mask = chunk + 1;
-        for level in 1..depth {
-            if mask & 1 != 0 {
-                break;
-            }
-            let prior = stack[level - 1];
-            stack[level].add(prior);
-            stack[level - 1] = Moments::default();
-            mask >>= 1;
-        }
-    }
-    for level in 1..depth {
-        let prior = stack[level];
-        stack[0].add(prior);
-    }
-    let mut count = 0usize;
-    let mut mean = 0.0_f32;
-    let mut square = 0.0_f32;
-    for &value in &values[vectors * vector..] {
-        let delta = value - mean;
-        count += 1;
-        mean += delta / count as f32;
-        square += delta * (value - mean);
-    }
-    let additional = vectors * vector / 4;
-    for lane in 0..4 {
-        let next = count + additional;
-        let coefficient = if next == 0 {
-            0.0
-        } else {
-            additional as f32 / next as f32
-        };
-        let delta = stack[0].mean[lane] - mean;
-        mean = coefficient.mul_add(delta, mean);
-        square += (delta * delta * coefficient).mul_add(count as f32, stack[0].square[lane]);
-        count = next;
-    }
-    (mean, square / values.len() as f32)
-}
-
-/// Bounded FP32 moments and affine rounding for reference-ordered LayerNorm.
-pub(crate) fn cascaded_layer_norm(
+/// Portable FP32 reductions using exact row order.
+pub(crate) fn ordered_layer_norm(
     input: &Array,
     weight: Option<&Array>,
     bias: Option<&Array>,
     epsilon: f32,
+    arithmetic: eredu_nn::LayerNormalizationArithmetic,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    use eredu_nn::LayerNormalizationArithmetic;
     use safemlx::{Device, DeviceType, Dtype};
+    let blocked = arithmetic == LayerNormalizationArithmetic::BlockedFloat32;
     let width = input
         .shape()
         .last()
@@ -110,14 +25,15 @@ pub(crate) fn cascaded_layer_norm(
             Dtype::Float32 | Dtype::Float64 | Dtype::Bfloat16 | Dtype::Float16
         )
     };
-    if !floating(input)
+    if (blocked && width % 32 != 0)
+        || !floating(input)
         || [weight, bias]
             .into_iter()
             .flatten()
             .any(|value| !floating(value))
     {
         return Err(Exception::custom(
-            "cascaded layer normalization requires floating representations",
+            "ordered layer normalization requires floating representations",
         ));
     }
     if !epsilon.is_finite()
@@ -128,7 +44,7 @@ pub(crate) fn cascaded_layer_norm(
             .any(|x| x.shape() != [width])
     {
         return Err(Exception::custom(
-            "invalid cascaded layer normalization parameters",
+            "invalid ordered layer normalization parameters",
         ));
     }
     if stream.get_device()?.get_type()? != DeviceType::Cpu {
@@ -136,8 +52,15 @@ pub(crate) fn cascaded_layer_norm(
         let host = input.copy(&cpu)?;
         let weight = weight.map(|value| value.copy(&cpu)).transpose()?;
         let bias = bias.map(|value| value.copy(&cpu)).transpose()?;
-        return cascaded_layer_norm(&host, weight.as_ref(), bias.as_ref(), epsilon, &cpu)?
-            .copy(stream);
+        return ordered_layer_norm(
+            &host,
+            weight.as_ref(),
+            bias.as_ref(),
+            epsilon,
+            arithmetic,
+            &cpu,
+        )?
+        .copy(stream);
     }
     let wide = input
         .as_dtype(Dtype::Float32, stream)?
@@ -156,68 +79,32 @@ pub(crate) fn cascaded_layer_norm(
     let reduced = matches!(input.dtype(), Dtype::Bfloat16 | Dtype::Float16);
     let mut output = Vec::with_capacity(input.size());
     for row in wide.as_slice::<f32>().chunks_exact(width as usize) {
-        let (mean, variance) = rowwise_moments(row, reduced);
-        let inverse = 1.0_f32 / (variance + epsilon).sqrt();
-        let shift = -inverse * mean;
-        for (column, &value) in row.iter().enumerate() {
-            let normalized = if reduced {
-                value * inverse + shift
-            } else {
-                (value - mean) * inverse
-            };
-            output.push(
-                normalized * weight.map_or(1.0, |w| w[column]) + bias.map_or(0.0, |b| b[column]),
-            );
+        if blocked {
+            let start = output.len();
+            output.extend_from_slice(row);
+            let values = &mut output[start..];
+            eredu_nn::arithmetic::normalize_blocked_f32(values, epsilon);
+            for (column, value) in values.iter_mut().enumerate() {
+                if let Some(weight) = weight {
+                    *value *= weight[column];
+                }
+                if let Some(bias) = bias {
+                    *value += bias[column];
+                }
+            }
+            continue;
         }
+        let start = output.len();
+        output.extend_from_slice(row);
+        eredu_nn::arithmetic::normalize_cascaded_f32(
+            &mut output[start..],
+            weight,
+            bias,
+            epsilon,
+            reduced,
+        );
     }
     Array::from_slice(&output, input.shape()).as_dtype(input.dtype(), stream)
-}
-
-fn channel_sum_squares(values: &[f32], parallel: usize) -> f32 {
-    let steps = values.len() / parallel;
-    let log = usize::BITS as usize - steps.saturating_sub(1).leading_zeros() as usize;
-    let power = 4.max(log / 4);
-    let chunk = 1usize << power;
-    let mut sums = [[0.0_f32; 4]; 4];
-    let mut index = 0;
-    while index + chunk <= steps {
-        let end = index + chunk;
-        while index < end {
-            for p in 0..parallel {
-                let value = values[index * parallel + p];
-                sums[0][p] += value * value;
-            }
-            index += 1;
-        }
-        for level in 1..4 {
-            for p in 0..parallel {
-                sums[level][p] += sums[level - 1][p];
-                sums[level - 1][p] = 0.0;
-            }
-            if index & ((chunk - 1) << (level * power)) != 0 {
-                break;
-            }
-        }
-    }
-    while index < steps {
-        for p in 0..parallel {
-            let value = values[index * parallel + p];
-            sums[0][p] += value * value;
-        }
-        index += 1;
-    }
-    for level in 1..4 {
-        for p in 0..parallel {
-            sums[0][p] += sums[level][p];
-        }
-    }
-    for value in &values[steps * parallel..] {
-        sums[0][0] += value * value;
-    }
-    for p in 1..parallel {
-        sums[0][0] += sums[0][p];
-    }
-    sums[0][0]
 }
 
 /// Channel-major RMS traversal without depending on the realized input strides.
@@ -257,8 +144,8 @@ pub(crate) fn channel_major_rms(
         let scale = scale.as_ref().map(|value| value.as_slice::<f32>());
         let mut output = Vec::with_capacity(values.len());
         for (row, values) in values.chunks_exact(width).enumerate() {
-            let parallel = if row % time < (time / 16) * 16 { 1 } else { 4 };
-            let variance = channel_sum_squares(values, parallel) / width as f32;
+            let variance =
+                eredu_nn::arithmetic::channel_major_rms_sum(values, time, row) / width as f32;
             let inverse = 1.0 / (variance + epsilon).sqrt();
             for (column, value) in values.iter().enumerate() {
                 let normalized = value * inverse;
@@ -370,6 +257,13 @@ pub(crate) fn input_precision_rms(
     epsilon: f32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    if input.dtype() == Dtype::Float32
+        && weight.dtype() == Dtype::Float32
+        && input.size() != 0
+        && super::ordered_f32::supported(stream)?
+    {
+        return wide_square_rms(input, weight, epsilon, stream);
+    }
     if matches!(
         input.dtype(),
         safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16
@@ -385,6 +279,84 @@ pub(crate) fn input_precision_rms(
         return weightless_rms(input, epsilon, stream)?.multiply(weight, stream);
     }
     safemlx::fast::rms_norm(input, weight, epsilon, stream)
+}
+
+fn wide_square_rms(
+    input: &Array,
+    weight: &Array,
+    epsilon: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use safemlx::transforms::eval;
+    let width = input.dim(-1);
+    if width <= 0 || weight.shape() != [width] {
+        return Err(Exception::custom("invalid ordered RMS width"));
+    }
+    let rows = input.size() / width as usize;
+    if crate::backend::nn::native_quantization::uses_metal_device(stream.get_device()?.get_type()?)
+    {
+        use safemlx::fast::{CustomKernelConfig, MetalKernel};
+        use std::cell::RefCell;
+        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        let rows = i32::try_from(rows).map_err(|_| Exception::custom("RMS row count overflows"))?;
+        let epsilon = Array::from_slice(&[epsilon], &[1]);
+        let config = CustomKernelConfig::new()
+            .with_template_arg_int("WIDTH", width)
+            .with_grid([rows, 1, 1])
+            .with_thread_group([64, 1, 1])
+            .with_output_arg(input.shape(), Dtype::Float32);
+        return KERNEL.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "wide_square_rms",
+                    ["input", "gain", "epsilon"],
+                    ["out"],
+                    r#"
+                    uint row = thread_position_in_grid.x;
+                    size_t offset = size_t(row) * WIDTH;
+                    float high = 0.0f;
+                    float low = 0.0f;
+                    for (uint i = 0; i < WIDTH; ++i) {
+                        float x = input[offset + i];
+                        float y = x * x;
+                        float s = high + y;
+                        float v = s - high;
+                        float e = (high - (s - v)) + (y - v) + low;
+                        high = s + e;
+                        low = e - (high - s);
+                    }
+                    float mean = metal::precise::divide(high, float(WIDTH));
+                    mean += metal::precise::divide(fma(-mean, float(WIDTH), high) + low, float(WIDTH));
+                    float inverse = metal::precise::divide(1.0f, metal::precise::sqrt(mean + epsilon[0]));
+                    for (uint i = 0; i < WIDTH; ++i) out[offset + i] = (input[offset + i] * inverse) * gain[i];
+                    "#,
+                    "#pragma clang fp contract(off)\n",
+                    true,
+                    false,
+                )?);
+            }
+            cell.borrow().as_ref().expect("RMS kernel initialized")
+                .apply_one_device([input, weight, &epsilon], &config, stream)
+        });
+    }
+    let contiguous = input.contiguous(false, stream)?;
+    eval([&contiguous, weight])?;
+    let x = contiguous.evaluated()?;
+    let gain = weight
+        .evaluated()?
+        .try_to_vec::<f32>()
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let x = x
+        .try_as_slice::<f32>()
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let mut output = Vec::with_capacity(input.size());
+    for row in x.chunks_exact(width as usize) {
+        let sum: f64 = row.iter().map(|&x| f64::from(x * x)).sum();
+        let mean = (sum / f64::from(width)) as f32;
+        let inverse = (mean + epsilon).sqrt().recip();
+        output.extend(row.iter().zip(&gain).map(|(&x, &w)| (x * inverse) * w));
+    }
+    Array::from_slice(&output, input.shape()).copy(stream)
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -684,74 +656,6 @@ pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Arra
 
 // Four vector lanes and four independent accumulation chains, with the same
 // four-level carry and scalar-tail merge as rms_cascade.metal.
-fn contiguous_sum_squares<const LANES: usize>(values: &[f32]) -> f32 {
-    let vectors = values.len() / LANES;
-    let steps = vectors / 4;
-    let log = usize::BITS as usize - steps.saturating_sub(1).leading_zeros() as usize;
-    let power = 4.max(log / 4);
-    let chunk = 1usize << power;
-    let mut sums = [[[0.0_f32; LANES]; 4]; 4];
-    let mut index = 0;
-    while index + chunk <= steps {
-        let end = index + chunk;
-        while index < end {
-            for p in 0..4 {
-                for lane in 0..LANES {
-                    let value = values[(index * 4 + p) * LANES + lane];
-                    sums[0][p][lane] += value * value;
-                }
-            }
-            index += 1;
-        }
-        for level in 1..4 {
-            for p in 0..4 {
-                for lane in 0..LANES {
-                    sums[level][p][lane] += sums[level - 1][p][lane];
-                    sums[level - 1][p][lane] = 0.0;
-                }
-            }
-            if index & ((chunk - 1) << (level * power)) != 0 {
-                break;
-            }
-        }
-    }
-    while index < steps {
-        for p in 0..4 {
-            for lane in 0..LANES {
-                let value = values[(index * 4 + p) * LANES + lane];
-                sums[0][p][lane] += value * value;
-            }
-        }
-        index += 1;
-    }
-    for level in 1..4 {
-        for p in 0..4 {
-            for lane in 0..LANES {
-                sums[0][p][lane] += sums[level][p][lane];
-            }
-        }
-    }
-    for vector in steps * 4..vectors {
-        for lane in 0..LANES {
-            let value = values[vector * LANES + lane];
-            sums[0][0][lane] += value * value;
-        }
-    }
-    for p in 1..4 {
-        for lane in 0..LANES {
-            sums[0][0][lane] += sums[0][p][lane];
-        }
-    }
-    let mut sum = 0.0_f32;
-    for &value in &values[vectors * LANES..] {
-        sum += value * value;
-    }
-    for lane in 0..LANES {
-        sum += sums[0][0][lane];
-    }
-    sum
-}
-
 /// Explicit contiguous FP32 reduction; native backend normalization remains a
 /// separate policy. Metal shares the existing grouped cascade with one group.
 pub(crate) fn cascaded_rms(
@@ -795,7 +699,7 @@ pub(crate) fn cascaded_rms(
     let weight = weight.as_ref().map(|value| value.as_slice::<f32>());
     let mut output = Vec::with_capacity(input.size());
     for row in wide.as_slice::<f32>().chunks_exact(width as usize) {
-        let variance = contiguous_sum_squares::<4>(row) / width as f32;
+        let variance = eredu_nn::arithmetic::cascaded_sum_squares::<4>(row) / width as f32;
         let inverse = 1.0_f32 / (variance + epsilon).sqrt();
         for (column, &value) in row.iter().enumerate() {
             let normalized = value * inverse;
@@ -830,7 +734,7 @@ pub(crate) fn eight_lane_rms(
         let width = input.dim(-1) as usize;
         let mut output = Vec::with_capacity(input.size());
         for row in values.as_slice::<f32>().chunks_exact(width) {
-            let variance = contiguous_sum_squares::<8>(row) / width as f32;
+            let variance = eredu_nn::arithmetic::cascaded_sum_squares::<8>(row) / width as f32;
             let inverse = 1.0_f32 / (variance + epsilon).sqrt();
             output.extend(row.iter().map(|value| value * inverse));
         }

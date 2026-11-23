@@ -9,6 +9,8 @@ pub enum NativeQuantizationFormat {
     GgufNvFp4,
     /// GGUF Q4_0 blocks with one FP16 scale per 32 signed values.
     GgufQ4_0,
+    /// GGUF Q5_0 blocks with an FP16 scale per 32 signed values.
+    GgufQ5_0,
     /// GGUF/GGML Q4_K blocks: 256 weights in 144 bytes.
     GgufQ4K,
     /// GGUF/GGML Q5_K blocks: 256 weights in 176 bytes.
@@ -45,6 +47,7 @@ impl NativeQuantizationFormat {
         Some(match ty {
             GgmlType::NvFp4 => Self::GgufNvFp4,
             GgmlType::Q4_0 => Self::GgufQ4_0,
+            GgmlType::Q5_0 => Self::GgufQ5_0,
             GgmlType::Q4K => Self::GgufQ4K,
             GgmlType::Q5K => Self::GgufQ5K,
             GgmlType::Q6K => Self::GgufQ6K,
@@ -68,6 +71,7 @@ impl NativeQuantizationFormat {
         Some(match self {
             Self::GgufNvFp4 => GgmlType::NvFp4,
             Self::GgufQ4_0 => GgmlType::Q4_0,
+            Self::GgufQ5_0 => GgmlType::Q5_0,
             Self::GgufQ4K => GgmlType::Q4K,
             Self::GgufQ5K => GgmlType::Q5K,
             Self::GgufQ6K => GgmlType::Q6K,
@@ -182,14 +186,14 @@ impl NativeQuantizedTensor {
             )));
         }
         let expected = i64::from(matrix_count)
-            * i64::from(physical_rows)
-            * i64::from(columns / block_values)
-            * i64::from(block_bytes);
+            .checked_mul(i64::from(physical_rows))
+            .and_then(|rows| rows.checked_mul(i64::from(columns / block_values)))
+            .and_then(|blocks| blocks.checked_mul(i64::from(block_bytes)));
         if matrix_count <= 0
             || physical_rows <= 0
             || columns <= 0
             || columns % block_values != 0
-            || expected != bytes.size() as i64
+            || expected != Some(bytes.size() as i64)
         {
             return Err(Exception::custom(format!(
                 "native {format:?} storage shape mismatch: logical {shape:?}, {} bytes",
@@ -226,8 +230,9 @@ impl NativeQuantizedTensor {
 
     /// Applies this native matrix to `input`.
     ///
-    /// Metal uses direct block dequantization. CPU and unsupported devices use
-    /// a transient float matrix without retaining affine companions.
+    /// Supported little-endian formats contract binary32 activations with the
+    /// original integer weight blocks. Other formats use bounded float decoding
+    /// or a native device kernel.
     pub fn linear(
         &self,
         input: &Array,
@@ -239,7 +244,32 @@ impl NativeQuantizedTensor {
                 "native linear expects a single logical matrix",
             ));
         }
-        if native_execution_backend(stream)? == NativeExecutionBackend::Metal && transpose {
+        let backend = native_execution_backend(stream)?;
+        if let Some(encoding) = self.format().ggml_type().filter(|ty| {
+            transpose
+                && input.dtype() == Dtype::Float32
+                && ((backend == NativeExecutionBackend::Metal && *ty != GgmlType::NvFp4)
+                    || stream
+                        .get_device()
+                        .and_then(|device| device.get_type())
+                        .ok()
+                        == Some(DeviceType::Cpu))
+                && self.storage.endian == GgufEndian::Little
+                && eredu_gguf::packed_dot::supports_packed_dot(*ty)
+        }) {
+            if input.shape().last() != Some(&self.columns) {
+                return Err(Exception::custom("packed projection input width mismatch"));
+            }
+            return match backend {
+                NativeExecutionBackend::Metal => {
+                    super::packed_metal::linear(input, self, encoding, stream)
+                }
+                NativeExecutionBackend::GenericFallback => {
+                    packed_linear_cpu(input, self, encoding, stream)
+                }
+            };
+        }
+        if backend == NativeExecutionBackend::Metal && transpose {
             return match self.format() {
                 NativeQuantizationFormat::GgufNvFp4 => nvfp4_linear_metal(input, self, stream),
                 NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
@@ -291,53 +321,20 @@ impl NativeQuantizedTensor {
     pub fn dequantize(&self, stream: &Stream) -> Result<Array, Exception> {
         let evaluated = self.storage.bytes.evaluated()?;
         let raw = evaluated.as_slice::<u8>();
-        let values = match self.format() {
-            NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
-                decode_q4k_view(raw, self)?
-            }
-            NativeQuantizationFormat::GgufQ5_1 if self.storage.endian == GgufEndian::Little => {
-                decode_q5_1_view(raw, self)?
-            }
-            NativeQuantizationFormat::GgufQ8_0 if self.storage.endian == GgufEndian::Little => {
-                decode_q8_0_view(raw, self)?
-            }
-            format => {
-                let ty = format.ggml_type().expect("IQ format");
-                let physical_shape = if self.matrix_count == 1 {
-                    vec![self.physical_rows as u64, self.columns as u64]
-                } else {
-                    vec![
-                        self.matrix_count as u64,
-                        self.physical_rows as u64,
-                        self.columns as u64,
-                    ]
-                };
-                let tensor = eredu_gguf::IQuantTensor {
-                    shape: physical_shape,
-                    ggml_type: ty,
-                    endian: self.storage.endian,
-                    data: raw.to_vec(),
-                };
-                let all = tensor
-                    .dequantize_f32()
-                    .map_err(|error| Exception::custom(error.to_string()))?;
-                if self.row_start == 0 && self.rows == self.physical_rows {
-                    all
-                } else {
-                    let mut selected = Vec::with_capacity(
-                        self.matrix_count as usize * self.rows as usize * self.columns as usize,
-                    );
-                    let matrix_stride = self.physical_rows as usize * self.columns as usize;
-                    for matrix in 0..self.matrix_count as usize {
-                        let start = matrix * matrix_stride
-                            + self.row_start as usize * self.columns as usize;
-                        let end = start + self.rows as usize * self.columns as usize;
-                        selected.extend_from_slice(&all[start..end]);
-                    }
-                    selected
-                }
-            }
-        };
+        let packed = self.packed_rows(raw)?;
+        let matrix_len = (self.rows as usize)
+            .checked_mul(self.columns as usize)
+            .ok_or_else(|| Exception::custom("native decoded matrix size overflows"))?;
+        let count = (self.matrix_count as usize)
+            .checked_mul(matrix_len)
+            .ok_or_else(|| Exception::custom("native decoded view size overflows"))?;
+        let mut values = vec![0.0; count];
+        for (matrix, output) in values.chunks_exact_mut(matrix_len).enumerate() {
+            let start = self.physical_row(matrix as i32, 0)?;
+            packed
+                .decode_rows(start..start + self.rows as usize, output)
+                .map_err(block_decode_error)?;
+        }
         let shape = if self.matrix_count == 1 {
             vec![self.rows, self.columns]
         } else {
@@ -386,11 +383,13 @@ impl NativeQuantizedTensor {
         let evaluated_storage = self.storage.bytes.evaluated()?;
         let raw = evaluated_storage.as_slice::<u8>();
 
+        let packed = self.packed_rows(raw)?;
+        let mut weights = vec![0.0; self.columns as usize];
         let output_width = if transpose { self.rows } else { self.columns };
         let mut output = vec![0.0f32; outer as usize * output_width as usize];
         if transpose {
             for output_row in 0..self.rows {
-                let weights = decode_native_row(raw, self, 0, output_row)?;
+                self.decode_row(&packed, 0, output_row, &mut weights)?;
                 for input_row in 0..outer as usize {
                     let input_start = input_row * self.columns as usize;
                     output[input_row * self.rows as usize + output_row as usize] = dot_f32(
@@ -401,7 +400,7 @@ impl NativeQuantizedTensor {
             }
         } else {
             for weight_row in 0..self.rows {
-                let weights = decode_native_row(raw, self, 0, weight_row)?;
+                self.decode_row(&packed, 0, weight_row, &mut weights)?;
                 for input_row in 0..outer as usize {
                     let scale = input_values[input_row * self.rows as usize + weight_row as usize];
                     let output_row = &mut output[input_row * self.columns as usize
@@ -428,15 +427,21 @@ impl NativeQuantizedTensor {
         let index_values = evaluated_indices.as_slice::<i32>();
         let evaluated_storage = self.storage.bytes.evaluated()?;
         let raw = evaluated_storage.as_slice::<u8>();
-        let mut output = Vec::with_capacity(index_values.len() * self.columns as usize);
-        for &index in index_values {
+        let packed = self.packed_rows(raw)?;
+        let columns = self.columns as usize;
+        let count = index_values
+            .len()
+            .checked_mul(columns)
+            .ok_or_else(|| Exception::custom("native decoded embedding size overflows"))?;
+        let mut output = vec![0.0; count];
+        for (&index, row) in index_values.iter().zip(output.chunks_exact_mut(columns)) {
             if index < 0 || index >= self.rows {
                 return Err(Exception::custom(format!(
                     "native embedding index {index} is outside 0..{}",
                     self.rows
                 )));
             }
-            output.extend(decode_native_row(raw, self, 0, index)?);
+            self.decode_row(&packed, 0, index, row)?;
         }
         let mut shape = indices.shape().to_vec();
         shape.push(self.columns);

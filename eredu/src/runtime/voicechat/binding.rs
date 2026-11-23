@@ -1,6 +1,9 @@
 //! Architecture-owned speech startup and invocation over native mechanisms.
 
-use eredu_core::realtime_mechanisms::{RealtimeQueue, RealtimeStartupMechanisms};
+use eredu_core::{
+    realtime_mechanisms::{RealtimeQueue, SpeechRealtimeNative},
+    sampling::{host_random::HostRandomState, host_tensor::HostTensorSampling},
+};
 use std::sync::Arc;
 
 use eredu_architectures::voicechat::{
@@ -18,27 +21,26 @@ use super::{
 };
 use crate::api::realtime::{PreparedSpeechSelection, ShareSpeechExecution, SpeechRealtimeSession};
 
-type NativeTensor<M> = <<M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::Neural as eredu_nn::NeuralBackend>::Tensor;
+type NativeTensor<M> = <<M as SpeechRealtimeNative>::Neural as eredu_nn::NeuralBackend>::Tensor;
 
+type Completion<M> = <<M as SpeechRealtimeNative>::Queue as RealtimeQueue>::Completion;
 type Components<M> = BoundVoiceChatComponents<
-    <M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::Neural,
-    eredu_runtime::state::HybridState<
-        <M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::CacheBackend,
-    >,
-    <M as eredu_core::realtime_mechanisms::SpeechRealtimeNative>::Components,
+    <M as SpeechRealtimeNative>::Neural,
+    eredu_runtime::state::HybridState<<M as SpeechRealtimeNative>::CacheBackend>,
+    <M as SpeechRealtimeNative>::Components,
     std::convert::Infallible,
 >;
 type SpeechGeneration<M> = Generation<
     NativeTensor<M>,
     eredu_runtime::SpeechRealtimeState<M>,
-    <M as RealtimeStartupMechanisms>::Random,
-    <M as RealtimeStartupMechanisms>::Completion,
+    HostRandomState,
+    Completion<M>,
 >;
 type SpeechBranch<M> = LocalInvocationBranch<
     NativeTensor<M>,
     eredu_runtime::SpeechRealtimeStateBranch<M>,
-    <M as RealtimeStartupMechanisms>::Random,
-    <M as RealtimeStartupMechanisms>::Completion,
+    HostRandomState,
+    Completion<M>,
 >;
 
 struct SpeechExecutor<M: SpeechRealtimeMechanisms> {
@@ -86,7 +88,7 @@ impl<M: SpeechRealtimeMechanisms>
                     self.execution.queue().readback(),
                 )),
                 |components, branch, context, begin| {
-                    components.invoke_local::<M::Sampling, _, _>(
+                    components.invoke_local::<HostTensorSampling<NativeTensor<M>>, _, _>(
                         invocation,
                         branch,
                         self.inputs.input_limits,

@@ -70,7 +70,7 @@ fn fixture_conditioned_profile(scratch: MemoryBytes) -> ConditionedAssistantMemo
                 execution_workspace: MemoryBytes::exact(0),
             },
         ),
-        host_execution: false,
+        placement: base.placement,
         native_workspace: scratch,
     }
 }
@@ -180,7 +180,7 @@ fn conditioned_parameter_pools_use_capacity_and_cache_limits_without_hiding_unkn
         profile.residency = residency;
         profile.parameter_bounds = Some(bounds.clone());
         profile.parameter_loading = None;
-        profile.host_execution = host_execution;
+        profile.placement.host_execution = host_execution;
         let p = &mut profile.parameters.parameters;
         p.physical_semantics = semantics;
         p.logical_parameter_bytes = Observed::exact(600, "fixture unit payloads");

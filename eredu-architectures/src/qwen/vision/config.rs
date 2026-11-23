@@ -29,7 +29,28 @@ pub fn prompt_cache_architecture_fingerprint(config: &VisionConfig) -> String {
                 "linear_formats",
                 crate::cache_identity::debug_map(Some(&config.linear_formats)),
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            config
+                .antialias_positions
+                .then(|| ("position_filter", "half_pixel_antialias".into())),
+        )
+        .chain(
+            config
+                .split_temporal_patches
+                .then(|| ("patch_reduction", "separate_temporal".into())),
+        )
+        .chain(
+            config
+                .fp16_video_patches
+                .then(|| ("video_prefill", "media_segments_f16_patches".into())),
+        )
+        .chain(
+            config
+                .fp16_gelu
+                .then(|| ("vision_gelu", "gelu_tanh_f16".into())),
+        ),
     )
 }
 
@@ -86,6 +107,14 @@ pub struct VisionConfig {
     pub num_heads: i32,
     /// Number of learned spatial positions.
     pub num_position_embeddings: i32,
+    /// Resize the learned table with a half-pixel, normalized triangle filter.
+    pub(super) antialias_positions: bool,
+    /// Sum independently projected temporal patches before adding the shared bias.
+    pub(super) split_temporal_patches: bool,
+    /// Use FP16 accumulation for the separate temporal patch projections of video.
+    fp16_video_patches: bool,
+    /// Use binary16-rounded tanh GELU in the vision blocks and mergers.
+    pub(super) fp16_gelu: bool,
     /// Input channel count.
     pub in_channels: i32,
     /// Spatial patch size.
@@ -103,6 +132,22 @@ pub struct VisionConfig {
 }
 
 impl VisionConfig {
+    pub(crate) fn arithmetic_capabilities(&self) -> eredu_nn::NeuralOperatorCapabilities {
+        use eredu_nn::NeuralOperatorCapabilities as C;
+        let mut requirements = C::NONE;
+        if self.fp16_gelu {
+            requirements = requirements.union(C::GELU_APPROXIMATE_F16);
+        }
+        if self.fp16_video_patches {
+            requirements = requirements.union(C::FUSED_F16_PROJECTION);
+        }
+        requirements
+    }
+
+    pub(in crate::qwen) fn fp16_video_patches(&self) -> bool {
+        self.fp16_video_patches
+    }
+
     /// Number of vision blocks.
     pub fn layer_count(&self) -> usize {
         self.layer_schedule.len()
@@ -406,6 +451,10 @@ impl VisionConfigSource {
             intermediate_size: self.intermediate_size,
             num_heads: self.num_heads,
             num_position_embeddings: self.num_position_embeddings,
+            antialias_positions: false,
+            split_temporal_patches: false,
+            fp16_video_patches: false,
+            fp16_gelu: false,
             in_channels: self.in_channels,
             patch_size: self.patch_size,
             spatial_merge_size: self.spatial_merge_size,
@@ -534,6 +583,10 @@ pub fn config_from_gguf_catalog(
         num_position_embeddings: i32::try_from(position_shape[0]).map_err(|_| {
             VisionConfigError::Invalid("projector position count exceeds i32".into())
         })?,
+        antialias_positions: mode == VisionMode::DeepStack,
+        split_temporal_patches: mode == VisionMode::DeepStack,
+        fp16_video_patches: mode == VisionMode::DeepStack,
+        fp16_gelu: mode == VisionMode::DeepStack,
         in_channels: 3,
         patch_size: integer("clip.vision.patch_size")?,
         spatial_merge_size: integer("clip.vision.spatial_merge_size")?,

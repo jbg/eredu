@@ -20,5 +20,8 @@ compile_error!(
 
 /// High-level model loading, dispatch, and request APIs.
 pub mod api;
+/// Native factories available to the portable execution-plan APIs.
+#[cfg(any(feature = "mlx", feature = "candle"))]
+pub mod backends;
 /// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;

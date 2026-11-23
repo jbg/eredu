@@ -91,40 +91,22 @@ impl PhysicalEmbedding {
                 stream,
             );
         }
-        use safemlx::ops::indexing::TryIndexOp;
-        let shape = coefficients.shape();
-        let flat = coefficients.reshape(&[-1, vocabulary], stream)?;
-        let mut result: Option<Array> = None;
-        let mut output_dtype = None;
-        for start in (0..vocabulary).step_by(512) {
-            let end = (start + 512).min(vocabulary);
-            let ids = Array::arange::<i32, i32>(Some(start), end, None, stream)?;
-            let rows = self.forward(&ids, stream)?;
-            output_dtype = Some(rows.dtype());
-            // Round coefficients to table arithmetic once, then accumulate
-            // across blocks in FP32. Rounding each block's output changes the
-            // embedding with the chosen residency granularity.
-            let weights = flat
-                .try_index_device((.., start..end), stream)?
-                .as_dtype(rows.dtype(), stream)?
-                .as_dtype(Dtype::Float32, stream)?;
-            let contribution = matmul(weights, rows.as_dtype(Dtype::Float32, stream)?, stream)?;
-            let value = match result {
-                Some(previous) => previous.add(contribution, stream)?,
-                None => contribution,
-            };
-            // Completion bounds decoded rows and the accumulation graph to one
-            // block. The resulting embedding remains a native tensor.
-            safemlx::transforms::eval([&value])?;
-            result = Some(value);
-        }
-        let value = result
-            .ok_or_else(|| Exception::custom("weighted embedding has an empty vocabulary"))?;
-        let mut output_shape = shape.to_vec();
-        *output_shape.last_mut().unwrap() = value.dim(-1);
-        value
-            .as_dtype(output_dtype.unwrap(), stream)?
-            .reshape(&output_shape, stream)
+        eredu_nn::weighted_embedding::weighted_embedding_rows(
+            &crate::MlxTensor::from_array(coefficients.clone()),
+            vocabulary,
+            stream,
+            |ids| {
+                self.forward(ids.as_array(), stream)
+                    .map(crate::MlxTensor::from_array)
+                    .map_err(eredu_nn::Error::backend_source)
+            },
+            |value| {
+                safemlx::transforms::eval([value.as_array()])
+                    .map_err(eredu_nn::Error::backend_source)
+            },
+        )
+        .map(|value| value.as_array().clone())
+        .map_err(Exception::from_source)
     }
 
     pub(crate) fn as_linear(&self, input: &Array, stream: &Stream) -> Result<Array, Exception> {

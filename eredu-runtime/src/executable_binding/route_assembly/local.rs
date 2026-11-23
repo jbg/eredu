@@ -38,10 +38,6 @@ where
         A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
         A::StaticModules: Clone;
 
-    fn construction_started(&mut self) {
-        self.observe_construction();
-    }
-
     fn context(&self) -> &B::Executor {
         self.session_context()
     }
@@ -100,10 +96,6 @@ where
     type Output = InstalledTextExecutable<LocalTextTypes<N>>;
     type Error = Failure<N>;
 
-    fn construction_started(&mut self) {
-        self.observe_construction();
-    }
-
     type BoundRouted<A>
         = BoundRoutedText<B, A, P, N::Mechanisms<A>, N, ()>
     where
@@ -136,10 +128,6 @@ where
 {
     type Output = InstalledTextExecutable<LocalTextTypes<N>>;
     type Error = Failure<N>;
-
-    fn construction_started(&mut self) {
-        self.observe_construction();
-    }
 
     type BoundComposite<A>
         = BoundTextSession<

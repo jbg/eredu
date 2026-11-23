@@ -19,6 +19,7 @@ pub use paged_append_stream::PagedAppendStream;
 mod paged_key_value;
 pub use paged_key_value::PagedKeyValueCache;
 mod resident_key_value;
+pub(crate) mod resident_persistence;
 pub use compressed::CompressedLatentCache;
 pub use resident_key_value::ResidentKeyValueCache;
 mod persistence;

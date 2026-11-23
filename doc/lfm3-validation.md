@@ -1365,6 +1365,34 @@ cargo run -p eredu --no-default-features --features mlx,audio --example lfm3_aud
   --gguf-projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf"
 ```
 
+### Q4_K_M local Audio tasks
+
+With the pinned Q4_K_M backbone, projector and publisher tokenizer assets,
+the public speech-synthesis task emits 7,680 finite mono PCM samples on
+Candle CPU, Candle Metal, and MLX CPU for `Hello.` at seed 7 and a four-slot
+budget. On both Candle devices, the response task accepts 2,151 samples of
+440 Hz input in two chunks, closes the input, and emits text and 23,040
+finite PCM samples at a 24-slot budget with the same seed. PCM differs
+between the two Candle devices. The Candle Metal transcription task
+processes zero-based frames 10–26 of NVIDIA's 16 kHz `sample_general.wav`
+in chunks of up to 3,200 samples and returns ` Hello?` after input closure.
+
+```sh
+audio_dir=/private/tmp/eredu-audio-gguf
+cargo run -p eredu-cli --no-default-features --features candle,realtime -- \
+  audio speak --backend candle --device cpu \
+  --model "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
+  --projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" \
+  --assets /private/tmp/lfm3-audio --text 'Hello.' --seed 7 \
+  --max-slots 4 --output /private/tmp/lfm3-candle-speech.wav
+cargo run -p eredu-cli --no-default-features --features candle-metal,realtime -- \
+  audio speak --backend candle --device metal:0 \
+  --model "$audio_dir/LFM3-Audio-2B-Q4_K_M.gguf" \
+  --projector "$audio_dir/mmproj-LFM3-Audio-2B-Q4_K_M.gguf" \
+  --assets /private/tmp/lfm3-audio --text 'Hello.' --seed 7 \
+  --max-slots 4 --output /private/tmp/lfm3-candle-metal-speech.wav
+```
+
 ### Q4_K_M mixed Audio scores
 
 The independent runner uses the same pinned Audio backbone and projector as
@@ -1860,6 +1888,18 @@ maximum calibrated probability error is `2.01e-7`. The selected labels and
 ordinal level match. The comparison uses the same `5e-5` logit and `1e-5`
 probability tolerances as the single-choice fixture. Advancing the public
 controlled session yields the same result as the convenience call.
+
+### Candle typed decisions
+
+The public `--decisions` route evaluates the pinned F32 d1-2B model on
+Candle through the same prepared decision program as MLX. The mixed text
+fixture yields the same 204 input tokens, answer kinds, selected labels,
+and ordinal level on Candle CPU, Candle Metal, and MLX CPU. The maximum
+absolute probability differences from MLX CPU are `5.15e-7` on Candle CPU
+and `7.27e-7` on Candle Metal. A 256×256 RGB image and one yes/no question
+yield the same 92 input tokens on Candle Metal and MLX CPU and differ in
+probability by `8.72e-9`. Each run uses the same calibration sidecar and
+generates zero tokens.
 
 ### Text span extraction
 

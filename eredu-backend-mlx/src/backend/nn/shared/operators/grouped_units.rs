@@ -1,5 +1,5 @@
 use super::*;
-use eredu_nn::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
+use eredu_nn::{GroupedUnitBatch, GroupedUnitObserver};
 
 struct NativeUnitObserver<'a> {
     inner: &'a mut dyn GroupedUnitObserver<MlxTensor>,
@@ -19,25 +19,12 @@ impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
                 total_token_count: batch.total_token_count,
                 group_count: batch.group_count,
             };
-            self.inner.observe(&batch)?;
-            let replacement = self.inner.intervene(&batch)?;
-            let effective = replacement.as_ref().unwrap_or(batch.values);
-            if effective.shape() != batch.values.shape() {
-                return Err(ComputeError::backend_source(
-                    GroupedUnitError::ReplacementShape {
-                        expected: batch.values.shape().to_vec(),
-                        actual: effective.shape().to_vec(),
-                    },
-                ));
-            }
-            if effective.as_array().dtype() != batch.values.as_array().dtype() {
-                return Err(ComputeError::backend_source(
-                    GroupedUnitError::ReplacementDtype,
-                ));
-            }
-            self.inner
-                .observe_effective(&batch.with_values(effective))?;
-            Ok(effective.as_array().clone())
+            Ok(batch
+                .apply_observer(self.inner, |original, effective| {
+                    original.as_array().dtype() == effective.as_array().dtype()
+                })?
+                .as_array()
+                .clone())
         })();
         result.map_err(|error: ComputeError| {
             let native = Exception::custom(error.to_string());

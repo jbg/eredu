@@ -481,6 +481,58 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
         )
     }
 
+    /// Prepares a controlled run from admitted tensors and the architecture's decoder IDs.
+    pub fn prepare_controlled_input(
+        &self,
+        chat: &PreparedChat,
+        prompt: S::Prompt,
+        settings: PreparedChatGenerationSettings,
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError>
+    where
+        S: eredu_core::ModelCapabilitySession<B>,
+    {
+        self.prepare_generation_input(
+            chat,
+            prompt,
+            settings,
+            super::GenerationControlOptions::default().trace_limits,
+            #[cfg(feature = "tensor-capture")]
+            CapturePlan::none(),
+        )
+    }
+
+    pub(super) fn prepare_generation_input(
+        &self,
+        chat: &PreparedChat,
+        prompt: S::Prompt,
+        settings: PreparedChatGenerationSettings,
+        trace_limits: TraceLimits,
+        #[cfg(feature = "tensor-capture")] plan: CapturePlan,
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError>
+    where
+        S: eredu_core::ModelCapabilitySession<B>,
+    {
+        let count = S::count_prepared_input(&self.runtime, &prompt)?;
+        let ids = S::prepared_input_token_ids(&self.runtime, &prompt)
+            .map_err(PreparedChatError::Backend)?;
+        if u64::try_from(ids.len()).ok() != Some(count.model_positions) {
+            return Err(PreparedChatError::Alignment {
+                expected: count.model_positions,
+                actual: ids.len(),
+            });
+        }
+        let mut generation = self.prepare_generation(
+            chat,
+            ids,
+            settings,
+            trace_limits,
+            #[cfg(feature = "tensor-capture")]
+            plan,
+        )?;
+        generation.prompt = Some(prompt);
+        Ok(generation)
+    }
+
     pub(super) fn prepare_controlled_token_ids(
         &self,
         chat: &PreparedChat,
@@ -541,9 +593,6 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
         trace_limits: TraceLimits,
         #[cfg(feature = "tensor-capture")] plan: CapturePlan,
     ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
-        if self.prompt_cache_store.is_some() {
-            return Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store for observed execution".into()).into());
-        }
         if prompt_token_ids.is_empty()
             || prompt_token_ids
                 .iter()
@@ -594,30 +643,21 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
     }
 
     /// Admits an already prepared text/media prompt for observed or controlled execution.
-    /// `original_token_ids` must be the complete ordered decoder IDs retained by
-    /// `prompt`, including media placeholders. They provide capture and trace alignment;
-    /// embeddings are never used to reconstruct IDs. The backend still validates the
-    /// prepared input and its full decoder geometry before executing any chunk.
+    /// Trace and capture alignment comes from the prompt's retained decoder IDs,
+    /// including architecture-declared media placeholders.
     #[cfg(feature = "tensor-capture")]
     pub fn prepare_observed_input(
         &self,
         chat: &PreparedChat,
         prompt: S::Prompt,
-        original_token_ids: Vec<u32>,
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError> {
-        let mut prepared = self.prepare_observed_token_ids(
-            chat,
-            original_token_ids,
-            settings,
-            #[cfg(feature = "tensor-capture")]
-            plan,
-            trace_limits,
-        )?;
-        prepared.prompt = Some(prompt);
-        Ok(prepared)
+    ) -> Result<PreparedObservedGeneration<S::Prompt>, PreparedChatError>
+    where
+        S: eredu_core::ModelCapabilitySession<B>,
+    {
+        self.prepare_generation_input(chat, prompt, settings, trace_limits, plan)
     }
 
     /// Runs a prepared observed request with explicit output interpretation.
@@ -633,9 +673,7 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> LoadedModel<B, S> {
     where
         F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
     {
-        let identity = if self.prompt_cache_store.is_some() {
-            Err(CaptureError::Unsupported("automatic prompt-cache store publication is outside controlled snapshot and observation budgets; remove the configured store for observed execution".into()).into())
-        } else if prepared.session_identity != self.session_identity {
+        let identity = if prepared.session_identity != self.session_identity {
             Err(CaptureError::Invalid(
                 "observed request belongs to a different loaded session".into(),
             )

@@ -349,12 +349,17 @@ fn quantization(args: &Args) -> Result<SpeechQuantizationPolicy> {
     }
     Ok(policy)
 }
-pub fn run(
-    factory: &(impl eredu::api::BackendInspection + eredu::api::realtime::RealtimeBackendFactory),
+pub fn run<F>(
+    create_factory: impl FnOnce(Option<CliDevice>) -> Result<F>,
     args: Args,
     timing: bool,
     total_started: Instant,
-) -> Result<()> {
+) -> Result<()>
+where
+    F: eredu::api::BackendInspection
+        + eredu_core::BackendHardware
+        + eredu::api::realtime::RealtimeBackendFactory,
+{
     #[cfg(feature = "system-audio")]
     if args.list_audio_devices {
         for device in eredu_media::audio::system::devices()? {
@@ -427,17 +432,18 @@ pub fn run(
         load::Device::Cpu => None,
         load::Device::Gpu => Some(CliDevice::Gpu(0)),
     });
-    let device = crate::resolve_device(&crate::discover_devices(factory)?, requested_device)?;
+    let factory = create_factory(requested_device)?;
+    let device = crate::resolve_device(&crate::discover_devices(&factory)?, requested_device)?;
     let sampling = eredu_architectures::voicechat::agent_sampling::AgentSamplingPolicy::new(
         args.common.temperature.unwrap_or(0.0),
         args.common.top_p.unwrap_or(1.0),
         args.common.repeat_penalty.unwrap_or(1.0),
         usize::try_from(config.max_model_steps)?,
     )?;
-    args.common.apply_allocator_cache_limit(factory)?;
+    args.common.apply_allocator_cache_limit(&factory)?;
     let started = Instant::now();
     let mut session = load::load(
-        factory,
+        &factory,
         &config,
         policy,
         &device,

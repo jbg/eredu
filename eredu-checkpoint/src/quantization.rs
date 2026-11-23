@@ -416,14 +416,13 @@ impl BoundedQuantizationTarget {
             ));
         }
         let columns = input_shape.last().copied().unwrap_or(0);
-        if input_shape.len() < 2 || columns == 0 || columns % 32 != 0 || input_shape.contains(&0) {
+        if input_shape.len() < 2 || input_shape.contains(&0) {
             return Err(quantization_error(format!(
                 "quantization input geometry is incompatible: {}",
                 self.weight_name
             )));
         }
-        let geometry = quantization
-            .packed_word_geometry(columns)
+        let geometry = crate::word_quantization::geometry(quantization, columns)
             .map_err(|error| quantization_error(format!("{}: {error}", self.weight_name)))?;
         let dtype = match self.affine_companion_dtype {
             RecipeDtype::F16 => StoredDtype::F16,

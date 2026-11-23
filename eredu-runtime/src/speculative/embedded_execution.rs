@@ -7,8 +7,7 @@ use eredu_core::{
         AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationOrigin,
         SpeculativeActivationPhase, SpeculativeControlError,
     },
-    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill,
-    SpeculativeTelemetry, Submission,
+    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
 };
 
 use crate::{inspection::SpeculativeActivationObserver, DraftStateTransaction};
@@ -319,8 +318,6 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
     type TargetCache;
     /// Separately typed embedded-prediction cache.
     type PredictionCache: Clone;
-    /// Optional component telemetry.
-    type Telemetry: SpeculativeTelemetry;
 
     /// Releases optional conversions; caller must establish a settled boundary.
     fn trim_parameter_conversions(
@@ -397,23 +394,6 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
 
     /// Creates a fallible exact checkpoint of ordinary target and prediction state.
     fn checkpoint_target(cache: &Self::TargetCache) -> Result<Self::TargetCache, M::Error>;
-
-    /// Enables optional component telemetry.
-    fn set_telemetry_enabled(&mut self, _enabled: bool) {}
-
-    /// Whether optional component telemetry is available.
-    fn supports_telemetry(&self) -> bool {
-        false
-    }
-
-    /// Drains completed component telemetry.
-    fn take_telemetry(&mut self) -> Result<Self::Telemetry, M::Error>;
-
-    /// Drains telemetry retained by a target verification output.
-    fn take_verification_telemetry(
-        &mut self,
-        _output: &mut EmbeddedPredictionOutput<M::Tensor>,
-    ) -> Result<Self::Telemetry, M::Error>;
 
     /// Streams target and prediction prefill, retaining only the final target chunk.
     /// The returned count covers the complete input, independently of that chunk.
@@ -521,7 +501,11 @@ where
     S: EmbeddedPredictionCacheFactory<T, M>,
     M: SpeculativeTensorMechanisms,
 {
-    fn new_cache<'a>(&mut self, context: Self::Context<'a>) -> Result<Self::Cache, Self::Error>
+    fn new_cache<'a>(
+        &mut self,
+        _: &T::Binding,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Cache, Self::Error>
     where
         Self: 'a,
     {
@@ -687,7 +671,7 @@ where
     where
         Self: 'a;
     type Completion = M::Completion;
-    type Telemetry = S::Telemetry;
+    type Telemetry = ();
     type Error = M::Error;
 
     /// Releases optional conversions; caller must establish a settled boundary.
@@ -912,26 +896,6 @@ where
 
     fn max_proposals(&self) -> usize {
         self.strategy.proposal_capacity()
-    }
-
-    fn set_telemetry_enabled(&mut self, enabled: bool) {
-        self.strategy.set_telemetry_enabled(enabled);
-    }
-
-    fn supports_telemetry(&self) -> bool {
-        self.strategy.supports_telemetry()
-    }
-
-    fn take_telemetry(&mut self) -> Result<Self::Telemetry, Self::Error> {
-        self.strategy.take_telemetry()
-    }
-
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut Self::Verification,
-    ) -> Result<Self::Telemetry, Self::Error> {
-        self.strategy
-            .take_verification_telemetry(output.output_mut())
     }
 
     fn prefill<'context>(

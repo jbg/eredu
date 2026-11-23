@@ -14,14 +14,15 @@ use crate::{
 use eredu_core::backend::TextExecutableTypes;
 use eredu_core::speculative::installed::InstalledSpeculationOperators;
 
-use super::{AutoregressiveMechanisms, AutoregressivePass};
+use super::{
+    causal_invocation::InstalledCausalState, AutoregressiveMechanisms, AutoregressivePass,
+};
 use crate::speculative::shared_backbone::{SharedBackboneMechanisms, SharedRefinementState};
 
 type Types<M> =
     crate::executable_binding::PortableTextTypes<<M as InstalledSpeculationOperators>::Text>;
 type Scores<M> = <Types<M> as TextExecutableTypes>::Scores;
 type Queue<M> = <Types<M> as TextExecutableTypes>::Context;
-type Cache<M> = <Types<M> as TextExecutableTypes>::PredictionState;
 type Tensor<M> = <Types<M> as TextExecutableTypes>::Tensor;
 type InvocationTensor<M> = <Types<M> as TextExecutableTypes>::InvocationTensor;
 type InvocationError<M> = <Types<M> as TextExecutableTypes>::Error;
@@ -115,12 +116,6 @@ where
 {
 }
 
-/// Independent causal cache paired with its selected queue.
-pub struct InstalledCausalState<M: InstalledSpeculationPrimitives> {
-    cache: Cache<M>,
-    queue: Queue<M>,
-}
-
 /// Retained verification scores paired with their selected queue.
 pub struct InstalledCausalScores<M: InstalledSpeculationPrimitives> {
     scores: Scores<M>,
@@ -163,13 +158,12 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
     type Input = crate::text_session_driver::PreparedTextPrompt<
         <Types<M> as TextExecutableTypes>::InputTensor,
     >;
-    type State = InstalledCausalState<M>;
+    type State = InstalledCausalState<M::Text>;
     type Checkpoint = Rc<Self::State>;
     type Output = InstalledCausalScores<M>;
     type Logits = Scores<M>;
     type Context<'a> = Context<'a, M>;
     type Completion = M::Completion;
-    type Telemetry = M::Telemetry;
     type Error = M::Error;
 
     fn coordinate_speculative_step(
@@ -207,12 +201,7 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
             AutoregressivePass::DraftPrefill => context.draft(),
             _ => context.target(),
         };
-        Ok(InstalledCausalState {
-            cache: model
-                .prepare_autoregressive_cache()
-                .map_err(M::execution_error)?,
-            queue: queue.clone(),
-        })
+        InstalledCausalState::allocate(model, queue).map_err(M::execution_error)
     }
     fn prefill(
         model: &mut Self::Model,
@@ -224,12 +213,7 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
         let mut positions = 0;
         let mut execute =
             |observer: &mut dyn ActivationObserver<InvocationTensor<M>, InvocationError<M>>| {
-                let (scores, count) = model.prepared_context_forward(
-                    input.borrowed(),
-                    &mut state.cache,
-                    &state.queue,
-                    observer,
-                )?;
+                let (scores, count) = state.prefill(model, input.borrowed(), observer)?;
                 positions = count;
                 Ok(scores)
             };
@@ -254,18 +238,10 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
         context: Self::Context<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let tokens = M::causal_tokens(tokens)?;
-        let mut execute =
-            |observer: &mut dyn ActivationObserver<InvocationTensor<M>, InvocationError<M>>| {
-                model.attention_forward_with_observer(
-                    &tokens,
-                    None,
-                    eredu_core::decoding::AttentionInvocation::CAUSAL,
-                    Some(&mut state.cache),
-                    false,
-                    &state.queue,
-                    observer,
-                )
-            };
+        let mut execute = |observer: &mut dyn ActivationObserver<
+            InvocationTensor<M>,
+            InvocationError<M>,
+        >| { state.append(model, &tokens, observer) };
         let scores = match context.target_observer() {
             Some(observer) => observer.with_observer(&mut execute),
             None => execute(&mut crate::NoopObserver),
@@ -277,16 +253,10 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
         })
     }
     fn checkpoint(state: &Self::State) -> Result<Self::Checkpoint, Self::Error> {
-        Ok(Rc::new(InstalledCausalState {
-            cache: state.cache.checkpoint_view().map_err(M::execution_error)?,
-            queue: state.queue.clone(),
-        }))
+        state.checkpoint().map_err(M::execution_error)
     }
     fn restore(saved: &Self::Checkpoint, _: Self::Context<'_>) -> Result<Self::State, Self::Error> {
-        Ok(InstalledCausalState {
-            cache: saved.cache.checkpoint_view().map_err(M::execution_error)?,
-            queue: saved.queue.clone(),
-        })
+        saved.copy_boundary().map_err(M::execution_error)
     }
     fn retain_verified_prefix(
         state: &mut Self::State,
@@ -294,30 +264,18 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
         accepted: usize,
         context: Self::Context<'_>,
     ) -> Result<bool, Self::Error> {
-        let length = saved
-            .cache
-            .generation()
-            .map_err(M::execution_error)?
-            .checked_add(accepted as u64)
-            .and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(|| M::invalid("accepted prefix exceeds native geometry"))?;
         state
-            .cache
-            .retain_causal_prefix(length, context.target())
+            .retain_verified_prefix(saved, accepted, context.target())
             .map_err(M::execution_error)
     }
     fn estimate(saved: &Self::Checkpoint) -> Option<SnapshotEstimate> {
-        saved.cache.control_estimate()
+        saved.estimate()
     }
     fn checkpoint_retained_bytes(saved: &Self::Checkpoint) -> Option<u64> {
-        saved
-            .cache
-            .control_estimate()?
-            .retained_bytes
-            .checked_add(saved.cache.control_growth(0)?)
+        saved.retained_bytes()
     }
     fn estimate_state(state: &Self::State) -> Option<SnapshotEstimate> {
-        state.cache.control_estimate()
+        state.estimate()
     }
     fn trim_parameter_conversions(
         model: &mut Self::Model,
@@ -341,7 +299,7 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
         additional: u64,
     ) -> Result<Option<eredu_core::speculative::SpeculativeModelMemoryObservation>, BackendFailure>
     {
-        super::memory_observation::model::<M::Memory>(
+        super::memory_observation::model(
             state.cache.memory_bounds(additional)?,
             model
                 .residency_report()
@@ -349,6 +307,7 @@ impl<M: InstalledSpeculationPrimitives> AutoregressiveMechanisms for M {
             model
                 .parameter_bank_report()
                 .map_err(BackendFailure::from_error)?,
+            M::placement_memory(&state.queue)?,
         )
         .map(Some)
     }

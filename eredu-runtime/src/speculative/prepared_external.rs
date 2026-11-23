@@ -280,6 +280,10 @@ pub enum ExternalDraftExecution<D, E: eredu_core::backend::TextExecutableTypes> 
 }
 
 impl<D, E: eredu_core::backend::TextExecutableTypes> InstalledExternalDraft<D, E> {
+    pub(super) fn into_parts(self) -> (ExternalDraftExecution<D, E>, String) {
+        (self.execution, self.target_identity)
+    }
+
     /// Exact installed target session admitted for this draft.
     pub fn target_identity(&self) -> &str {
         &self.target_identity
@@ -352,16 +356,34 @@ impl<B: ExternalAssistantBinder> BoundAssistantVisitor<B> for TrimAssistantConve
     }
 }
 
-struct ObserveAssistantMemory<N> {
-    host_execution: bool,
-    residency: crate::LayerWeightResidency,
-    scratch: crate::memory_estimation::MemoryBytes,
-    native: std::marker::PhantomData<N>,
+impl<D> BoundAssistant<D> {
+    pub(crate) fn memory_profile<B>(
+        &self,
+        memory: eredu_core::capability::ParameterMemoryFacts,
+        scratch: crate::memory_estimation::MemoryBytes,
+    ) -> Result<
+        Option<crate::memory_forecast::ConditionedAssistantMemoryProfile>,
+        eredu_core::BackendFailure,
+    >
+    where
+        B: ExternalAssistantBinder,
+        D: BoundAssistantDispatch<B>,
+    {
+        self.dispatch().visit_ref(ObserveAssistantMemory {
+            memory,
+            residency: self.residency(),
+            scratch,
+        })
+    }
 }
 
-impl<B: ExternalAssistantBinder, N: eredu_core::capability::NativeAllocatorObservations>
-    BoundAssistantRefVisitor<B> for ObserveAssistantMemory<N>
-{
+struct ObserveAssistantMemory {
+    memory: eredu_core::capability::ParameterMemoryFacts,
+    residency: crate::LayerWeightResidency,
+    scratch: crate::memory_estimation::MemoryBytes,
+}
+
+impl<B: ExternalAssistantBinder> BoundAssistantRefVisitor<B> for ObserveAssistantMemory {
     type Output = Result<
         Option<crate::memory_forecast::ConditionedAssistantMemoryProfile>,
         eredu_core::BackendFailure,
@@ -371,12 +393,7 @@ impl<B: ExternalAssistantBinder, N: eredu_core::capability::NativeAllocatorObser
         self,
         assistant: &InstalledExternalAssistant<B, A>,
     ) -> Self::Output {
-        assistant.memory_profile(
-            self.host_execution,
-            self.residency,
-            || assistant.parameter_memory_observation::<N>(),
-            self.scratch,
-        )
+        assistant.memory_profile(self.memory, self.residency, self.scratch)
     }
 }
 
@@ -422,12 +439,9 @@ impl<D, E: eredu_core::backend::TextExecutableTypes> InstalledExternalDraft<D, E
     }
 
     /// Projects memory for a selected conditioned assistant.
-    pub fn conditioned_memory_profile<
-        B: ExternalAssistantBinder,
-        N: eredu_core::capability::NativeAllocatorObservations,
-    >(
+    pub fn conditioned_memory_profile<B: ExternalAssistantBinder>(
         &self,
-        host_execution: Result<bool, eredu_core::BackendFailure>,
+        memory: eredu_core::capability::ParameterMemoryFacts,
         scratch: crate::memory_estimation::MemoryBytes,
     ) -> Result<
         Option<crate::memory_forecast::ConditionedAssistantMemoryProfile>,
@@ -439,48 +453,22 @@ impl<D, E: eredu_core::backend::TextExecutableTypes> InstalledExternalDraft<D, E
         let ExternalDraftExecution::Assistant(assistant) = self.execution() else {
             return Ok(None);
         };
-        Ok(assistant
-            .dispatch()
-            .visit_ref(ObserveAssistantMemory::<N> {
-                host_execution: host_execution?,
-                residency: assistant.residency(),
-                scratch,
-                native: std::marker::PhantomData,
-            })?)
+        Ok(assistant.memory_profile::<B>(memory, scratch)?)
     }
 
     /// Projects the selected independent decoder using its installed parameter heads.
     pub fn autoregressive_memory_facts(
         &self,
-        host_execution: Result<bool, eredu_core::BackendFailure>,
-        native: eredu_core::capability::NativeMemoryFacts,
+        memory: eredu_core::capability::ParameterMemoryFacts,
     ) -> Result<
-        Option<crate::text_session_driver::forecast::IndependentDraftMemoryFacts>,
+        Option<crate::memory_forecast::LoadedMemoryProfile>,
         crate::memory_forecast::GenerationForecastError,
     > {
         let ExternalDraftExecution::Autoregressive { model, .. } = self.execution() else {
             return Ok(None);
         };
-        let residency = model
-            .executable()
-            .residency_report()
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        let geometry = model.memory_geometry(residency.as_ref())?;
-        let banks = crate::text_session_driver::capability::bank_memory_facts(
-            model
-                .executable()
-                .parameter_bank_report()
-                .map_err(eredu_core::BackendFailure::from_error)?,
-        );
-        Ok(Some(
-            crate::text_session_driver::forecast::IndependentDraftMemoryFacts {
-                geometry,
-                residency,
-                banks,
-                native,
-                host_execution: host_execution?,
-            },
-        ))
+        crate::text_session_driver::forecast::independent_draft_profile(model.as_ref(), memory)
+            .map(Some)
     }
 }
 

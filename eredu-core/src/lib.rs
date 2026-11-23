@@ -19,7 +19,6 @@ pub mod automatic;
 pub mod backend;
 /// Aggregate ownership and admission for backend-managed live caches.
 pub mod cache;
-/// Portable model capabilities, runtime-state accounting, and admission policy.
 pub mod capability;
 /// Bounded, admitted execution capture and portable transport records.
 pub mod capture;
@@ -39,12 +38,16 @@ pub mod decision;
 pub mod decoding;
 /// Logical architecture and capture discovery contracts.
 pub mod discovery;
+/// Portable model capabilities, runtime-state accounting, and admission policy.
+pub mod host_memory;
 pub mod parameters;
 /// Logical expert and routed-unit geometry.
 pub mod routing;
 /// Checked logical tensor extents.
 pub mod tensor_shape;
 pub use discovery::*;
+/// Exact completion of eager work.
+pub mod eager_completion;
 /// Portable execution plans, capabilities, and telemetry.
 pub mod execution;
 /// Completed-token execution control, discovery and snapshot resource contracts.
@@ -103,11 +106,11 @@ pub use artifact::{
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{
     realize_execution_plan_drafting, realize_execution_plan_target, select_execution_plan_drafting,
-    select_execution_plan_target, speculative_decoding_telemetry, AllocatorTelemetry,
-    AutomaticModelPlanning, AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy,
-    AutomaticPlanningBackend, AutomaticPlanningError, BackendHardware, BoundedResidencyRequirement,
-    CandidateAdmission, DraftInspectionFor, DraftSelectionFor, DurationSeconds,
-    ExecutionPlanBackendFactory, ExecutionPlanDraftAdmission, ExecutionPlanReport,
+    select_execution_plan_target, speculative_decoding_telemetry, AllocatorObservation,
+    AllocatorTelemetry, AutomaticModelPlanning, AutomaticPlanRequest, AutomaticPlanner,
+    AutomaticPlannerPolicy, AutomaticPlanningBackend, AutomaticPlanningError, BackendHardware,
+    BoundedResidencyRequirement, CandidateAdmission, DraftInspectionFor, DraftSelectionFor,
+    DurationSeconds, ExecutionPlanBackendFactory, ExecutionPlanDraftAdmission, ExecutionPlanReport,
     ExecutionPlanTarget, ExecutionPlanTargetAdmission, ExecutionPlanTargetLoadError,
     ExecutionPlanTargetSelection, ExecutionTelemetry, ExpertCacheTelemetry, ExternalDraftArtifact,
     ExternalDraftBinding, ExternalDraftConstruction, HardwareBackendProfile, HardwareDeviceKind,

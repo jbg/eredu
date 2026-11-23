@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use eredu_core::VideoSampling;
 use eredu_gguf::{MetadataArray, MetadataValue};
+use eredu_media::image::{Rgb8Rescale, RgbResample, RgbTransformPlan};
 use serde::Deserialize;
 
 use crate::{configuration::SafetensorsArchitecturePlan, GgufArchitecture, ModelKind};
@@ -82,34 +83,6 @@ pub enum GgufSpecialTokenIds {
     },
 }
 
-/// Backend-executed RGB transform selected by architecture policy.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RgbTransformPlan {
-    /// Target image height.
-    pub height: usize,
-    /// Target image width.
-    pub width: usize,
-    /// Pixel interpolation selected by the family processor.
-    pub resample: RgbResample,
-    /// Scalar applied before channel normalization.
-    pub rescale_factor: f32,
-    /// Per-channel normalization mean.
-    pub mean: [f32; 3],
-    /// Per-channel normalization standard deviation.
-    pub std: [f32; 3],
-}
-
-/// Backend-neutral pixel interpolation policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RgbResample {
-    /// Bicubic interpolation.
-    Bicubic,
-    /// Antialiased cubic interpolation with one final RGB8 rounding.
-    AntialiasedBicubic,
-    /// Lanczos interpolation with a three-lobe kernel.
-    Lanczos3,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct QwenProcessorSize {
     shortest_edge: u64,
@@ -118,6 +91,8 @@ struct QwenProcessorSize {
 
 #[derive(Debug, Clone, Deserialize)]
 struct QwenVisualSource {
+    #[serde(skip)]
+    exact_byte_division: bool,
     size: QwenProcessorSize,
     patch_size: usize,
     temporal_patch_size: usize,
@@ -383,6 +358,7 @@ impl QwenProcessorPlan {
                     .ok_or_else(|| invalid("Qwen GGUF maximum pixel geometry overflow"))?,
             );
         let visual = QwenVisualSource {
+            exact_byte_division: true,
             size: QwenProcessorSize {
                 shortest_edge: min_pixels as u64,
                 longest_edge: max_pixels as u64,
@@ -632,6 +608,7 @@ pub struct ArtifactArchitecturePlan {
     family: ArtifactFamilyPlan,
     media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     processor: Option<NormalizedProcessorPlan>,
+    gguf_special_token_ids: Option<GgufSpecialTokenIds>,
     prediction_extension: Option<crate::configuration::PredictionExtensionPlan>,
     draft_adapter:
         Option<std::sync::Arc<crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter>>,
@@ -900,6 +877,7 @@ impl ArtifactArchitecturePlan {
             family: ArtifactFamilyPlan::Safetensors(architecture),
             media_projector: None,
             processor: None,
+            gguf_special_token_ids: None,
             prediction_extension: None,
             draft_adapter: None,
             media_companions: Vec::new(),
@@ -915,6 +893,7 @@ impl ArtifactArchitecturePlan {
             family: ArtifactFamilyPlan::Gguf(architecture),
             media_projector: None,
             processor: None,
+            gguf_special_token_ids: None,
             prediction_extension: None,
             draft_adapter: None,
             media_companions: Vec::new(),
@@ -996,6 +975,7 @@ impl ArtifactArchitecturePlan {
                 family: ArtifactFamilyPlan::Safetensors(family),
                 media_projector: self.media_projector.clone(),
                 processor: self.processor.clone(),
+                gguf_special_token_ids: self.gguf_special_token_ids,
                 prediction_extension: Some(extension.clone()),
                 draft_adapter: self.draft_adapter.clone(),
                 media_companions: self.media_companions.clone(),
@@ -1307,12 +1287,15 @@ impl ArtifactArchitecturePlan {
         }
     }
 
+    pub(crate) const fn gguf_special_token_ids(&self) -> Option<GgufSpecialTokenIds> {
+        self.gguf_special_token_ids
+    }
+
     /// Binds facade-resolved GGUF tokenizer IDs after structural admission.
     pub fn bind_gguf_special_token_ids(
         &mut self,
         ids: GgufSpecialTokenIds,
     ) -> Result<(), ProcessorPlanError> {
-        self.validation = Default::default();
         match ids {
             GgufSpecialTokenIds::Qwen(tokens) => {
                 if !matches!(&self.processor, Some(NormalizedProcessorPlan::Qwen(_))) {
@@ -1342,6 +1325,8 @@ impl ArtifactArchitecturePlan {
                 plan.bind_token_ids(image_bos_token_id, audio_bos_token_id);
             }
         }
+        self.gguf_special_token_ids = Some(ids);
+        self.validation = Default::default();
         Ok(())
     }
 
@@ -1409,10 +1394,10 @@ fn qwen_transform(
             PatchResizePolicy::Qwen => RgbResample::Bicubic,
             PatchResizePolicy::Lfm3 { .. } => RgbResample::AntialiasedBicubic,
         },
-        rescale_factor: if source.do_rescale {
-            source.rescale_factor as f32
-        } else {
-            1.0
+        rescale: match (source.do_rescale, source.exact_byte_division) {
+            (true, true) => Rgb8Rescale::Divide(255.0),
+            (true, false) => Rgb8Rescale::Multiply(source.rescale_factor as f32),
+            (false, _) => Rgb8Rescale::Multiply(1.0),
         },
         mean: if source.do_normalize {
             source.image_mean
@@ -1431,7 +1416,7 @@ fn qwen_transform(
         let input_scale = source.rescale_factor.recip() as f32;
         transform.mean = transform.mean.map(|value| value * input_scale);
         transform.std = transform.std.map(|value| value * input_scale);
-        transform.rescale_factor = 1.0;
+        transform.rescale = Rgb8Rescale::Multiply(1.0);
     }
     transform
 }
@@ -1631,6 +1616,7 @@ struct Gemma4VisualPolicy {
     patch_size: usize,
     pooling_kernel_size: usize,
     max_soft_tokens: usize,
+    min_soft_tokens: Option<usize>,
 }
 
 /// Complete Gemma 4 image preprocessing plan.
@@ -1691,6 +1677,8 @@ pub struct Gemma4AudioPlan {
     pub max_frequency: f32,
     /// Feature floor before logarithm.
     pub mel_floor: f32,
+    /// Floor arithmetic selected by the checkpoint processor protocol.
+    pub arithmetic: eredu_media::audio::LogMelArithmetic,
     /// Maximum waveform sample count.
     pub max_samples: usize,
     /// Feature frames are padded to this multiple.
@@ -1705,6 +1693,7 @@ pub struct Gemma4ProcessorPlan {
     image_framing: Option<MediaFraming>,
     audio_framing: Option<MediaFraming>,
     has_audio: bool,
+    unpadded_audio: bool,
 }
 
 impl Gemma4ProcessorPlan {
@@ -1737,6 +1726,7 @@ impl Gemma4ProcessorPlan {
             max_soft_tokens: image_source
                 .max_soft_tokens
                 .unwrap_or(model.vision_soft_tokens_per_image),
+            min_soft_tokens: None,
         });
         let video_policy = vision_source.as_ref().map(|_| {
             (
@@ -1744,11 +1734,13 @@ impl Gemma4ProcessorPlan {
                     patch_size: video_source.patch_size,
                     pooling_kernel_size: video_source.pooling_kernel_size,
                     max_soft_tokens: video_source.max_soft_tokens,
+                    min_soft_tokens: None,
                 },
                 video_source.num_frames,
             )
         });
         let plan = Self {
+            unpadded_audio: false,
             image: image_policy,
             video: video_policy,
             image_framing: optional_framing(
@@ -1796,10 +1788,13 @@ impl Gemma4ProcessorPlan {
         let video_num_frames = optional_metadata_usize(projector, "clip.vision.video.frame_count")?
             .unwrap_or(default_gemma_video_frames());
         let plan = Self {
+            unpadded_audio: crate::gemma4::projector::published_audio(projector),
             image: has_vision.then_some(Gemma4VisualPolicy {
                 patch_size,
                 pooling_kernel_size,
                 max_soft_tokens,
+                min_soft_tokens: crate::gemma4::projector::published_vision(projector)
+                    .then_some(40),
             }),
             video: has_vision.then_some((
                 Gemma4VisualPolicy {
@@ -1811,17 +1806,18 @@ impl Gemma4ProcessorPlan {
                     )?
                     .unwrap_or(pooling_kernel_size),
                     max_soft_tokens: video_max_soft_tokens,
+                    min_soft_tokens: None,
                 },
                 video_num_frames,
             )),
             image_framing: optional_framing(
-                optional_metadata_u32(model, "gemma4.boi_token_id")?,
-                optional_metadata_u32(model, "gemma4.eoi_token_id")?,
+                gemma_gguf_media_token(model, "boi", "<|image>")?,
+                gemma_gguf_media_token(model, "eoi", "<image|>")?,
                 "Gemma 4 visual",
             )?,
             audio_framing: optional_framing(
-                optional_metadata_u32(model, "gemma4.boa_token_id")?,
-                optional_metadata_u32(model, "gemma4.eoa_token_id")?,
+                gemma_gguf_media_token(model, "boa", "<|audio>")?,
+                gemma_gguf_media_token(model, "eoa", "<audio|>")?,
                 "Gemma 4 audio",
             )?,
             has_audio: projector
@@ -1928,8 +1924,13 @@ impl Gemma4ProcessorPlan {
             min_frequency: 0.0,
             max_frequency: 8_000.0,
             mel_floor: 1e-3,
+            arithmetic: if self.unpadded_audio {
+                eredu_media::audio::LogMelArithmetic::ClampedFloor
+            } else {
+                eredu_media::audio::LogMelArithmetic::AdditiveFloor
+            },
             max_samples: 480_000,
-            pad_to_multiple: 128,
+            pad_to_multiple: if self.unpadded_audio { 1 } else { 128 },
         })
     }
 
@@ -1991,6 +1992,37 @@ fn gemma_visual_plan(
         .max_soft_tokens
         .checked_mul(pool_area)
         .ok_or_else(|| invalid("Gemma 4 patch budget overflow"))?;
+    if let Some(min_soft_tokens) = policy.min_soft_tokens {
+        let multiple = policy
+            .patch_size
+            .checked_mul(policy.pooling_kernel_size)
+            .ok_or_else(|| invalid("Gemma 4 resize multiple overflow"))?;
+        let token_area = multiple
+            .checked_mul(multiple)
+            .ok_or_else(|| invalid("Gemma 4 image token area overflow"))?;
+        let min_pixels = min_soft_tokens
+            .checked_mul(token_area)
+            .ok_or_else(|| invalid("Gemma 4 minimum image area overflow"))?;
+        let max_pixels = policy
+            .max_soft_tokens
+            .checked_mul(token_area)
+            .ok_or_else(|| invalid("Gemma 4 maximum image area overflow"))?;
+        let (height, width) = aligned_image_size(height, width, multiple, min_pixels, max_pixels)?;
+        let patches = (height / policy.patch_size)
+            .checked_mul(width / policy.patch_size)
+            .ok_or_else(|| invalid("Gemma 4 image patch count overflow"))?;
+        return Ok((
+            RgbTransformPlan {
+                height,
+                width,
+                resample: RgbResample::BilinearAlignCorners,
+                rescale: Rgb8Rescale::Divide(255.0),
+                mean: [0.0; 3],
+                std: [1.0; 3],
+            },
+            patches,
+        ));
+    }
     let (height, width) = gemma_aspect_ratio_preserving_size(
         height,
         width,
@@ -2003,12 +2035,46 @@ fn gemma_visual_plan(
             height,
             width,
             resample: RgbResample::Bicubic,
-            rescale_factor: 1.0 / 255.0,
+            rescale: Rgb8Rescale::Multiply(1.0 / 255.0),
             mean: [0.0; 3],
             std: [1.0; 3],
         },
         max_patches,
     ))
+}
+
+fn aligned_image_size(
+    height: usize,
+    width: usize,
+    multiple: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize), ProcessorPlanError> {
+    if height == 0 || width == 0 {
+        return Err(invalid("image dimensions must be positive"));
+    }
+    let factor = multiple as f32;
+    let h = height as f32;
+    let w = width as f32;
+    let align = |units: f32| {
+        (units as usize)
+            .max(1)
+            .checked_mul(multiple)
+            .ok_or_else(|| invalid("aligned image dimension overflow"))
+    };
+    let mut target_h = align((h / factor).round())?;
+    let mut target_w = align((w / factor).round())?;
+    let target_area = target_h.saturating_mul(target_w);
+    if target_area > max_pixels {
+        let scale = (h * w / max_pixels as f32).sqrt();
+        target_h = align((h / scale / factor).floor())?;
+        target_w = align((w / scale / factor).floor())?;
+    } else if target_area < min_pixels {
+        let scale = (min_pixels as f32 / (h * w)).sqrt();
+        target_h = align((h * scale / factor).ceil())?;
+        target_w = align((w * scale / factor).ceil())?;
+    }
+    Ok((target_h, target_w))
 }
 
 fn gemma_aspect_ratio_preserving_size(
@@ -2076,14 +2142,15 @@ fn optional_metadata_usize(
         .transpose()
 }
 
-fn optional_metadata_u32(
-    metadata: &HashMap<String, MetadataValue>,
-    key: &str,
+fn gemma_gguf_media_token(
+    model: &HashMap<String, MetadataValue>,
+    kind: &str,
+    spelling: &str,
 ) -> Result<Option<u32>, ProcessorPlanError> {
-    optional_metadata_u64(metadata, key)?
-        .map(|value| {
-            u32::try_from(value)
-                .map_err(|_| invalid(format!("processor GGUF metadata key {key:?} must fit u32")))
+    crate::gemma4::projector::media_token(model, kind, spelling)
+        .map_err(|error| invalid(error.to_string()))?
+        .map(|id| {
+            u32::try_from(id).map_err(|_| invalid(format!("invalid Gemma 4 {kind} token ID")))
         })
         .transpose()
 }
@@ -2998,11 +3065,11 @@ fn muse_transform(
             width
         },
         resample: RgbResample::Lanczos3,
-        rescale_factor: if source.do_rescale {
+        rescale: Rgb8Rescale::Multiply(if source.do_rescale {
             source.rescale_factor
         } else {
             1.0
-        },
+        }),
         mean: if source.do_normalize {
             source.image_mean
         } else {

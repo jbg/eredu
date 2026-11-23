@@ -49,11 +49,15 @@ pub trait RealtimeGraphMechanisms<B: NeuralBackend>: Sized {
     fn retained_values(state: &Self::State) -> Vec<&B::Tensor>;
 
     /// Opens native recovery before portable streamed input work.
-    fn open_input_recovery() -> Result<impl Sized, BackendFailure>;
+    fn open_input_recovery(
+        context: &Context<B>,
+    ) -> Result<impl Sized + 'static + use<Self, B>, BackendFailure>;
 
     /// Keeps branch accounting alive through any native work started in this scope.
-    fn hold_fork_retention(retention: SnapshotRetainedGrowth)
-        -> Result<impl Sized, BackendFailure>;
+    fn hold_fork_retention(
+        context: &Context<B>,
+        retention: SnapshotRetainedGrowth,
+    ) -> Result<impl Sized + 'static + use<Self, B>, BackendFailure>;
 }
 
 /// Portable cache owner used by categorical startup.
@@ -107,13 +111,16 @@ where
             .collect()
     }
 
-    fn open_input_recovery() -> Result<impl Sized, BackendFailure> {
-        M::open_input_recovery()
+    fn open_input_recovery(
+        context: &Context<B>,
+    ) -> Result<impl Sized + 'static + use<B, M>, BackendFailure> {
+        M::open_input_recovery(context)
     }
 
     fn hold_fork_retention(
+        context: &Context<B>,
         retention: SnapshotRetainedGrowth,
-    ) -> Result<impl Sized, BackendFailure> {
-        M::hold_fork_retention(retention.authority())
+    ) -> Result<impl Sized + 'static + use<B, M>, BackendFailure> {
+        M::hold_fork_retention(context, retention.authority())
     }
 }

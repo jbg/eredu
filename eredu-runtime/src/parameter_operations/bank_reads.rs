@@ -105,6 +105,7 @@ pub trait BankParameterReadSource<T, C: ?Sized, E> {
     /// Opens native retention for the selected and ordered transfer.
     fn begin_loan(
         transfer: <Self::Residency as crate::residency::ResidencyAccess>::Transfer,
+        context: &C,
     ) -> Result<Self::Loan, E>;
 
     /// Assembles copied members in canonical order.
@@ -131,7 +132,7 @@ impl BankParameterReadPlan<'_> {
                     .acquire_many_with_transfer(&[(member.key.unit_id(), 1)], MemoryTier::Device)
                     .map_err(Into::into)?;
                 transfer.order_after(context).map_err(Into::into)?;
-                let mut loan = S::begin_loan(transfer)?;
+                let mut loan = S::begin_loan(transfer, context)?;
                 let value = loan.copy_binding(&member.binding, context)?;
                 loan.finish(&value)?;
                 Ok(value)

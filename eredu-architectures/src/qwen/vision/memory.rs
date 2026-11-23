@@ -145,16 +145,23 @@ impl VisionConfig {
             };
             window_chunks = add(window_chunks, windows)?;
         }
-        // Interpolated samples hold four u32 IDs and four f32 weights, followed
-        // by four corner ID/weight arrays. Gathered positions use one ID array.
-        let position_bytes = mul(
-            patches,
-            if self.mode == VisionMode::DeepStack {
-                64
-            } else {
-                4
-            },
-        )?;
+        let position_bytes = if self.antialias_positions && patches != 0 {
+            // Learned table IDs, merge-major positions, and gather IDs.
+            add(
+                mul(self.num_position_embeddings as u64, 4)?,
+                mul(patches, 16)?,
+            )?
+        } else {
+            // Four-corner interpolation samples and ID/weight arrays, or gathered IDs.
+            mul(
+                patches,
+                if self.mode == VisionMode::DeepStack {
+                    64
+                } else {
+                    4
+                },
+            )?
+        };
         // Rotary [time,y,x] and [y,x] arrays; permutation/inverse; full/window
         // chunk vectors. These are payload totals across phases, not peak bytes.
         add(
@@ -215,18 +222,23 @@ impl super::Declaration {
             )?,
             element_bytes(element),
         )?;
-        let invocation = self
-            .patch()
-            .geometry
-            .memory_invocation(patches, element, true)?;
-        // Patch embedding uses Tensor::linear after reshaping a dense kernel,
-        // not the backend's constructed/optimized linear module. Keep the
-        // generic unbound projection query and unknown weight representation.
+        let patch = self.patch();
+        let mut patch_geometry = patch.geometry;
+        let repetitions = if patch.split_temporal {
+            patch_geometry.temporal = 1;
+            patch.geometry.temporal as u64
+        } else {
+            1
+        };
+        // Patch projection uses an unbound linear. With separate temporal products the
+        // architecture adds the shared bias after the last product has been reduced.
+        let invocation =
+            patch_geometry.memory_invocation(patches, element, !patch.split_temporal)?;
         let memory = mechanism(&invocation)?;
         memory.validate()?;
         report.invocations.push(VisionMemoryInvocation {
             component: "patch_embed.proj".into(),
-            repetitions: 1,
+            repetitions,
             invocation,
             memory,
         });

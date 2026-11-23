@@ -736,6 +736,10 @@ impl FamilyConfig {
                 )
             },
         );
+        let vision = match &self.vision {
+            Some(config) if config.published_gguf => format!("{vision}:gelu_f16"),
+            _ => vision,
+        };
         let audio = self.audio.as_ref().map_or_else(
             || "none".into(),
             |config| {
@@ -758,6 +762,7 @@ impl FamilyConfig {
                 ("text", self.text.architecture_fingerprint()),
                 ("vision", vision),
                 ("audio", audio),
+                ("media_per_layer_token", "padding".into()),
                 (
                     "vision_quantization",
                     self.vision.as_ref().map_or_else(
@@ -801,7 +806,19 @@ impl FamilyConfig {
                         self.image_token_id, self.video_token_id, self.audio_token_id
                     ),
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                self.audio
+                    .as_ref()
+                    .filter(|audio| audio.published_gguf)
+                    .map(|_| {
+                        (
+                            "audio_checkpoint_protocol",
+                            "gemma4a:fused_f16:blocked_f32".into(),
+                        )
+                    }),
+            ),
         )
     }
 }
