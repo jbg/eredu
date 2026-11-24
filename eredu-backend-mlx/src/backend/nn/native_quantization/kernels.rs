@@ -532,13 +532,39 @@ pub(super) fn qk_matmul_kernel(format: NativeQuantizationFormat) -> Result<Metal
             "  }",
             "}"
         ),
-        qk_matmul_header(format)?,
+        qk_matmul_header(format, false)?,
         true,
         false,
     )
 }
 
-pub(super) fn qk_matmul_header(format: NativeQuantizationFormat) -> Result<String, Exception> {
+pub(super) fn qk_f32_matmul_kernel(
+    format: NativeQuantizationFormat,
+) -> Result<MetalKernel, Exception> {
+    let name = match format {
+        NativeQuantizationFormat::GgufQ4K => "native_q4k_f32_matmul_64x32",
+        NativeQuantizationFormat::GgufQ6K => "native_q6k_f32_matmul_64x32",
+        _ => {
+            return Err(Exception::custom(format!(
+                "no specialized F32 K-quant tile for {format:?}"
+            )))
+        }
+    };
+    MetalKernel::new(
+        name,
+        ["input", "weight"],
+        ["out"],
+        include_str!("qk_f32_matmul.metal"),
+        qk_matmul_header(format, true)?,
+        true,
+        false,
+    )
+}
+
+fn qk_matmul_header(
+    format: NativeQuantizationFormat,
+    vectorized: bool,
+) -> Result<String, Exception> {
     let (block_bytes, body) = match format {
         NativeQuantizationFormat::GgufQ4K => (
             Q4_K_BLOCK_BYTES,
@@ -582,6 +608,10 @@ pub(super) fn qk_matmul_header(format: NativeQuantizationFormat) -> Result<Strin
                 " values[j] = half(d * float(scale) * float(q) - dm * float(minv));",
                 "}"
             ),
+        ),
+        NativeQuantizationFormat::GgufQ6K if vectorized => (
+            Q6_K_BLOCK_BYTES,
+            include_str!("q6k_dequantize_four.metal"),
         ),
         NativeQuantizationFormat::GgufQ6K => (
             Q6_K_BLOCK_BYTES,

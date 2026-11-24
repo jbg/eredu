@@ -395,6 +395,25 @@ pub(super) fn qk_matmul_metal(
         .with_grid([REDUCTION_TILE, output_tiles * SIMD_GROUPS, activation_tiles])
         .with_thread_group([REDUCTION_TILE, SIMD_GROUPS, 1])
         .with_output_arg([rows, view.rows], dtype);
+    let specialized = match (dtype, format) {
+        (Dtype::Float32, NativeQuantizationFormat::GgufQ4K) => Some(&Q4K_F32_MATMUL_KERNEL),
+        (Dtype::Float32, NativeQuantizationFormat::GgufQ6K) => Some(&Q6K_F32_MATMUL_KERNEL),
+        _ => None,
+    };
+    if let Some(cache) = specialized {
+        let config = config
+            .with_template_arg_int("WIDTH", view.columns)
+            .with_template_arg_int("OUTPUTS", view.rows);
+        return cache.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(qk_f32_matmul_kernel(format)?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("F32 K-quant matrix-matrix kernel initialized")
+                .apply_one_device([flat, view.storage.bytes()], &config, stream)
+        });
+    }
     match format {
         NativeQuantizationFormat::GgufQ4K => {
             Q4K_MATMUL_KERNEL.with(|cell| -> Result<_, Exception> {
