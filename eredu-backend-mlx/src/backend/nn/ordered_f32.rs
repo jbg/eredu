@@ -12,11 +12,13 @@ thread_local! {
     static PRODUCT: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static ROWS: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SOFTMAX: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static FUSED_ATTENTION: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
 const SOFTMAX_SIMD_WIDTH: i32 = 32;
 const SOFTMAX_MIN_WIDTH: i32 = 128;
 const SOFTMAX_MAX_WIDTH: i32 = 8192;
+const FUSED_ATTENTION_THREADS: i32 = 256;
 
 fn metal(stream: &Stream) -> Result<bool, Exception> {
     Ok(super::native_quantization::uses_metal_device(
@@ -27,6 +29,96 @@ fn metal(stream: &Stream) -> Result<bool, Exception> {
 pub(super) fn supported(stream: &Stream) -> Result<bool, Exception> {
     let device = stream.get_device()?.get_type()?;
     Ok(device == DeviceType::Cpu || super::native_quantization::uses_metal_device(device))
+}
+
+/// Full-key prefill with the ordered score, softmax and value reductions.
+pub(super) fn fused_attention(
+    query: &Array,
+    keys: &Array,
+    transposed_values: &Array,
+    mask: Option<&Array>,
+    scale: f32,
+    query_rows: u64,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    let [batch, heads, rows, width] = *query.shape() else {
+        return Ok(None);
+    };
+    let positions = keys.dim(2);
+    let kv_heads = keys.dim(1);
+    let output_width = transposed_values.dim(2);
+    if query_rows <= 1 || !(128..=4096).contains(&positions) || query.size() == 0 || !metal(stream)?
+    {
+        return Ok(None);
+    }
+    let shape = [batch, heads, rows, positions];
+    let (mask, mask_mode) = if let Some(mask) = mask {
+        let mode = match mask.dtype() {
+            Dtype::Bool => 1,
+            Dtype::Float32 | Dtype::Bfloat16 | Dtype::Float16 => 2,
+            _ => return Ok(None),
+        };
+        if mask.ndim() > 4 {
+            return Ok(None);
+        }
+        let mut axes = [1; 4];
+        axes[4 - mask.ndim()..].copy_from_slice(mask.shape());
+        if axes
+            .iter()
+            .zip(shape)
+            .any(|(&axis, size)| axis != 1 && axis != size)
+        {
+            return Ok(None);
+        }
+        (mask.reshape(&axes, stream)?, mode)
+    } else {
+        (query.clone(), 0)
+    };
+    let row_count = batch
+        .checked_mul(heads)
+        .and_then(|count| count.checked_mul(rows))
+        .ok_or_else(|| Exception::custom("ordered attention row count overflows"))?;
+    let config = CustomKernelConfig::new()
+        .with_template_arg_int("CAPACITY", (positions as u32).next_power_of_two() as i32)
+        .with_template_arg_int("MASK_MODE", mask_mode)
+        .with_template_arg_int("THREADS", FUSED_ATTENTION_THREADS)
+        .with_template_arg_int(
+            "VALUE_LANES",
+            ordered_f32::attention_value_lanes(query_rows) as i32,
+        )
+        .with_grid([FUSED_ATTENTION_THREADS, row_count, 1])
+        .with_thread_group([FUSED_ATTENTION_THREADS, 1, 1])
+        .with_output_arg([batch, heads, rows, output_width], Dtype::Float32);
+    let dimensions = Array::from_slice(
+        &[heads, rows, width, kv_heads, positions, output_width],
+        &[6],
+    );
+    let scale = Array::from_slice(&[scale], &[1]);
+    let query = query.contiguous(false, stream)?;
+    let keys = keys.contiguous(false, stream)?;
+    let values = transposed_values.contiguous(false, stream)?;
+    FUSED_ATTENTION.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(MetalKernel::new(
+                "ordered_f32_fused_attention",
+                ["query", "keys", "values", "mask", "shape", "scale"],
+                ["out"],
+                include_str!("ordered_f32_fused_attention.metal"),
+                &row_arithmetic_header(),
+                false,
+                false,
+            )?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("ordered fused attention kernel initialized")
+            .apply_one_device(
+                [&query, &keys, &values, &mask, &dimensions, &scale],
+                &config,
+                stream,
+            )
+            .map(Some)
+    })
 }
 
 // Both operands have contiguous rows; every K/V head serves a contiguous group

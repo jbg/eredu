@@ -1366,6 +1366,11 @@ ordered FP32 Metal invocations. Ordered FP32 shares contiguous K/V layouts
 and bounds the live score rows using the ordinary tile geometry. Portable
 forecasts use the wider tile and the declared maximum live tile count for
 conservative scratch and dependency-release accounting.
+Ordered FP32 Metal prefill can retain scores and probabilities in threadgroup
+memory for a complete key row. The fused operator applies post-product scaling
+and masking, preserves the compensated softmax sum, and preserves the score and
+value reduction lanes. Unsupported geometry and requests with score caps or
+sink logits use the explicit products and softmax.
 Larger key rows retain the two-scan bounded mechanism. Explicit rotary input
 products retain inverse frequencies directly so positions multiply the same
 rounded coefficients instead of dividing by reconstructed denominators.
