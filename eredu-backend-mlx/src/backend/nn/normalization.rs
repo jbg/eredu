@@ -315,6 +315,7 @@ fn wide_square_rms(
         let config = CustomKernelConfig::new()
             .with_template_arg_int("WIDTH", width)
             .with_template_arg_bool("STAGED", staged)
+            .with_template_arg_bool("PARALLEL", staged && (width as u32).is_power_of_two())
             .with_grid(grid)
             .with_thread_group(group)
             .with_output_arg(input.shape(), Dtype::Float32);
@@ -325,7 +326,7 @@ fn wide_square_rms(
                     ["input", "gain", "epsilon"],
                     ["out"],
                     include_str!("ordered_f32_rms.metal"),
-                    "#pragma clang fp contract(off)\n",
+                    include_str!("ordered_f32_rms_guard.metal"),
                     true,
                     false,
                 )?);
