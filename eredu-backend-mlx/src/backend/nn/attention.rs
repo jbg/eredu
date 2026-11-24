@@ -631,6 +631,19 @@ fn attention_with_prepared_key_values(
     let score_dtype = prepared.score_dtype;
     let query = queries.as_dtype(score_dtype, stream)?;
     let scores = if let Some(ordered) = &prepared.ordered {
+        if sinks.is_none() && softcap.is_none() {
+            if let Some(output) = super::ordered_f32::fused_attention(
+                &query,
+                &ordered.keys,
+                &ordered.transposed_values,
+                mask,
+                scale,
+                prepared.query_rows,
+                stream,
+            )? {
+                return Ok(output);
+            }
+        }
         super::ordered_f32::attention_product(
             &query,
             &ordered.keys,
