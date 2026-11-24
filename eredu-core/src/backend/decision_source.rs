@@ -559,6 +559,14 @@ where
             admission,
             ControlledTextGenerationError::Preparation,
         )?;
+        if config.prefill_chunk_policy() == PrefillChunkPolicy::Automatic {
+            let limit = S::plain_text_prefill_tokens(&prompt)
+                .filter(|&tokens| tokens != 0 && config.sampling().max_new_tokens != Some(0))
+                .map_or(PrefillChunkPolicy::AUTOMATIC_FALLBACK, |tokens| {
+                    S::automatic_prefill_chunk(runtime, tokens)
+                });
+            config = config.with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(limit));
+        }
         let backend_state = runtime
             .session()
             .start_text_generation(runtime.backend(), config.clone())
@@ -635,10 +643,7 @@ where
         &mut self,
         runtime: &mut ModelRuntime<B, S>,
     ) -> Result<bool, B::Error> {
-        let max_tokens = match self.prefill {
-            PrefillChunkPolicy::Unchunked => std::num::NonZeroUsize::MAX,
-            PrefillChunkPolicy::Bounded(max_tokens) => max_tokens,
-        };
+        let max_tokens = self.prefill.unresolved_limit();
         if self.remaining_tokens == Some(0)
             || self
                 .cancellation

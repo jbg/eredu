@@ -319,9 +319,10 @@ variable-length transcription events and conversational snapshots.
 
 Ordinary and controlled generation share prompt chunking in the core driver.
 `TextGenerationConfig::with_prefill_chunk_policy` and
-`PreparedChatGenerationSettings::prefill` select `PrefillChunkPolicy::Bounded`
-(512 tokens by default) or `Unchunked`. Each nonfinal chunk completes before the
-next begins and advances the model cache without sampling. Only the final chunk
+`PreparedChatGenerationSettings::prefill` default to `PrefillChunkPolicy::Automatic`.
+Eligible local text requests use observed memory headroom to size chunks, with a
+512-token fallback. Callers can also select `Bounded` or `Unchunked`.
+Each nonfinal chunk completes before the next begins and advances the model cache without sampling. Only the final chunk
 predicts a token. A controlled step can publish `Progress` and pause at a
 completed nonfinal chunk; it consumes no output token or controller decision.
 Snapshots and branches preserve pending input together with committed model state.

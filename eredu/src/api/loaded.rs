@@ -292,7 +292,7 @@ impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B
             local,
             PreparedChatError::Backend,
         )?;
-        let Some((config, max_tokens, control, input)) = prepared else {
+        let Some((mut config, max_tokens, control, input)) = prepared else {
             on_event(SemanticEvent::Finished {
                 reason: FinishReason::Cancelled,
             });
@@ -311,7 +311,7 @@ impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B
                 .is_none_or(|delivery| delivery.plan.is_empty() && delivery.intervention.is_none());
         let prompt_cache = match (&self.prompt_cache_store, &input) {
             (Some(cache), PreparedChatInput::TokenIds { token_ids, .. }) if cache_eligible => {
-                cache.prepare(&mut self.runtime, &config, token_ids, &cancellation)?
+                cache.prepare(&mut self.runtime, &mut config, token_ids, &cancellation)?
             }
             _ => None,
         };

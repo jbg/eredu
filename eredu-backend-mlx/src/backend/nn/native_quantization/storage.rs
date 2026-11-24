@@ -245,6 +245,32 @@ impl NativeQuantizedTensor {
             ));
         }
         let backend = native_execution_backend(stream)?;
+        // Prefer dedicated Metal contractions. Their row-aware dispatch
+        // preserves the format's validated floating arithmetic.
+        if backend == NativeExecutionBackend::Metal && transpose {
+            let little_endian = self.storage.endian == GgufEndian::Little;
+            match self.format() {
+                NativeQuantizationFormat::GgufNvFp4 => {
+                    return nvfp4_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ4K if little_endian => {
+                    return q4k_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ5K if little_endian => {
+                    return q5k_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ6K if little_endian => {
+                    return q6k_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ8_0 if little_endian => {
+                    return q8_0_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ5_1 if little_endian => {
+                    return q5_1_linear_metal(input, self, stream)
+                }
+                _ => {}
+            }
+        }
         if let Some(encoding) = self.format().ggml_type().filter(|ty| {
             transpose
                 && input.dtype() == Dtype::Float32
@@ -270,25 +296,7 @@ impl NativeQuantizedTensor {
             };
         }
         if backend == NativeExecutionBackend::Metal && transpose {
-            return match self.format() {
-                NativeQuantizationFormat::GgufNvFp4 => nvfp4_linear_metal(input, self, stream),
-                NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
-                    q4k_linear_metal(input, self, stream)
-                }
-                NativeQuantizationFormat::GgufQ5K if self.storage.endian == GgufEndian::Little => {
-                    q5k_linear_metal(input, self, stream)
-                }
-                NativeQuantizationFormat::GgufQ6K if self.storage.endian == GgufEndian::Little => {
-                    q6k_linear_metal(input, self, stream)
-                }
-                NativeQuantizationFormat::GgufQ8_0 if self.storage.endian == GgufEndian::Little => {
-                    q8_0_linear_metal(input, self, stream)
-                }
-                NativeQuantizationFormat::GgufQ5_1 if self.storage.endian == GgufEndian::Little => {
-                    q5_1_linear_metal(input, self, stream)
-                }
-                _ => iq_linear_metal(input, self, stream),
-            };
+            return iq_linear_metal(input, self, stream);
         }
         self.linear_fallback(input, transpose, stream)
     }

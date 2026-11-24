@@ -1138,7 +1138,7 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>> LoadedMod
                 semantic.controller,
             ))
         })();
-        let (config, vocabulary, domain, pipeline, cursor, mut delivery, started, controller) =
+        let (mut config, vocabulary, domain, pipeline, cursor, mut delivery, started, controller) =
             self.runtime
                 .finish_text_preparation(Stage::Request, host, |error| {
                     PreparedChatError::Backend(error).into()
@@ -1152,7 +1152,7 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>> LoadedMod
             Some(cache) if cache_eligible => cache
                 .prepare(
                     &mut self.runtime,
-                    &config,
+                    &mut config,
                     &prepared.prompt_token_ids,
                     &delivery.cancellation,
                 )?

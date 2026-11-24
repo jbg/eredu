@@ -401,10 +401,10 @@ struct Cli {
     #[arg(long, value_name = "FLOAT")]
     presence_penalty: Option<f32>,
 
-    /// Maximum tokens per eligible text prefill pass; zero disables chunking.
-    /// Media, observations, distributed and speculative paths retain a full pass.
-    #[arg(long, default_value_t = 512, value_name = "TOKENS")]
-    prefill_chunk_size: usize,
+    /// Maximum tokens per eligible prefill pass. Omit for automatic sizing.
+    /// Zero disables caller-imposed chunking.
+    #[arg(long, value_name = "TOKENS")]
+    prefill_chunk_size: Option<usize>,
 
     /// Dense-stream host lookahead; use zero with a zero host budget.
     #[arg(long, default_value_t = 2, value_name = "LAYERS")]
@@ -2508,7 +2508,9 @@ where
     let drafting_enabled = planned.drafting().is_enabled();
     let mut session = planned;
     let model = session.model_mut();
-    if args.prefill_chunk_size > 0 && (args.verbose || memory::requested(&args)) {
+    if args.prefill_chunk_size.is_some_and(|size| size > 0)
+        && (args.verbose || memory::requested(&args))
+    {
         if let Err(reason) = model.prefill_chunking_support() {
             eprintln!("prefill uses one complete pass: {reason}");
         }
@@ -2644,10 +2646,7 @@ where
         bail!("the prompt produced no input tokens");
     }
     let settings = PreparedChatGenerationSettings {
-        prefill: std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
-            eredu::api::PrefillChunkPolicy::Unchunked,
-            eredu::api::PrefillChunkPolicy::Bounded,
-        ),
+        prefill: prefill_chunk_policy(args.prefill_chunk_size),
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(max_tokens),
             ..generation_overrides
@@ -2762,12 +2761,7 @@ where
         }
         let config = TextGenerationConfig::new(resolved_generation)
             .with_seed(args.common.seed.unwrap_or(0))
-            .with_prefill_chunk_policy(
-                std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
-                    eredu::api::PrefillChunkPolicy::Unchunked,
-                    eredu::api::PrefillChunkPolicy::Bounded,
-                ),
-            );
+            .with_prefill_chunk_policy(prefill_chunk_policy(args.prefill_chunk_size));
         let config = if args.mirostat_v2 {
             config.with_mirostat_v2(args.mirostat_tau, args.mirostat_eta)?
         } else {
@@ -3805,6 +3799,15 @@ fn select_revision<'a>(
                 .max_by_key(|revision| revision.last_modified)
         })
         .context("the cached repository contains no snapshots")
+}
+
+fn prefill_chunk_policy(size: Option<usize>) -> eredu::api::PrefillChunkPolicy {
+    use eredu::api::PrefillChunkPolicy;
+    match size {
+        None => PrefillChunkPolicy::Automatic,
+        Some(size) => std::num::NonZeroUsize::new(size)
+            .map_or(PrefillChunkPolicy::Unchunked, PrefillChunkPolicy::Bounded),
+    }
 }
 
 #[cfg(test)]
