@@ -75,7 +75,10 @@ impl<B, N, G> GenerationForecastSession<B> for TextSessionDriver<N::Resources, N
 where
     Self: TextOperationDriver<B, Prompt = TextPromptFor<B>>,
     B: TextGenerationBackend + eredu_core::input::PlainTextTokens<B::InputTensor>,
-    N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + CaptureWorkspace,
+    N: TextCapabilityMechanisms<B>
+        + NativeExecutionMemory<B>
+        + CaptureWorkspace
+        + super::TextTransactionMechanisms,
     Self: ModelCapabilitySession<B>,
 {
     fn refinement_memory_plan(
@@ -214,8 +217,7 @@ fn memory_profile<B, N, G>(
 ) -> Result<LoadedMemoryProfile, GenerationForecastError>
 where
     B: TextGenerationBackend,
-    N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + CaptureWorkspace,
-    TextSessionDriver<N::Resources, N, G>: ModelCapabilitySession<B>,
+    N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + super::TextTransactionMechanisms,
 {
     let session = runtime.session();
     let mut geometry = session
@@ -260,11 +262,59 @@ where
         allocator_cache_limit: memory.allocator_cache_limit,
     })
 }
+
+pub(super) fn automatic_prefill_chunk<B, N>(
+    runtime: &ModelRuntime<B, TextSessionDriver<N::Resources, N>>,
+    tokens: usize,
+) -> std::num::NonZeroUsize
+where
+    B: TextGenerationBackend,
+    N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + super::TextTransactionMechanisms,
+{
+    use eredu_core::{InputTokenCount, PrefillChunkPolicy};
+    let fallback = PrefillChunkPolicy::AUTOMATIC_FALLBACK;
+    let session = runtime.session();
+    // A rank-local observation cannot select a different collective schedule.
+    if N::control_transport(&session.resources().retained).is_some() {
+        return fallback;
+    }
+    let model = session.resources().model.as_ref();
+    if model.forecast_state_offset().ok() != Some(Some(0)) {
+        return fallback;
+    }
+    let Ok(profile) = memory_profile::<B, N, _>(runtime, false) else {
+        return fallback;
+    };
+    let contract = ForecastExecutionContract {
+        input_retention: if model.retains_prefill_cursor() {
+            PrefillInputRetention::PreparedProducts
+        } else {
+            PrefillInputRetention::TokenIds
+        },
+        full_pass_reason: None,
+        // Prefix invocations and instrumented requests can expose every row.
+        logits: LogitsWorkspace::EveryPosition,
+    };
+    let Ok((request, _)) = loaded_generation_request(
+        profile,
+        InputTokenCount::text(tokens as u64),
+        0,
+        PrefillChunkPolicy::Automatic,
+        contract,
+        &GenerationForecastOptions::default(),
+    ) else {
+        return fallback;
+    };
+    crate::memory_estimation::select_prefill_chunk(&request).unwrap_or(fallback)
+}
 impl<B, N, G> ContinuationForecastSession<B> for TextSessionDriver<N::Resources, N, G>
 where
     Self: TextOperationDriver<B, Prompt = TextPromptFor<B>>,
     B: TextGenerationBackend + eredu_core::input::PlainTextTokens<B::InputTensor>,
-    N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + CaptureWorkspace,
+    N: TextCapabilityMechanisms<B>
+        + NativeExecutionMemory<B>
+        + CaptureWorkspace
+        + super::TextTransactionMechanisms,
     Self: ModelCapabilitySession<B>,
     N::Model: InstalledTextState,
     Self: eredu_core::execution_control::NativeTextStateSession<B>,
@@ -335,7 +385,10 @@ impl<B, N, G, D> SpeculativeForecastSession<B, D> for TextSessionDriver<N::Resou
 where
     Self: TextOperationDriver<B, Prompt = TextPromptFor<B>>,
     B: TextGenerationBackend + eredu_core::input::PlainTextTokens<B::InputTensor>,
-    N: TextCapabilityMechanisms<B> + NativeExecutionMemory<B> + CaptureWorkspace,
+    N: TextCapabilityMechanisms<B>
+        + NativeExecutionMemory<B>
+        + CaptureWorkspace
+        + super::TextTransactionMechanisms,
     Self: ModelCapabilitySession<B>,
     D: DraftForecastFacts,
 {

@@ -39,10 +39,9 @@ pub(super) fn report(
             .allocator_overhead(factory.proposed_allocator_cache_limit(cache_limit)?, 0);
     }
     options.max_output_tokens = output_tokens;
-    options.prefill_chunk_tokens = if args.prefill_chunk_size == 0 {
-        input_tokens
-    } else {
-        args.prefill_chunk_size as u64
+    options.prefill_chunk_tokens = match super::prefill_chunk_policy(args.prefill_chunk_size) {
+        eredu::api::PrefillChunkPolicy::Unchunked => input_tokens,
+        policy => policy.unresolved_limit().get() as u64,
     };
     options.budget.application_limit_bytes = args.memory_budget_bytes;
     options.budget.reserve_bytes = args.memory_reserve_bytes;

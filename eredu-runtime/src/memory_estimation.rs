@@ -924,6 +924,50 @@ pub fn estimate_prefill_candidates(
         .collect()
 }
 
+/// Selects the largest supported prefill chunk with a usable memory estimate.
+/// The request describes prompt execution with no output allowance.
+/// Unknown headroom cannot increase the default prefill bound.
+pub(crate) fn select_prefill_chunk(
+    request: &GenerationMemoryRequest,
+) -> Option<std::num::NonZeroUsize> {
+    let fallback = eredu_core::PrefillChunkPolicy::AUTOMATIC_FALLBACK.get() as u64;
+    let positions = request.input.model_positions;
+    if positions == 0
+        || !request.domains.iter().any(|plan| {
+            plan.budget.available_bytes.is_some() || plan.budget.application_limit_bytes.is_some()
+        })
+    {
+        return None;
+    }
+    let mut chunks = vec![positions.min(fallback * 4)];
+    for limit in [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
+        if limit < *chunks.last()? {
+            chunks.push(limit);
+        }
+    }
+    let mut uncertain = None;
+    for (chunk, estimate) in estimate_prefill_candidates(request, &chunks).ok()? {
+        let size = std::num::NonZeroUsize::new(usize::try_from(chunk).ok()?);
+        if estimate
+            .domains
+            .iter()
+            .all(|domain| domain.generation_fit == MemoryFit::LikelyFit)
+        {
+            return size;
+        }
+        if chunk <= fallback
+            && uncertain.is_none()
+            && estimate
+                .domains
+                .iter()
+                .all(|domain| domain.generation_fit != MemoryFit::LikelyShortfall)
+        {
+            uncertain = size;
+        }
+    }
+    uncertain
+}
+
 /// Parameter placement derived from an existing static report. Unified memory
 /// implies shared capacity, not identical host/device backing. With unknown overlap
 /// the interval spans max(host, device)..host+device; no global allocator counter is

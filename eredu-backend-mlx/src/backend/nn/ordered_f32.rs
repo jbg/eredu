@@ -74,9 +74,12 @@ pub(super) fn attention_product(
             ],
             &[7],
         );
+        let grid_width = columns
+            .checked_mul(lanes)
+            .ok_or_else(|| Exception::custom("ordered attention grid width overflows"))?;
         let config = CustomKernelConfig::new()
-            .with_grid([columns, row_count, 1])
-            .with_thread_group([64, 1, 1])
+            .with_grid([grid_width, row_count, 1])
+            .with_thread_group([128, 1, 1])
             .with_output_arg(shape, Dtype::Float32);
         return PRODUCT.with(|cell| {
             if cell.borrow().is_none() {
@@ -142,12 +145,17 @@ fn map_rows(input: &Array, silu: bool, stream: &Stream) -> Result<Array, Excepti
     }
     let width = input.dim(-1);
     if metal(stream)? {
-        let rows = i32::try_from(input.size() / width as usize)
-            .map_err(|_| Exception::custom("ordered row count overflows"))?;
+        let work_items = if silu {
+            input.size()
+        } else {
+            input.size() / width as usize
+        };
+        let work_items = i32::try_from(work_items)
+            .map_err(|_| Exception::custom("ordered work item count overflows"))?;
         let dimensions = Array::from_slice(&[width], &[1]);
         let config = CustomKernelConfig::new()
             .with_template_arg_bool("SILU", silu)
-            .with_grid([rows, 1, 1])
+            .with_grid([work_items, 1, 1])
             .with_thread_group([64, 1, 1])
             .with_output_arg(input.shape(), Dtype::Float32);
         return ROWS.with(|cell| {
@@ -181,27 +189,31 @@ fn product_kernel() -> Result<MetalKernel, Exception> {
         ["left", "right", "shape"],
         ["out"],
         r#"
-        uint column = thread_position_in_grid.x;
+        uint index = thread_position_in_grid.x;
         uint row = thread_position_in_grid.y;
         uint heads = shape[0], rows = shape[1], width = shape[2], kv_heads = shape[3], columns = shape[4];
         uint batch = row / (heads * rows);
         uint head = (row / rows % heads) / (heads / kv_heads);
         uint nlanes = shape[5];
+        uint column = index / nlanes;
+        uint lane = index % nlanes;
         size_t a = size_t(row) * width;
         size_t b = (size_t(batch * kv_heads + head) * columns + column) * width;
         uint end = shape[6] ? width : (width / nlanes) * nlanes;
-        float lanes[16] = {};
-        for (uint i = 0; i < end; ++i) {
-            uint lane = i % nlanes;
-            lanes[lane] = fma(left[a+i], right[b+i], lanes[lane]);
-        }
+        float sum = 0.0f;
+        for (uint i = lane; i < end; i += nlanes) sum = fma(left[a+i], right[b+i], sum);
         if (nlanes == 16) {
-            for (uint i = 0; i < 8; ++i) lanes[i] += lanes[i + 8];
-            for (uint i = 0; i < 4; ++i) lanes[i] += lanes[i + 4];
+            sum += simd_shuffle_down(sum, 8);
+            sum += simd_shuffle_down(sum, 4);
         }
-        float result = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
-        for (uint i = end; i < width; ++i) result = fma(left[a+i], right[b+i], result);
-        out[size_t(row) * columns + column] = result;
+        float pair = simd_shuffle_down(sum, 1);
+        float third = simd_shuffle_down(sum, 2);
+        float fourth = simd_shuffle_down(sum, 3);
+        if (lane == 0) {
+            float result = (sum + pair) + (third + fourth);
+            for (uint i = end; i < width; ++i) result = fma(left[a+i], right[b+i], result);
+            out[size_t(row) * columns + column] = result;
+        }
         "#,
         "#pragma clang fp contract(off)\n",
         true,
@@ -216,14 +228,14 @@ fn row_kernel() -> Result<MetalKernel, Exception> {
         ["out"],
         r#"
         uint width = shape[0];
-        size_t base = size_t(thread_position_in_grid.x) * width;
+        uint index = thread_position_in_grid.x;
         if (SILU) {
-            for (uint i = 0; i < width; ++i) {
-                float x = input[base+i];
-                float e = i < (width/4)*4 ? vector_exp_f32(-x) : stable_exp_f32(-x);
-                out[base+i] = metal::precise::divide(x, 1.0f+e);
-            }
+            uint column = index % width;
+            float x = input[index];
+            float e = column < (width/4)*4 ? vector_exp_f32(-x) : stable_exp_f32(-x);
+            out[index] = metal::precise::divide(x, 1.0f+e);
         } else {
+            size_t base = size_t(index) * width;
             float peak = -INFINITY;
             for (uint i = 0; i < width; ++i) peak = max(peak, input[base+i]);
             float high = 0.0f;

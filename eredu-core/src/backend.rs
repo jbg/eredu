@@ -1638,6 +1638,8 @@ pub struct TextGenerationConfig {
 /// invocation limits apply even without a caller-imposed bound.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PrefillChunkPolicy {
+    /// Selects a chunk for the request using installed execution and memory facts.
+    Automatic,
     /// Add no caller-imposed chunk limit; architecture invocation limits remain.
     Unchunked,
     /// Process at most this many tokens in each eligible prefill pass.
@@ -1646,7 +1648,22 @@ pub enum PrefillChunkPolicy {
 
 impl Default for PrefillChunkPolicy {
     fn default() -> Self {
-        Self::Bounded(std::num::NonZeroUsize::new(512).expect("512 is nonzero"))
+        Self::Automatic
+    }
+}
+
+impl PrefillChunkPolicy {
+    /// Bound used when there is no usable forecast for automatic selection.
+    pub const AUTOMATIC_FALLBACK: std::num::NonZeroUsize =
+        std::num::NonZeroUsize::new(512).unwrap();
+
+    /// Effective explicit bound, or the automatic fallback before selection.
+    pub const fn unresolved_limit(self) -> std::num::NonZeroUsize {
+        match self {
+            Self::Automatic => Self::AUTOMATIC_FALLBACK,
+            Self::Unchunked => std::num::NonZeroUsize::MAX,
+            Self::Bounded(limit) => limit,
+        }
     }
 }
 
@@ -1675,7 +1692,7 @@ impl TextGenerationConfig {
             sampling,
             seed: 0,
             strategy: TextSamplingStrategy::Standard,
-            prefill: PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(512).unwrap()),
+            prefill: PrefillChunkPolicy::Automatic,
             decoding_mode: None,
             draft_events: false,
             canvas: None,
@@ -2050,6 +2067,19 @@ pub trait CausalTextSession<B: BackendProvider, Prompt, Token, State>: BackendSe
 pub trait TextOperationDriver<B: TextGenerationBackend>: BackendSession<B> + Sized {
     /// Prepared input owned by this portable operation driver.
     type Prompt: 'static;
+
+    /// Counts an unadorned prompt for automatic prefill sizing.
+    fn plain_text_prefill_tokens(_prompt: &Self::Prompt) -> Option<usize> {
+        None
+    }
+
+    /// Resolves automatic prefill sizing without submitting model work.
+    fn automatic_prefill_chunk(
+        _runtime: &ModelRuntime<B, Self>,
+        _input_tokens: usize,
+    ) -> std::num::NonZeroUsize {
+        PrefillChunkPolicy::AUTOMATIC_FALLBACK
+    }
 
     /// Admits tokenized text and prepares the exact prompt for this installed driver.
     fn prepare_text_prompt(

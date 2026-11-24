@@ -10,7 +10,7 @@ fn failure(error: impl std::fmt::Display) -> GenerationForecastError {
 fn chunk_tokens(policy: eredu_core::PrefillChunkPolicy, positions: u64) -> u64 {
     match policy {
         eredu_core::PrefillChunkPolicy::Unchunked => positions.max(1),
-        eredu_core::PrefillChunkPolicy::Bounded(n) => n.get() as u64,
+        bounded => bounded.unresolved_limit().get() as u64,
     }
 }
 /// Application comparisons and optional calibration overrides. Missing available

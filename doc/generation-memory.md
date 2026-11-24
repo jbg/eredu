@@ -250,8 +250,10 @@ fresh inspection because conversion and transfer costs can change the result.
 
 ## Chunked prefill
 
-Ordinary text generation requests chunks of 512 tokens by default.
-`--prefill-chunk-size 0` requests a single pass. The shared generation driver
+Ordinary text generation sizes eligible prefill chunks using installed execution
+geometry and observed physical headroom. It uses a 512-token fallback when
+accounting is unavailable. A positive `--prefill-chunk-size` overrides the
+automatic bound. A zero value removes the caller-imposed limit. The shared generation driver
 settles intermediate chunks before proceeding and samples only after the final
 chunk. Controlled generation uses that same driver. Chunk boundaries preserve
 cache positions and cancellation is checked between completed chunks.

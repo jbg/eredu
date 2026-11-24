@@ -93,16 +93,32 @@ where
         + BackendSession<B, Output = N::Output, Completion = N::Completion>,
     B::Error: From<GenerationError> + From<eredu_core::BackendError> + From<BackendFailure>,
     N: CausalTextMechanisms<
-        B,
-        Resources = R,
-        Token = B::Token,
-        SamplingCompletion = B::TextCompletion,
-        Model: super::InstalledTextState,
-    >,
+            B,
+            Resources = R,
+            Prefill = super::TextPromptFor<B>,
+            Token = B::Token,
+            SamplingCompletion = B::TextCompletion,
+            Model: super::InstalledTextState,
+        > + eredu_core::capability::NativeExecutionMemory<B>
+        + super::TextTransactionMechanisms,
     R: std::ops::Deref<Target = TextSessionResourcesFor<B, N>>,
 {
     type Prompt = crate::text_session_driver::TextPromptFor<B>;
     type TextGenerationState = super::TextRequestFor<B>;
+
+    fn plain_text_prefill_tokens(prompt: &Self::Prompt) -> Option<usize> {
+        prompt.plain_token_tensor().and_then(B::token_count)
+    }
+
+    fn automatic_prefill_chunk(
+        runtime: &ModelRuntime<B, Self>,
+        input_tokens: usize,
+    ) -> NonZeroUsize {
+        if runtime.session().prefill_chunking_support::<B>().is_err() {
+            return eredu_core::PrefillChunkPolicy::AUTOMATIC_FALLBACK;
+        }
+        super::forecast::automatic_prefill_chunk::<B, N>(runtime, input_tokens)
+    }
 
     fn prepare_text_prompt(
         backend: &B,

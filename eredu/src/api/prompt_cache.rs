@@ -101,21 +101,19 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> PromptCacheRun<'_, B,
 }
 
 impl<B: TextGenerationBackend, S: TextExecutionSession<B>> AttachedPromptCache<B, S> {
-    fn eligible(runtime: &ModelRuntime<B, S>, config: &TextGenerationConfig) -> Option<usize> {
-        let PrefillChunkPolicy::Bounded(chunk) = config.prefill_chunk_policy() else {
-            return None;
-        };
-        (matches!(
-            config
-                .decoding_mode()
-                .unwrap_or_else(|| runtime.session().default_decoding_mode()),
-            eredu_core::decoding::DecodingMode::Autoregressive
-        ) && config.sampling().max_new_tokens != Some(0)
+    fn eligible(runtime: &ModelRuntime<B, S>, config: &TextGenerationConfig) -> bool {
+        config.prefill_chunk_policy() != PrefillChunkPolicy::Unchunked
+            && matches!(
+                config
+                    .decoding_mode()
+                    .unwrap_or_else(|| runtime.session().default_decoding_mode()),
+                eredu_core::decoding::DecodingMode::Autoregressive
+            )
+            && config.sampling().max_new_tokens != Some(0)
             && config.refinement_canvas().is_none()
             && runtime.session().active_parameter_overlay().is_none()
             && runtime.session().text_prefill_chunking_support().is_ok()
-            && !runtime.session().supports_block_refinement())
-        .then_some(chunk.get())
+            && !runtime.session().supports_block_refinement()
     }
 
     fn descriptor(
@@ -165,13 +163,13 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> AttachedPromptCache<B
     pub(super) fn prepare(
         &self,
         runtime: &mut ModelRuntime<B, S>,
-        config: &TextGenerationConfig,
+        config: &mut TextGenerationConfig,
         tokens: &[u32],
         cancel: &GenerationCancellationToken,
     ) -> Result<Option<PromptCacheRun<'_, B, S>>, PreparedChatError> {
-        let Some(chunk) = Self::eligible(runtime, config) else {
+        if !Self::eligible(runtime, config) {
             return Ok(None);
-        };
+        }
         if cancel.is_cancelled() {
             return Ok(None);
         }
@@ -186,6 +184,13 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> AttachedPromptCache<B
         }
         let started = Instant::now();
         runtime.reset().map_err(PreparedChatError::Backend)?;
+        if config.prefill_chunk_policy() == PrefillChunkPolicy::Automatic {
+            let limit = S::automatic_prefill_chunk(runtime, tokens.len());
+            *config = config
+                .clone()
+                .with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(limit));
+        }
+        let chunk = config.prefill_chunk_policy().unresolved_limit().get();
         let reused = self.restore_prefix(runtime, identity, tokens)?;
         let chunks = tokens.len().saturating_sub(1) / chunk;
         Ok(Some(PromptCacheRun {
