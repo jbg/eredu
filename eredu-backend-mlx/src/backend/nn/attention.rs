@@ -522,7 +522,7 @@ impl PreparedAttentionKeyValues {
                 keys: keys.swap_axes(-1, -2, stream)?,
                 transposed_values: values.swap_axes(-1, -2, stream)?,
             };
-            if share_ordered_layouts {
+            if share_ordered_layouts && queries.dim(2) > 1 {
                 ordered.keys = ordered.keys.contiguous(false, stream)?;
                 ordered.transposed_values = ordered.transposed_values.contiguous(false, stream)?;
             }
