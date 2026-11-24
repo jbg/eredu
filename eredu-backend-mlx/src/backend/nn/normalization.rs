@@ -300,10 +300,23 @@ fn wide_square_rms(
         thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
         let rows = i32::try_from(rows).map_err(|_| Exception::custom("RMS row count overflows"))?;
         let epsilon = Array::from_slice(&[epsilon], &[1]);
+        // One FP32 square per input element, with at most 32 KiB per group.
+        const STAGED_MAX_WIDTH: i32 = 8192;
+        // For large row batches, independent scalar rows provide parallelism
+        // without assigning a whole SIMD group and scratch to every row.
+        const STAGED_MAX_ROWS: i32 = 512;
+        const SIMD_WIDTH: i32 = 32;
+        let staged = width <= STAGED_MAX_WIDTH && rows <= STAGED_MAX_ROWS;
+        let (grid, group) = if staged {
+            ([SIMD_WIDTH, rows, 1], [SIMD_WIDTH, 1, 1])
+        } else {
+            ([rows, 1, 1], [64, 1, 1])
+        };
         let config = CustomKernelConfig::new()
             .with_template_arg_int("WIDTH", width)
-            .with_grid([rows, 1, 1])
-            .with_thread_group([64, 1, 1])
+            .with_template_arg_bool("STAGED", staged)
+            .with_grid(grid)
+            .with_thread_group(group)
             .with_output_arg(input.shape(), Dtype::Float32);
         return KERNEL.with(|cell| {
             if cell.borrow().is_none() {
@@ -311,31 +324,15 @@ fn wide_square_rms(
                     "wide_square_rms",
                     ["input", "gain", "epsilon"],
                     ["out"],
-                    r#"
-                    uint row = thread_position_in_grid.x;
-                    size_t offset = size_t(row) * WIDTH;
-                    float high = 0.0f;
-                    float low = 0.0f;
-                    for (uint i = 0; i < WIDTH; ++i) {
-                        float x = input[offset + i];
-                        float y = x * x;
-                        float s = high + y;
-                        float v = s - high;
-                        float e = (high - (s - v)) + (y - v) + low;
-                        high = s + e;
-                        low = e - (high - s);
-                    }
-                    float mean = metal::precise::divide(high, float(WIDTH));
-                    mean += metal::precise::divide(fma(-mean, float(WIDTH), high) + low, float(WIDTH));
-                    float inverse = metal::precise::divide(1.0f, metal::precise::sqrt(mean + epsilon[0]));
-                    for (uint i = 0; i < WIDTH; ++i) out[offset + i] = (input[offset + i] * inverse) * gain[i];
-                    "#,
+                    include_str!("ordered_f32_rms.metal"),
                     "#pragma clang fp contract(off)\n",
                     true,
                     false,
                 )?);
             }
-            cell.borrow().as_ref().expect("RMS kernel initialized")
+            cell.borrow()
+                .as_ref()
+                .expect("RMS kernel initialized")
                 .apply_one_device([input, weight, &epsilon], &config, stream)
         });
     }
