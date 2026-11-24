@@ -340,7 +340,7 @@ pub fn sliding_window_prefill_attention_with_softcap(
 }
 
 const INPUT_SCORE_TILE_ELEMENTS: u64 = 8192;
-const WIDE_BF16_SCORE_TILE_ELEMENTS: u64 = 32768;
+const WIDE_SCORE_TILE_ELEMENTS: u64 = 32768;
 
 /// Conservative native live-buffer facts shared with cold memory selection.
 pub(crate) const INPUT_SCORE_WORKSPACE: eredu_core::attention::InputScoreAttentionMechanism =
@@ -353,7 +353,7 @@ pub(crate) const INPUT_SCORE_WORKSPACE: eredu_core::attention::InputScoreAttenti
         full_key_tiles: Some(eredu_core::attention::FullKeyAttentionTiles {
             max_key_positions: INPUT_SCORE_TILE_ELEMENTS,
             wider_score_tile_elements: if cfg!(all(feature = "metal", not(feature = "cuda"))) {
-                Some(WIDE_BF16_SCORE_TILE_ELEMENTS)
+                Some(WIDE_SCORE_TILE_ELEMENTS)
             } else {
                 None
             },
@@ -468,22 +468,28 @@ pub fn attention_with_softcap(
             queries, keys, values, scale, mask, sinks, softcap, stream,
         );
     }
-    let prepared = PreparedAttentionKeyValues::new(queries, keys, values, arithmetic, stream)?;
+    let prepared =
+        PreparedAttentionKeyValues::new(queries, keys, values, arithmetic, false, stream)?;
     attention_with_prepared_key_values(queries, &prepared, scale, mask, sinks, softcap, stream)
 }
 
-/// Invocation-local layouts shared by every full-key query tile. In particular,
-/// the BF16 value projection needs a contiguous transposed layout, not merely a
-/// shared transpose expression which each custom-kernel call would copy again.
+/// Invocation-local layouts shared by every full-key query tile. Native
+/// products that need contiguous rows prepare them once for the invocation.
 struct PreparedAttentionKeyValues {
     keys: Array,
     values: Array,
     key_product: Option<super::matrix::PreparedBf16BatchedProduct>,
     value_product: Option<super::matrix::PreparedBf16BatchedProduct>,
+    ordered: Option<OrderedAttentionKeyValues>,
     score_dtype: Dtype,
     query_rows: u64,
     score_reduction: super::matrix::BatchedDotReduction,
     value_reduction: super::matrix::BatchedDotReduction,
+}
+
+struct OrderedAttentionKeyValues {
+    keys: Array,
+    transposed_values: Array,
 }
 
 impl PreparedAttentionKeyValues {
@@ -492,6 +498,7 @@ impl PreparedAttentionKeyValues {
         keys: &Array,
         values: &Array,
         arithmetic: eredu_nn::AttentionArithmetic,
+        share_ordered_layouts: bool,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let score_dtype = if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
@@ -506,6 +513,23 @@ impl PreparedAttentionKeyValues {
             .as_dtype(score_dtype, stream)?
             .swap_axes(-1, -2, stream)?;
         let values = values.clone();
+        let ordered = if score_dtype == Dtype::Float32
+            && queries.dtype() == Dtype::Float32
+            && values.dtype() == Dtype::Float32
+            && super::ordered_f32::supported(stream)?
+        {
+            let mut ordered = OrderedAttentionKeyValues {
+                keys: keys.swap_axes(-1, -2, stream)?,
+                transposed_values: values.swap_axes(-1, -2, stream)?,
+            };
+            if share_ordered_layouts {
+                ordered.keys = ordered.keys.contiguous(false, stream)?;
+                ordered.transposed_values = ordered.transposed_values.contiguous(false, stream)?;
+            }
+            Some(ordered)
+        } else {
+            None
+        };
         use super::matrix::BatchedDotReduction;
         use eredu_nn::arithmetic::Bf16DotGeometry;
 
@@ -538,6 +562,7 @@ impl PreparedAttentionKeyValues {
             values,
             key_product,
             value_product,
+            ordered,
             score_dtype,
             query_rows: queries.dim(2) as u64,
             score_reduction,
@@ -605,14 +630,10 @@ fn attention_with_prepared_key_values(
     let tokens = prepared.values.dim(2);
     let score_dtype = prepared.score_dtype;
     let query = queries.as_dtype(score_dtype, stream)?;
-    let ordered = score_dtype == Dtype::Float32
-        && queries.dtype() == Dtype::Float32
-        && prepared.values.dtype() == Dtype::Float32
-        && super::ordered_f32::supported(stream)?;
-    let scores = if ordered {
+    let scores = if let Some(ordered) = &prepared.ordered {
         super::ordered_f32::attention_product(
             &query,
-            &prepared.keys.swap_axes(-1, -2, stream)?,
+            &ordered.keys,
             false,
             prepared.query_rows,
             stream,
@@ -635,13 +656,13 @@ fn attention_with_prepared_key_values(
         mask,
         sinks,
         softcap,
-        ordered,
+        prepared.ordered.is_some(),
         stream,
     )?;
-    if ordered {
+    if let Some(ordered) = &prepared.ordered {
         return super::ordered_f32::attention_product(
             &probabilities,
-            &prepared.values.swap_axes(-1, -2, stream)?,
+            &ordered.transposed_values,
             true,
             prepared.query_rows,
             stream,
@@ -806,26 +827,28 @@ fn input_score_attention_with_tile_batches(
                 keys,
                 values,
                 eredu_nn::AttentionArithmetic::InputScores,
+                true,
                 stream,
             )
         })
         .transpose()?;
     let mut outputs = Vec::new();
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let wide_tile = prepared.is_some()
-        && keys.dim(2) <= score_softmax::MAX_KEYS
-        && sinks.is_none()
-        && softcap.is_none()
-        && mask.as_ref().is_none_or(|value| {
-            matches!(
-                value.dtype(),
-                Dtype::Bool | Dtype::Bfloat16 | Dtype::Float32
-            )
-        })
-        && [queries, keys, values]
-            .iter()
-            .all(|value| value.dtype() == Dtype::Bfloat16)
-        && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu;
+    let wide_tile = prepared.as_ref().is_some_and(|prepared| {
+        prepared.ordered.is_some()
+            || (keys.dim(2) <= score_softmax::MAX_KEYS
+                && sinks.is_none()
+                && softcap.is_none()
+                && mask.as_ref().is_none_or(|value| {
+                    matches!(
+                        value.dtype(),
+                        Dtype::Bool | Dtype::Bfloat16 | Dtype::Float32
+                    )
+                })
+                && [queries, keys, values]
+                    .iter()
+                    .all(|value| value.dtype() == Dtype::Bfloat16))
+    }) && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu;
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     let wide_tile = false;
     let score_tile_elements = if wide_tile {
@@ -835,6 +858,19 @@ fn input_score_attention_with_tile_batches(
     };
     let query_step = (score_tile_elements as i32 / keys.dim(2))
         .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
+    // Wider ordered tiles share K/V layout work. Preserve the narrow path's
+    // live score-row bound and its evaluation boundary across layers.
+    let live_tile_batch = if wide_tile
+        && prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.ordered.is_some())
+    {
+        let narrow_step = (INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
+            .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
+        (live_tile_batch.saturating_mul(narrow_step as usize) / query_step as usize).max(1)
+    } else {
+        live_tile_batch
+    };
     let tile_count = (queries.dim(2) as usize).div_ceil(query_step as usize);
     let evaluate_batches = prepared.is_some() && tile_count > live_tile_batch;
     let mut completed_tiles = 0;
