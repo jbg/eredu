@@ -11,7 +11,12 @@ use std::cell::RefCell;
 thread_local! {
     static PRODUCT: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static ROWS: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static SOFTMAX: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
+
+const SOFTMAX_SIMD_WIDTH: i32 = 32;
+const SOFTMAX_MIN_WIDTH: i32 = 128;
+const SOFTMAX_MAX_WIDTH: i32 = 8192;
 
 fn metal(stream: &Stream) -> Result<bool, Exception> {
     Ok(super::native_quantization::uses_metal_device(
@@ -153,6 +158,24 @@ fn map_rows(input: &Array, silu: bool, stream: &Stream) -> Result<Array, Excepti
         let work_items = i32::try_from(work_items)
             .map_err(|_| Exception::custom("ordered work item count overflows"))?;
         let dimensions = Array::from_slice(&[width], &[1]);
+        if !silu && (SOFTMAX_MIN_WIDTH..=SOFTMAX_MAX_WIDTH).contains(&width) {
+            // Reuse the same pipeline as the cached sequence grows.
+            let capacity = (width as u32).div_ceil(4).next_power_of_two() as i32;
+            let config = CustomKernelConfig::new()
+                .with_template_arg_int("GROUP_CAPACITY", capacity)
+                .with_grid([SOFTMAX_SIMD_WIDTH, work_items, 1])
+                .with_thread_group([SOFTMAX_SIMD_WIDTH, 1, 1])
+                .with_output_arg(input.shape(), Dtype::Float32);
+            return SOFTMAX.with(|cell| {
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(softmax_kernel()?);
+                }
+                cell.borrow()
+                    .as_ref()
+                    .expect("ordered softmax kernel initialized")
+                    .apply_one_device([input, &dimensions], &config, stream)
+            });
+        }
         let config = CustomKernelConfig::new()
             .with_template_arg_bool("SILU", silu)
             .with_grid([work_items, 1, 1])
@@ -246,25 +269,51 @@ fn row_kernel() -> Result<MetalKernel, Exception> {
                     values[j] = vector_exp_f32(input[base+i+j] - peak);
                     out[base+i+j] = values[j];
                 }
-                float mass = (values.x + values.y) + (values.z + values.w);
-                float sum = high + mass;
-                float split = sum - high;
-                float error = (high - (sum - split)) + (mass - split) + low;
-                high = sum + error;
-                low = error - (high - sum);
+                add_softmax_mass(softmax_mass(values), high, low);
             }
-            float quotient = metal::precise::divide(1.0f, high);
-            float error = fma(-quotient, high, 1.0f) - quotient * low;
-            float inverse = quotient + metal::precise::divide(error, high);
+            float inverse = softmax_inverse(high, low);
             for (uint i = 0; i < width; ++i) out[base+i] *= inverse;
         }
         "#,
-        &[
-            super::arithmetic::metal_arithmetic_header(),
-            include_str!("exp_vector_f32.metal"),
-        ]
-        .concat(),
+        &row_arithmetic_header(),
         true,
         false,
     )
+}
+
+fn softmax_kernel() -> Result<MetalKernel, Exception> {
+    MetalKernel::new(
+        "ordered_f32_simd_softmax",
+        ["input", "shape"],
+        ["out"],
+        include_str!("ordered_f32_softmax.metal"),
+        &row_arithmetic_header(),
+        true,
+        false,
+    )
+}
+
+fn row_arithmetic_header() -> String {
+    [
+        super::arithmetic::metal_arithmetic_header(),
+        include_str!("exp_vector_f32.metal"),
+        r#"
+        inline float softmax_mass(float4 values) {
+            return (values.x + values.y) + (values.z + values.w);
+        }
+        inline void add_softmax_mass(float mass, thread float& high, thread float& low) {
+            float sum = high + mass;
+            float split = sum - high;
+            float error = (high - (sum - split)) + (mass - split) + low;
+            high = sum + error;
+            low = error - (high - sum);
+        }
+        inline float softmax_inverse(float high, float low) {
+            float quotient = metal::precise::divide(1.0f, high);
+            float error = fma(-quotient, high, 1.0f) - quotient * low;
+            return quotient + metal::precise::divide(error, high);
+        }
+        "#,
+    ]
+    .concat()
 }
