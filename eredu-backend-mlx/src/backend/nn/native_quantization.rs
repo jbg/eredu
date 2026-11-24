@@ -50,6 +50,7 @@ thread_local! {
     static Q4K_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q4K_F32_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GROUPED_DECODE_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q4K_EMBEDDING_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
@@ -59,6 +60,7 @@ thread_local! {
     static Q6K_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q6K_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q6K_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static Q6K_F32_MATMUL_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_LINEAR_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_BATCH_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static Q5_1_GROUPED_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
