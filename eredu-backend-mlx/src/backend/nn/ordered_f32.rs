@@ -13,6 +13,8 @@ thread_local! {
     static ROWS: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SOFTMAX: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static FUSED_ATTENTION: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static DECODE_SCORES: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static DECODE_VALUES: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
 const SOFTMAX_SIMD_WIDTH: i32 = 32;
@@ -31,7 +33,7 @@ pub(super) fn supported(stream: &Stream) -> Result<bool, Exception> {
     Ok(device == DeviceType::Cpu || super::native_quantization::uses_metal_device(device))
 }
 
-/// Full-key prefill with the ordered score, softmax and value reductions.
+/// Full-key attention with the ordered score, softmax and value reductions.
 pub(super) fn fused_attention(
     query: &Array,
     keys: &Array,
@@ -47,7 +49,12 @@ pub(super) fn fused_attention(
     let positions = keys.dim(2);
     let kv_heads = keys.dim(1);
     let output_width = transposed_values.dim(2);
-    if query_rows <= 1 || !(128..=4096).contains(&positions) || query.size() == 0 || !metal(stream)?
+    let decode = query_rows == 1;
+    let min_positions = if decode { 1 } else { 128 };
+    if !(min_positions..=4096).contains(&positions)
+        || query.size() == 0
+        || output_width == 0
+        || !metal(stream)?
     {
         return Ok(None);
     }
@@ -78,6 +85,64 @@ pub(super) fn fused_attention(
         .checked_mul(heads)
         .and_then(|count| count.checked_mul(rows))
         .ok_or_else(|| Exception::custom("ordered attention row count overflows"))?;
+    let dimensions = Array::from_slice(
+        &[heads, rows, width, kv_heads, positions, output_width],
+        &[6],
+    );
+    let scale = Array::from_slice(&[scale], &[1]);
+    if decode {
+        let scores = DECODE_SCORES.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "ordered_f32_decode_scores",
+                    ["query", "keys", "mask", "shape", "scale"],
+                    ["out"],
+                    include_str!("ordered_f32_decode_scores.metal"),
+                    "#pragma clang fp contract(off)\n",
+                    false,
+                    false,
+                )?);
+            }
+            let config = CustomKernelConfig::new()
+                .with_template_arg_int("MASK_MODE", mask_mode)
+                .with_grid([positions * 16, row_count, 1])
+                .with_thread_group([128, 1, 1])
+                .with_output_arg(shape, Dtype::Float32);
+            cell.borrow()
+                .as_ref()
+                .expect("ordered decode score kernel initialized")
+                .apply_one_device([query, keys, &mask, &dimensions, &scale], &config, stream)
+        })?;
+        return DECODE_VALUES.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "ordered_f32_decode_values",
+                    ["scores", "values", "shape"],
+                    ["out"],
+                    include_str!("ordered_f32_decode_values.metal"),
+                    &row_arithmetic_header(),
+                    false,
+                    false,
+                )?);
+            }
+            const THREADS: i32 = 256;
+            const COLUMNS: i32 = THREADS / 16;
+            let config = CustomKernelConfig::new()
+                .with_template_arg_int(
+                    "CAPACITY",
+                    (positions as u32).max(4).next_power_of_two() as i32,
+                )
+                .with_template_arg_int("THREADS", THREADS)
+                .with_grid([THREADS, row_count, (output_width - 1) / COLUMNS + 1])
+                .with_thread_group([THREADS, 1, 1])
+                .with_output_arg([batch, heads, rows, output_width], Dtype::Float32);
+            cell.borrow()
+                .as_ref()
+                .expect("ordered decode value kernel initialized")
+                .apply_one_device([&scores, transposed_values, &dimensions], &config, stream)
+                .map(Some)
+        });
+    }
     let config = CustomKernelConfig::new()
         .with_template_arg_int("CAPACITY", (positions as u32).next_power_of_two() as i32)
         .with_template_arg_int("MASK_MODE", mask_mode)
@@ -89,11 +154,6 @@ pub(super) fn fused_attention(
         .with_grid([FUSED_ATTENTION_THREADS, row_count, 1])
         .with_thread_group([FUSED_ATTENTION_THREADS, 1, 1])
         .with_output_arg([batch, heads, rows, output_width], Dtype::Float32);
-    let dimensions = Array::from_slice(
-        &[heads, rows, width, kv_heads, positions, output_width],
-        &[6],
-    );
-    let scale = Array::from_slice(&[scale], &[1]);
     let query = query.contiguous(false, stream)?;
     let keys = keys.contiguous(false, stream)?;
     let values = transposed_values.contiguous(false, stream)?;
