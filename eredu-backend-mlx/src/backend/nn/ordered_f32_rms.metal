@@ -17,25 +17,17 @@ if (PARALLEL) mean = certified_rms_mean(squares, WIDTH, lane);
 float inverse = 0.0f;
 if (lane == 0) {
     if (mean < 0.0f) {
-        // The compensated sum consumes the rounded squares in input order.
-        float high = 0.0f;
-        float low = 0.0f;
-        for (uint i = 0; i < WIDTH; ++i) {
-            float y;
-            if (STAGED) {
-                y = squares[i];
-            } else {
+        if (STAGED) {
+            mean = ordered_rms_mean_from_squares(squares, WIDTH);
+        } else {
+            float high = 0.0f;
+            float low = 0.0f;
+            for (uint i = 0; i < WIDTH; ++i) {
                 float x = input[offset + i];
-                y = x * x;
+                accumulate_ordered_rms_square(x * x, high, low);
             }
-            float s = high + y;
-            float v = s - high;
-            float e = (high - (s - v)) + (y - v) + low;
-            high = s + e;
-            low = e - (high - s);
+            mean = finish_ordered_rms_mean(high, low, WIDTH);
         }
-        mean = metal::precise::divide(high, float(WIDTH));
-        mean += metal::precise::divide(fma(-mean, float(WIDTH), high) + low, float(WIDTH));
     }
     inverse = metal::precise::divide(1.0f, metal::precise::sqrt(mean + epsilon[0]));
 }
