@@ -77,6 +77,11 @@ path = "examples/conversion_retention.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "lfm3_q4k_reference"
+path = "examples/lfm3_q4k_reference.rs"
+required-features = ["mlx", "metal"]
+
+[[example]]
 name = "projection_forecast"
 path = "examples/projection_forecast.rs"
 required-features = ["mlx", "metal", "projection-profiling", "tensor-capture"]
@@ -359,6 +364,7 @@ jsonschema = { version = "0.52.0", default-features = false }
 anyhow = "1"
 
 [dev-dependencies]
+half.workspace = true
 tempfile.workspace = true
 eredu-evaluation.workspace = true
 eredu-codec.workspace = true

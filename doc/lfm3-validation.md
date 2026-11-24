@@ -74,19 +74,42 @@ Both cases pass the shared score profile, including its relative L2 limit of
 0.02, minimum cosine similarity of 0.999, and top-five overlap of at least four.
 Independent greedy runs also match the first nine predictions on each prompt.
 
-## Same-artifact GGUF evidence
+## Independent Q4_K projection validation
 
 `LiquidAI/LFM3-1.7B-GGUF` revision
 `cd0c74c575b5c416f3011b5b4c298077f26ca8c2`, file
 `LFM3-1.7B-Q4_K_M.gguf`, has SHA-256
 `3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4`.
-Eredu Metal with `MLX_ENABLE_TF32=0` and llama.cpp Metal execute this identical
-encoded artifact. The reference is llama.cpp `cd959bae99ff4bed22bef2604f45241c09bbb8c8`
-(0.9.0, build 12110), with F32 KV and flash attention disabled. This reference pin
-is the installed version used for measurement.
 
-The short prompt and eight teacher-forced cached inputs compare every vocabulary
-score. Maximum relative L2 is `0.01882853`, minimum cosine is `0.99983101`, minimum
+The `lfm3_q4k_reference` runner checks the artifact digest and reads the original
+Q4_K bytes of `blk.0.shortconv.in_proj.weight`. It reconstructs each weight
+directly from the encoded fields in F64 and computes the dot products in F64.
+It compares all 12,582,912 decoded weights against Eredu's portable F32 decode
+and compares all 6,144 outputs per activation row against Eredu's native Metal
+projection. The runner exercises one and 17 rows in F32 and 17 rows in F16.
+The activation values are exactly representable in F16 and the signed 8-bit
+activation blocks. This isolates weight decoding and contraction from activation
+quantization error. The per-row relative L2 limit is `0.00001` for the F32
+single-row projection and `0.001` for the multi-row projections, which allows
+for F16 rounding in the tiled Metal path.
+
+On M3 Ultra, all 12,582,912 decoded values match exactly.
+
+| Metal activation dtype | Rows | Maximum relative L2 |
+| --- | ---: | ---: |
+| F32 | 1 | 0.000000076 |
+| F32 | 17 | 0.000211206 |
+| F16 | 17 | 0.000298098 |
+
+## Same-artifact GGUF interoperability
+
+Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same
+encoded artifact. The interoperability baseline is llama.cpp
+`cd959bae99ff4bed22bef2604f45241c09bbb8c8` (0.9.0, build 12110), with F32 KV
+and flash attention disabled.
+
+The recorded short prompt and eight teacher-forced cached inputs compare every
+vocabulary score. Maximum relative L2 is `0.01882853`, minimum cosine is `0.99983101`, minimum
 top-five overlap is 4/5, and all nine argmax IDs agree. These meet the existing shared
 logit profile (`relative_l2 <= 0.02`, `cosine >= 0.999`, top-five overlap at least four,
 and matching unambiguous argmax). Maximum absolute difference is `0.24158096`;
@@ -100,6 +123,30 @@ is separate from the passing Metal-to-Metal comparison.
 Compact measured rows, precision settings and token IDs are retained in
 `validation/fixtures/lfm3/acceptance-results.json`. Other published GGUF encodings
 have no recorded numerical acceptance.
+
+### llama.cpp Metal tiled prefill discrepancy
+
+With the pinned artifact, the first traced difference is in the layer-0 short
+convolution input projection. Its activation input matches exactly. The tiled
+llama.cpp Metal decoder divides the block's upper-nibble scale by 16 in F16
+before widening it to F32. That division rounds the scale in 44,817 of the
+projection's 49,152 blocks. Reading the nibble as an integer from 0 to 15 and
+applying the original block scale in wider arithmetic avoids the extra rounding.
+[Pinned llama.cpp Q4_K Metal decoder](https://github.com/ggml-org/llama.cpp/blob/cd959bae99ff4bed22bef2604f45241c09bbb8c8/ggml/src/ggml-metal/kernels/dequantize.h#L435-L449).
+
+Independent contractions reproduce the stock and widened first-projection
+outputs within `8e-7` relative L2 when each uses the corresponding scale
+arithmetic and the tiled path's F16 operands.
+
+On the 781-token case, stock llama.cpp's final prefill row differs by 2.71%
+relative L2 from its own single-row execution. Disabling fusion leaves that
+row bit-identical. The stock Eredu versus llama.cpp prefill gap is 2.64%,
+above the 2% limit. The eight cached rows pass. Widening the scale before
+dividing in an off-tree llama.cpp build reduces the prefill gap to 0.38%,
+and all nine score rows then pass the shared profile. Across
+prompts of 33, 127, 256, 512, 781 and 1,024 tokens, the largest prefill gap
+drops from 3.97% to 0.38%. The residual difference is unattributed. The
+interoperability check uses the stock pinned build and the same tolerance.
 
 ## Reproduce
 
@@ -115,7 +162,7 @@ cargo test -p eredu --no-default-features --features mlx --test chunked_prefill 
 
 `validation/reference_runner.py` also produces the ordinary shared comparison
 artifact from a probe JSON using `--trust-remote-code --local-files-only --device cpu
---dtype float32`. A same-artifact GGUF reference uses
+--dtype float32`. The same-artifact GGUF interoperability check uses
 `validation/gguf_reference.cpp`, built against the exact llama.cpp revision recorded
 with its result. The exporter emits full prefill and cached-decode vocabulary rows;
 generated token agreement alone is insufficient.
@@ -144,16 +191,47 @@ for length in 128 269; do
 done
 ```
 
-For precise Metal acceptance, build the probe with `--features mlx,metal`, select
-`--device gpu`, and set `MLX_ENABLE_TF32=0`. Metal execution needs device access.
-The same probe accepts the GGUF file as `--model`; use
-`--output /private/tmp/lfm3-gguf-actual` for the comparison command below. Build the independent exporter
-against the pinned llama.cpp headers and library:
+For the independent Q4_K check, pass the pinned GGUF file to the projection
+runner. Metal execution needs device access.
 
 ```sh
-clang++ -std=c++17 validation/gguf_reference.cpp -I/opt/homebrew/include -L/opt/homebrew/lib -lllama -Wl,-rpath,/opt/homebrew/lib -o /private/tmp/gguf_reference
-/private/tmp/gguf_reference /private/tmp/LFM3-1.7B-Q4_K_M.gguf /private/tmp/lfm3-gguf-reference.safetensors 1,3,2,5,8,13,21,34,55 5,8,13,21,34,55,3,2 gpu
-cargo run -p eredu-evaluation --bin eredu-parity -- --actual /private/tmp/lfm3-gguf-actual.json --reference /private/tmp/lfm3-gguf-reference.json --output /private/tmp/lfm3-gguf-parity.json
+MLX_ENABLE_TF32=0 cargo run --release -p eredu --no-default-features --features mlx,metal --example lfm3_q4k_reference -- /private/tmp/LFM3-1.7B-Q4_K_M.gguf
+```
+
+For the Metal interoperability check, build the probe with `--features mlx,metal`, select
+`--device gpu`, and set `MLX_ENABLE_TF32=0`. Build the exporter against the
+pinned llama.cpp headers and Metal library.
+
+```sh
+llama_src=/private/tmp/lfm3-llama-source
+llama_build=/private/tmp/lfm3-llama-build
+git clone https://github.com/ggml-org/llama.cpp.git "$llama_src"
+git -C "$llama_src" checkout cd959bae99ff4bed22bef2604f45241c09bbb8c8
+cmake -S "$llama_src" -B "$llama_build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON
+cmake --build "$llama_build" --target llama --parallel
+clang++ -std=c++17 validation/gguf_reference.cpp \
+    -I"$llama_src/include" -I"$llama_src/ggml/include" -L"$llama_build/bin" \
+    -lllama -lggml -lggml-base -Wl,-rpath,"$llama_build/bin" -o /private/tmp/gguf_reference
+
+model=/private/tmp/LFM3-1.7B-Q4_K_M.gguf
+prompt=1,3,2,5,8,13,21,34,55
+decode=5,8,13,21,34,55,3,2
+MLX_ENABLE_TF32=0 cargo run --release -p eredu --no-default-features --features mlx,metal --example checkpoint_probe -- \
+    --model "$model" --device gpu --input-ids "$prompt" --teacher-forced-ids "$decode" \
+    --warmup-runs 0 --output /private/tmp/lfm3-gguf-actual
+/private/tmp/gguf_reference "$model" /private/tmp/lfm3-gguf-reference.safetensors "$prompt" "$decode" gpu
+cargo run --release -p eredu-evaluation --bin eredu-parity -- \
+    --actual /private/tmp/lfm3-gguf-actual.json --reference /private/tmp/lfm3-gguf-reference.json \
+    --output /private/tmp/lfm3-gguf-parity.json
+```
+
+To reproduce the stock 781-token discrepancy, set `prompt` to
+`$(python -c 'print(",".join(str(1 + (13*i) % 128000) for i in range(781)))')`
+and `decode` to `22,469,229,229,229,229,229,229`, then repeat the probe, exporter
+and comparison commands. The exporter also accepts `--single-row` after
+`gpu` for the stock llama.cpp single-row control.
+
+```sh
 EREDU_TOOL_CHECKPOINT=/private/tmp/lfm3-f32 cargo test -p eredu --no-default-features --test portable_facade lfm_checkpoint_native_tool_activation_with_portable_backend -- --exact --ignored
 ```
 
