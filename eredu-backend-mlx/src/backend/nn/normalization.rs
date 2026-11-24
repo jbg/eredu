@@ -297,35 +297,59 @@ fn wide_square_rms(
     {
         use safemlx::fast::{CustomKernelConfig, MetalKernel};
         use std::cell::RefCell;
-        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        thread_local! {
+            static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+            static MULTI_KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+        }
         let rows = i32::try_from(rows).map_err(|_| Exception::custom("RMS row count overflows"))?;
         let epsilon = Array::from_slice(&[epsilon], &[1]);
-        // One FP32 square per input element, with at most 32 KiB per group.
-        const STAGED_MAX_WIDTH: i32 = 8192;
-        // For large row batches, independent scalar rows provide parallelism
-        // without assigning a whole SIMD group and scratch to every row.
-        const STAGED_MAX_ROWS: i32 = 512;
         const SIMD_WIDTH: i32 = 32;
-        let staged = width <= STAGED_MAX_WIDTH && rows <= STAGED_MAX_ROWS;
-        let (grid, group) = if staged {
-            ([SIMD_WIDTH, rows, 1], [SIMD_WIDTH, 1, 1])
-        } else {
-            ([rows, 1, 1], [64, 1, 1])
-        };
         let config = CustomKernelConfig::new()
             .with_template_arg_int("WIDTH", width)
-            .with_template_arg_bool("STAGED", staged)
-            .with_template_arg_bool("PARALLEL", staged && (width as u32).is_power_of_two())
-            .with_grid(grid)
-            .with_thread_group(group)
             .with_output_arg(input.shape(), Dtype::Float32);
-        return KERNEL.with(|cell| {
+        let (slot, name, source, config) = if width == 2048 && rows == 1 {
+            // A single wide row has no row-level parallelism. Cooperate across
+            // SIMD groups within the row, retaining the same rounding certificate.
+            const SIMD_GROUPS: i32 = 8;
+            let threads = SIMD_WIDTH * SIMD_GROUPS;
+            (
+                &MULTI_KERNEL,
+                "wide_square_rms_multi",
+                include_str!("ordered_f32_rms_multi.metal"),
+                config
+                    .with_template_arg_int("SIMD_GROUPS", SIMD_GROUPS)
+                    .with_grid([threads, 1, 1])
+                    .with_thread_group([threads, 1, 1]),
+            )
+        } else {
+            // Batch rows independently once staging would use too much scratch
+            // across the grid. Each staged row uses at most 32 KiB.
+            const STAGED_MAX_WIDTH: i32 = 8192;
+            const STAGED_MAX_ROWS: i32 = 512;
+            let staged = width <= STAGED_MAX_WIDTH && rows <= STAGED_MAX_ROWS;
+            let (grid, group) = if staged {
+                ([SIMD_WIDTH, rows, 1], [SIMD_WIDTH, 1, 1])
+            } else {
+                ([rows, 1, 1], [64, 1, 1])
+            };
+            (
+                &KERNEL,
+                "wide_square_rms",
+                include_str!("ordered_f32_rms.metal"),
+                config
+                    .with_template_arg_bool("STAGED", staged)
+                    .with_template_arg_bool("PARALLEL", staged && (width as u32).is_power_of_two())
+                    .with_grid(grid)
+                    .with_thread_group(group),
+            )
+        };
+        return slot.with(|cell| {
             if cell.borrow().is_none() {
                 *cell.borrow_mut() = Some(MetalKernel::new(
-                    "wide_square_rms",
+                    name,
                     ["input", "gain", "epsilon"],
                     ["out"],
-                    include_str!("ordered_f32_rms.metal"),
+                    source,
                     include_str!("ordered_f32_rms_guard.metal"),
                     true,
                     false,
