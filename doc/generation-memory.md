@@ -711,12 +711,13 @@ are validation cases, not dispatch criteria.
 
 ### Dense LFM2/LFM2.5 hybrid workspace
 
-For complete key rows of at most 8,192 positions, MLX shares expanded K/V and
-contiguous BF16 projection layouts across query tiles in an invocation. Large
+For complete key rows of at most 8,192 positions, MLX shares prepared K/V
+layouts across query tiles in an invocation. Large
 calls evaluate batches of at most 32 query-tile outputs and retain completed
 outputs for final concatenation, releasing each batch's score/softmax graphs.
 Small calls remain lazy. The backend supplies an 8,192 query-by-key element
-threshold and at most 32 query rows per tile.
+threshold and at most 32 query rows per tile. Wider ordered FP32 tiles retain
+at most as many live score rows as the ordinary tiles.
 
 For full-key calls the forecast charges four query-width K/V payloads per
 invocation, at most 32 live tiles of score scratch at 32 bytes per element
@@ -1444,8 +1445,9 @@ cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu-back
 
 The generic estimator consumes the selected backend's explicit upstream
 evaluation fact. MLX's full-key InputScores path evaluates every batch, including
-the final partial batch, when more than 32 query tiles are needed and the key row
-is at most 8,192 positions. Merely sharing K/V layouts does not establish this
+the final partial batch, when the invocation exceeds its live tile limit and the
+key row is at most 8,192 positions. The forecast uses the declared upper limit of
+32 live tiles. Merely sharing K/V layouts does not establish this
 boundary. Short invocations, decode, Fused softcap, and the uncovered blockwise-key
 path use conservative retention bounds.
 

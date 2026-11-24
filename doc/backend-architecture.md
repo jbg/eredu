@@ -1361,9 +1361,11 @@ scans and their transfers; page size does not introduce extra output rounding.
 Resident attention tiles query rows while complete key rows fit its bounded
 score workspace, preserving the ordinary softmax and value-product reductions.
 The full-key memory contract can report a wider per-tile score bound separately
-from the threshold that selects tiling. MLX uses it for eligible BF16 Metal
-invocations. Portable forecasts use the larger tile for scratch accounting and
-claim a synchronous dependency release only when that tile geometry requires it.
+from the threshold that selects tiling. MLX uses it for eligible BF16 and
+ordered FP32 Metal invocations. Ordered FP32 shares contiguous K/V layouts
+and bounds the live score rows using the ordinary tile geometry. Portable
+forecasts use the wider tile and the declared maximum live tile count for
+conservative scratch and dependency-release accounting.
 Larger key rows retain the two-scan bounded mechanism. Explicit rotary input
 products retain inverse frequencies directly so positions multiply the same
 rounded coefficients instead of dividing by reconstructed denominators.
