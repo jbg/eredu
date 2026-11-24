@@ -56,19 +56,18 @@ for (uint loop_k = 0u; loop_k < WIDTH; loop_k += NK) {
 
     threadgroup const half* lsma = sa + 4u * 64u * (simd & 1u);
     threadgroup const half* lsmb = sb + 2u * 64u * (simd >> 1u);
+    // The staging barrier makes both tiles visible. Every lane in each SIMD
+    // group then executes the same matrix loads and multiply-accumulates.
     #pragma unroll
     for (uint ik = 0u; ik < NK / 8u; ++ik) {
-        simdgroup_barrier(mem_flags::mem_none);
         #pragma unroll
         for (uint i = 0u; i < 4u; ++i) {
             simdgroup_load(ma[i], lsma + 64u * i, 8u, 0u, false);
         }
-        simdgroup_barrier(mem_flags::mem_none);
         #pragma unroll
         for (uint i = 0u; i < 2u; ++i) {
             simdgroup_load(mb[i], lsmb + 64u * i, 8u, 0u, false);
         }
-        simdgroup_barrier(mem_flags::mem_none);
         #pragma unroll
         for (uint i = 0u; i < 8u; ++i) {
             simdgroup_multiply_accumulate(mc[i], mb[i / 4u], ma[i & 3u], mc[i]);
