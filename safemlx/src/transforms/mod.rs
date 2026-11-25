@@ -432,3 +432,6 @@ mod tests {
         });
     }
 }
+
+#[doc(hidden)]
+pub mod graph_replay;

@@ -134,6 +134,30 @@ prefill and eight cached rows are also bit-identical for the pinned short and
 781-token teacher-forced inputs and the 384-, 385-, 781- and 1,536-token greedy
 runs. Every predicted token ID agrees.
 
+### Metal decode graph replay
+
+On the M3 Ultra with the pinned Q4_K_M artifact, the resident single-device
+path reuses the lazy graph for convolution blocks and attention feed-forward
+regions. Convolution carry and weights are bound at each invocation. The
+architecture advances carry and the attention cache through the same state
+contracts.
+
+The release `checkpoint_probe` comparison uses `MLX_ENABLE_TF32=0`, prompt IDs
+`1 + (13*i) % 128000`, and 48 teacher-forced steps with the same sequence
+starting at `i = 4096`. Each measurement follows one warmup and the table
+reports medians of five interleaved pairs against base revision `0a9e5e2f5`.
+Peak MLX active allocation is measured from completed prefill through the
+last decode step. The final prefill vocabulary row and every decode vocabulary
+row match bit for bit in these pairs and in greedy runs at 781 and 1,536
+prompt tokens. A 24-token greedy chat also matches ordinary generation after
+controlled advancement and after snapshot restore.
+
+| Prompt tokens | Base decode tok/s | Replay decode tok/s | Median decode peak increase |
+| ---: | ---: | ---: | ---: |
+| 128 | 150.99 | 162.63 | 224 bytes |
+| 781 | 145.93 | 155.22 | 200 bytes |
+| 1,536 | 139.26 | 150.31 | 224 bytes |
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same

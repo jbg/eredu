@@ -33,6 +33,10 @@ where
     M: ObserverTensorMapping,
     O: ActivationObserver<M::ObserverTensor, M::ObserverError> + ?Sized,
 {
+    fn is_noop(&self) -> bool {
+        self.inner.is_noop()
+    }
+
     fn routed_unit_observer(
         &mut self,
         path: &str,

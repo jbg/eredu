@@ -6134,6 +6134,15 @@ impl TensorContextKey {
     }
 }
 
+/// A backend's reusable description of a pure, fixed-shape tensor region.
+///
+/// Replay binds fresh inputs and produces lazy outputs in the original order.
+/// The description carries no session state and performs no submission.
+pub trait FixedShapeReplay<T: Tensor>: Debug + Send + Sync {
+    /// Applies the region, or declines if the inputs or context are incompatible.
+    fn apply(&self, inputs: &[&T], context: &T::Context) -> Result<Option<Vec<T>>, Error>;
+}
+
 /// Opaque tensor handle and the neural operations required by shared Eredu
 /// architectures.
 ///
@@ -6142,6 +6151,25 @@ impl TensorContextKey {
 pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Backend execution context, such as a stream or command queue.
     type Context: ?Sized;
+
+    /// Reports whether this context supports recording fixed-shape regions.
+    fn supports_fixed_shape_replay(_context: &Self::Context) -> bool {
+        false
+    }
+
+    /// Records a pure region delimited by explicit input and output tensors.
+    ///
+    /// Every changing value, including parameter bindings and state, must be an
+    /// input. Any state replacement remains the caller's responsibility. Recording
+    /// must not evaluate tensors or retain their backing storage, except for
+    /// bounded immutable constants. An unsupported region returns `None`.
+    fn record_fixed_shape_replay(
+        _inputs: &[&Self],
+        _outputs: &[&Self],
+        _context: &Self::Context,
+    ) -> Result<Option<std::sync::Arc<dyn FixedShapeReplay<Self>>>, Error> {
+        Ok(None)
+    }
 
     /// Certifies a stable context identity for immutable derived-value reuse.
     /// The default declines caching. This observation must not evaluate, submit

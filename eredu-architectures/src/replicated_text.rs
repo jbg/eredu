@@ -227,6 +227,9 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm3Replicated {
         C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
         O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
     {
+        if hidden.dim(1) == 1 && observer.is_noop() {
+            return unit.forward(hidden, forward.mask.as_ref(), state, context);
+        }
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_instrumented(
             hidden,

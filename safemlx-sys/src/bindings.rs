@@ -4988,3 +4988,22 @@ unsafe extern "C" {
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
 }
+
+unsafe extern "C" {
+    pub fn mlx_record_fixed_shape_graph(
+        result: *mut *mut std::ffi::c_void,
+        inputs: mlx_vector_array,
+        outputs: mlx_vector_array,
+        stream: mlx_stream,
+        kernel_names: *const *const std::ffi::c_char,
+        num_kernel_names: usize,
+    ) -> i32;
+    pub fn mlx_apply_fixed_shape_graph(
+        outputs: *mut mlx_vector_array,
+        matched: *mut bool,
+        tape: *const std::ffi::c_void,
+        inputs: mlx_vector_array,
+        stream: mlx_stream,
+    ) -> i32;
+    pub fn mlx_free_fixed_shape_graph(tape: *mut std::ffi::c_void);
+}

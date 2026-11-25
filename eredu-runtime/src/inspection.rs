@@ -367,6 +367,12 @@ impl<T> RoutingObservation<'_, T> {
 
 /// Statically dispatched activation observation and intervention contract.
 pub trait ActivationObserver<T, E> {
+    /// Certifies that the observer has no observable callbacks or interventions.
+    #[doc(hidden)]
+    fn is_noop(&self) -> bool {
+        false
+    }
+
     /// Whether this observer needs the shared session's transactional lifecycle.
     /// The value must stay fixed throughout one forward. Partitioned sessions
     /// agree participation before invoking callbacks that may communicate.
@@ -489,6 +495,10 @@ pub struct BorrowedActivationObserver<'a, O: ?Sized>(pub &'a mut O);
 impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     for BorrowedActivationObserver<'_, O>
 {
+    fn is_noop(&self) -> bool {
+        self.0.is_noop()
+    }
+
     fn routed_unit_observer(
         &mut self,
         path: &str,
@@ -713,6 +723,10 @@ where
 pub struct NoopObserver;
 
 impl<T, E> ActivationObserver<T, E> for NoopObserver {
+    fn is_noop(&self) -> bool {
+        true
+    }
+
     fn observe_generated(
         &mut self,
         _: &str,

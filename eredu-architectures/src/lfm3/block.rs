@@ -1,10 +1,13 @@
 //! LFM3 normalization, residual, and token-mixing assembly.
 
+use std::sync::Arc;
+
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
     AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation,
-    DeclareLogicalParameters, Error, GatedShortConvolution, GatedShortConvolutionSpec,
-    GroupedNeuralBackend, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
+    DeclareLogicalParameters, Error, FixedShapeReplay, GatedShortConvolution,
+    GatedShortConvolutionSpec, GroupedNeuralBackend, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec,
     NormalizationOperator, ParameterSpec, Parameterized, RotarySpec, Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
@@ -82,6 +85,15 @@ pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
     feed_forward_norm: B::Normalization,
     post_operator_norm: Option<B::Normalization>,
     post_ffn_norm: Option<B::Normalization>,
+    #[parameter(skip)]
+    decode_graph: DecodeGraph<B::Tensor>,
+}
+
+#[derive(Debug, Clone)]
+enum DecodeGraph<T: Tensor> {
+    Unrecorded,
+    Unsupported,
+    Ready(Arc<dyn FixedShapeReplay<T>>),
 }
 
 impl<B: NeuralBackend> ReplicatedBlock<B> {
@@ -112,6 +124,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                 .post_ffn_norm
                 .map(|spec| B::normalization(spec, context))
                 .transpose()?,
+            decode_graph: DecodeGraph::Unrecorded,
         })
     }
 
@@ -125,13 +138,110 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        self.forward_instrumented(
-            hidden,
-            mask,
-            state,
-            context,
-            &mut ComponentInstrumentation::disabled(),
-        )
+        let mut instrumentation = ComponentInstrumentation::disabled();
+        if hidden.dim(1) != 1
+            || state.offset() == 0
+            || matches!(self.decode_graph, DecodeGraph::Unsupported)
+            || !B::Tensor::supports_fixed_shape_replay(context)
+        {
+            return self.forward_instrumented(hidden, mask, state, context, &mut instrumentation);
+        }
+        if matches!(self.mixer, TokenMixer::Attention(_)) {
+            let mixed = self.mix(hidden, mask, state, context, &mut instrumentation)?;
+            if let Some(replay) = self.replay_decode(&mixed, None, context)? {
+                let [result] = replay
+                    .try_into()
+                    .map_err(|_| Error::backend("expected one FFN output"))?;
+                return Ok(result);
+            }
+            let result = self.finish(&mixed, context, &mut instrumentation)?;
+            self.record_decode(&mixed, None, &[&result], context)?;
+            return Ok(result);
+        }
+        let role = StateTensorRole::Convolution { slot: 0 };
+        let Some(history) = state
+            .fixed_component(role)
+            .map_err(Error::backend)?
+            .as_ref()
+        else {
+            return self.forward_instrumented(hidden, mask, state, context, &mut instrumentation);
+        };
+        if let Some(replay) = self.replay_decode(hidden, Some(history), context)? {
+            let [result, carry] = replay
+                .try_into()
+                .map_err(|_| Error::backend("expected output and convolution carry"))?;
+            update_convolution_history::<B, C>(state, Some(carry), 1)?;
+            return Ok(result);
+        }
+        let history = matches!(self.decode_graph, DecodeGraph::Unrecorded).then(|| history.clone());
+        let result =
+            self.forward_instrumented(hidden, mask, state, context, &mut instrumentation)?;
+        if let Some(history) = history.as_ref() {
+            if let Some(carry) = state
+                .fixed_component(role)
+                .map_err(Error::backend)?
+                .as_ref()
+            {
+                self.record_decode(hidden, Some(history), &[&result, carry], context)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn record_decode(
+        &mut self,
+        hidden: &B::Tensor,
+        history: Option<&B::Tensor>,
+        outputs: &[&B::Tensor],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Error> {
+        if matches!(self.decode_graph, DecodeGraph::Unrecorded) {
+            self.decode_graph = match B::Tensor::record_fixed_shape_replay(
+                &self.decode_inputs(hidden, history),
+                outputs,
+                context,
+            )? {
+                Some(graph) => DecodeGraph::Ready(graph),
+                None => DecodeGraph::Unsupported,
+            };
+        }
+        Ok(())
+    }
+
+    fn decode_inputs<'a>(
+        &'a self,
+        hidden: &'a B::Tensor,
+        history: Option<&'a B::Tensor>,
+    ) -> Vec<&'a B::Tensor> {
+        struct Bindings<'a, T>(Vec<&'a T>);
+        impl<'a, T> eredu_nn::ParameterVisitor<'a, T> for Bindings<'a, T> {
+            fn visit(&mut self, _: eredu_nn::ParameterMetadata, value: &'a T) {
+                self.0.push(value);
+            }
+        }
+        let mut bindings = Bindings(std::iter::once(hidden).chain(history).collect());
+        if history.is_some() {
+            self.visit_parameters(&mut bindings);
+        } else {
+            self.feed_forward_norm.visit_parameters(&mut bindings);
+            self.feed_forward.visit_parameters(&mut bindings);
+            if let Some(norm) = self.post_ffn_norm.as_ref() {
+                norm.visit_parameters(&mut bindings);
+            }
+        }
+        bindings.0
+    }
+
+    fn replay_decode(
+        &self,
+        hidden: &B::Tensor,
+        history: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<Vec<B::Tensor>>, Error> {
+        let DecodeGraph::Ready(graph) = &self.decode_graph else {
+            return Ok(None);
+        };
+        graph.apply(&self.decode_inputs(hidden, history), context)
     }
 
     pub(crate) fn forward_instrumented<C>(
@@ -145,7 +255,22 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        let hidden = forward_mixer::<B, C>(
+        let hidden = self.mix(hidden, mask, state, context, instrumentation)?;
+        self.finish(&hidden, context, instrumentation)
+    }
+
+    fn mix<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        forward_mixer::<B, C>(
             &mut self.mixer,
             &mut self.operator_norm,
             &mut self.post_operator_norm,
@@ -155,8 +280,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
             None,
             context,
             instrumentation,
-        )?;
-        self.finish(&hidden, context, instrumentation)
+        )
     }
 
     /// Runs a full-attention block with bidirectional visibility and no cache.
@@ -666,6 +790,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
 /// Attention and convolution share residual ordering and state ownership; only
 /// attention has scalar aggregated-channel declarations.
 #[allow(clippy::too_many_arguments)]
+fn update_convolution_history<B: NeuralBackend, C: RuntimeStateComponents<B>>(
+    state: &mut C,
+    history: Option<B::Tensor>,
+    tokens: i32,
+) -> Result<(), Error> {
+    *state
+        .fixed_component(StateTensorRole::Convolution { slot: 0 })
+        .map_err(Error::backend)? = history;
+    state.advance_fixed(tokens).map_err(Error::backend)
+}
+
 fn forward_mixer<B: NeuralBackend, C>(
     mixer: &mut TokenMixer<B>,
     normalization: &mut B::Normalization,
@@ -718,8 +853,7 @@ where
                     None => convolution.forward(&normalized, history.as_ref(), context)?,
                 }
             };
-            *state.fixed_component(role).map_err(Error::backend)? = result.history;
-            state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
+            update_convolution_history::<B, C>(state, result.history, hidden.dim(1))?;
             result.output
         }
     };
