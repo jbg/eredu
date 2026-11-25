@@ -20,7 +20,9 @@ thread_local! {
 const SOFTMAX_SIMD_WIDTH: i32 = 32;
 const SOFTMAX_MIN_WIDTH: i32 = 128;
 const SOFTMAX_MAX_WIDTH: i32 = 8192;
+const INLINE_ATTENTION_MAX_POSITIONS: i32 = 4096;
 const FUSED_ATTENTION_THREADS: i32 = 256;
+const DECODE_SOFTMAX_THREADS: i32 = 256;
 
 fn metal(stream: &Stream) -> Result<bool, Exception> {
     Ok(super::native_quantization::uses_metal_device(
@@ -50,8 +52,12 @@ pub(super) fn fused_attention(
     let kv_heads = keys.dim(1);
     let output_width = transposed_values.dim(2);
     let decode = query_rows == 1;
-    let min_positions = if decode { 1 } else { 128 };
-    if !(min_positions..=4096).contains(&positions)
+    let supported_positions = if decode {
+        1..=SOFTMAX_MAX_WIDTH
+    } else {
+        128..=INLINE_ATTENTION_MAX_POSITIONS
+    };
+    if !supported_positions.contains(&positions)
         || query.size() == 0
         || output_width == 0
         || !metal(stream)?
@@ -113,11 +119,25 @@ pub(super) fn fused_attention(
                 .expect("ordered decode score kernel initialized")
                 .apply_one_device([query, keys, &mask, &dimensions, &scale], &config, stream)
         })?;
+        // Long rows share one ordered softmax across all value-column groups.
+        // The inline path keeps short rows in threadgroup memory.
+        let normalized = positions > INLINE_ATTENTION_MAX_POSITIONS;
+        let attention_rows = if normalized {
+            staged_softmax(
+                &scores,
+                positions,
+                row_count,
+                DECODE_SOFTMAX_THREADS,
+                stream,
+            )?
+        } else {
+            scores
+        };
         return DECODE_VALUES.with(|cell| {
             if cell.borrow().is_none() {
                 *cell.borrow_mut() = Some(MetalKernel::new(
                     "ordered_f32_decode_values",
-                    ["scores", "values", "shape"],
+                    ["attention_rows", "values", "shape"],
                     ["out"],
                     include_str!("ordered_f32_decode_values.metal"),
                     &row_arithmetic_header(),
@@ -128,9 +148,14 @@ pub(super) fn fused_attention(
             const THREADS: i32 = 256;
             const COLUMNS: i32 = THREADS / 16;
             let config = CustomKernelConfig::new()
+                .with_template_arg_bool("NORMALIZED", normalized)
                 .with_template_arg_int(
                     "CAPACITY",
-                    (positions as u32).max(4).next_power_of_two() as i32,
+                    if normalized {
+                        4
+                    } else {
+                        (positions as u32).max(4).next_power_of_two() as i32
+                    },
                 )
                 .with_template_arg_int("THREADS", THREADS)
                 .with_grid([THREADS, row_count, (output_width - 1) / COLUMNS + 1])
@@ -139,7 +164,11 @@ pub(super) fn fused_attention(
             cell.borrow()
                 .as_ref()
                 .expect("ordered decode value kernel initialized")
-                .apply_one_device([&scores, transposed_values, &dimensions], &config, stream)
+                .apply_one_device(
+                    [&attention_rows, transposed_values, &dimensions],
+                    &config,
+                    stream,
+                )
                 .map(Some)
         });
     }
@@ -309,25 +338,10 @@ fn map_rows(input: &Array, silu: bool, stream: &Stream) -> Result<Array, Excepti
         };
         let work_items = i32::try_from(work_items)
             .map_err(|_| Exception::custom("ordered work item count overflows"))?;
-        let dimensions = Array::from_slice(&[width], &[1]);
         if !silu && (SOFTMAX_MIN_WIDTH..=SOFTMAX_MAX_WIDTH).contains(&width) {
-            // Reuse the same pipeline as the cached sequence grows.
-            let capacity = (width as u32).div_ceil(4).next_power_of_two() as i32;
-            let config = CustomKernelConfig::new()
-                .with_template_arg_int("GROUP_CAPACITY", capacity)
-                .with_grid([SOFTMAX_SIMD_WIDTH, work_items, 1])
-                .with_thread_group([SOFTMAX_SIMD_WIDTH, 1, 1])
-                .with_output_arg(input.shape(), Dtype::Float32);
-            return SOFTMAX.with(|cell| {
-                if cell.borrow().is_none() {
-                    *cell.borrow_mut() = Some(softmax_kernel()?);
-                }
-                cell.borrow()
-                    .as_ref()
-                    .expect("ordered softmax kernel initialized")
-                    .apply_one_device([input, &dimensions], &config, stream)
-            });
+            return staged_softmax(input, width, work_items, SOFTMAX_SIMD_WIDTH, stream);
         }
+        let dimensions = Array::from_slice(&[width], &[1]);
         let config = CustomKernelConfig::new()
             .with_template_arg_bool("SILU", silu)
             .with_grid([work_items, 1, 1])
@@ -356,6 +370,33 @@ fn map_rows(input: &Array, silu: bool, stream: &Stream) -> Result<Array, Excepti
         apply(row);
     }
     Array::from_slice(&data, input.shape()).copy(stream)
+}
+
+fn staged_softmax(
+    input: &Array,
+    width: i32,
+    rows: i32,
+    threads: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    // Reuse the same pipeline as the cached sequence grows.
+    let capacity = (width as u32).div_ceil(4).next_power_of_two() as i32;
+    let dimensions = Array::from_slice(&[width], &[1]);
+    let config = CustomKernelConfig::new()
+        .with_template_arg_int("GROUP_CAPACITY", capacity)
+        .with_template_arg_int("THREADS", threads)
+        .with_grid([threads, rows, 1])
+        .with_thread_group([threads, 1, 1])
+        .with_output_arg(input.shape(), Dtype::Float32);
+    SOFTMAX.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(softmax_kernel()?);
+        }
+        cell.borrow()
+            .as_ref()
+            .expect("ordered softmax kernel initialized")
+            .apply_one_device([input, &dimensions], &config, stream)
+    })
 }
 
 fn product_kernel() -> Result<MetalKernel, Exception> {
@@ -448,7 +489,10 @@ fn softmax_kernel() -> Result<MetalKernel, Exception> {
 pub(super) fn packed_gated_silu_header() -> String {
     // Suppress contraction only in the activation code, leaving the packed
     // projection body on the same arithmetic as its standalone kernel.
-    format!("#define EREDU_LOCAL_EXP_CONTRACTION\n{}", row_arithmetic_header())
+    format!(
+        "#define EREDU_LOCAL_EXP_CONTRACTION\n{}",
+        row_arithmetic_header()
+    )
 }
 
 fn row_arithmetic_header() -> String {

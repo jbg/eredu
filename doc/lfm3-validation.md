@@ -252,6 +252,36 @@ Isolated FP32 attention also matches bit for bit with and without a boolean
 mask at 8,193, 16,385, and 32,769 key positions. The grouped operator peaks
 at about 1 MiB of active allocation above its preloaded inputs in those cases.
 
+### Metal decode through 8,192 keys
+
+Single-query FP32 Metal attention from 4,097 through 8,192 key positions
+uses one ordered softmax per query head. The score kernel applies scaling
+and masking, and the value kernel consumes normalized probabilities and
+strided KV views. Both products retain their existing FP32 reduction order.
+
+The pinned Q4_K_M on M3 Ultra uses the same release probe, token sequence,
+and warmup as the long-context check. The table compares revision
+`da2501f24` with the staged decode path. For the 4,088-token case, the latency
+column covers steps above 4,096 keys. Timing excludes the first decode step
+and first step after a cutoff. All score rows participate in the bitwise
+comparison. The 4,088- and 8,168-token prefixes use three interleaved pairs,
+and the 6,144-token prefix uses two.
+
+| Prefix tokens | Reference ms/token | Staged ms/token | Peak MLX decode reduction |
+| ---: | ---: | ---: | ---: |
+| 4,088 | 7.27 | 6.73 | 63.58 MiB |
+| 6,144 | 8.52 | 7.62 | 72.09 MiB |
+| 8,168 | 9.56 | 8.26 | 124.40 MiB |
+
+At 4,088 prefix tokens, the median step below the cutoff is 6.74 ms on both
+paths. Prefill and all 24 cached vocabulary rows match bit for bit in every
+pair and in one extra pair from an 8,184-token prefix crossing 8,192 keys.
+Ordinary, explicitly advanced, and snapshot-restored generation produce the
+same 16 token IDs and finish reason from an 8,188-token prefix.
+An isolated attention comparison also produces identical outputs in
+30 cases across the cutoffs, including strided KV, boolean and FP16 additive
+masks, batched heads, and partial value tiles.
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same
