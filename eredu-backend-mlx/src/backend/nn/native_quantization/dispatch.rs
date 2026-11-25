@@ -385,28 +385,47 @@ pub(super) fn qk_matmul_metal(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     const OUTPUT_TILE: i32 = 64;
-    const ACTIVATION_TILE: i32 = 32;
     const SIMD_GROUPS: i32 = 4;
     debug_assert!(k_quant_supports_tiled_matmul(view));
+    let specialized = match (dtype, format) {
+        (Dtype::Float32, NativeQuantizationFormat::GgufQ4K) => {
+            Some((&Q4K_F32_MATMUL_KERNEL, &Q4K_STEEL_MATMUL_KERNEL))
+        }
+        (Dtype::Float32, NativeQuantizationFormat::GgufQ6K) => {
+            Some((&Q6K_F32_MATMUL_KERNEL, &Q6K_STEEL_MATMUL_KERNEL))
+        }
+        _ => None,
+    };
+    // The 64-row tile pays off beyond six tiles in the released K-quant benchmark.
+    // Use the rows in this invocation, including a chunked prefill's tail.
+    #[cfg(feature = "metal")]
+    let steel_preamble = if rows > 384 && specialized.is_some() {
+        safemlx::fast::metal_steel_gemm_preamble()?
+    } else {
+        None
+    };
+    #[cfg(not(feature = "metal"))]
+    let steel_preamble = None;
+    let activation_tile = if steel_preamble.is_some() { 64 } else { 32 };
     let output_tiles = (view.rows + OUTPUT_TILE - 1) / OUTPUT_TILE;
-    let activation_tiles = (rows + ACTIVATION_TILE - 1) / ACTIVATION_TILE;
+    let activation_tiles = (rows + activation_tile - 1) / activation_tile;
     let config = CustomKernelConfig::new()
         .with_template_arg_dtype("T", dtype)
         .with_grid([REDUCTION_TILE, output_tiles * SIMD_GROUPS, activation_tiles])
         .with_thread_group([REDUCTION_TILE, SIMD_GROUPS, 1])
         .with_output_arg([rows, view.rows], dtype);
-    let specialized = match (dtype, format) {
-        (Dtype::Float32, NativeQuantizationFormat::GgufQ4K) => Some(&Q4K_F32_MATMUL_KERNEL),
-        (Dtype::Float32, NativeQuantizationFormat::GgufQ6K) => Some(&Q6K_F32_MATMUL_KERNEL),
-        _ => None,
-    };
-    if let Some(cache) = specialized {
+    if let Some((standard, steel)) = specialized {
+        let cache = if steel_preamble.is_some() {
+            steel
+        } else {
+            standard
+        };
         let config = config
             .with_template_arg_int("WIDTH", view.columns)
             .with_template_arg_int("OUTPUTS", view.rows);
         return cache.with(|cell| {
             if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(qk_f32_matmul_kernel(format)?);
+                *cell.borrow_mut() = Some(qk_f32_matmul_kernel(format, steel_preamble)?);
             }
             cell.borrow()
                 .as_ref()

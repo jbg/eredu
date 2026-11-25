@@ -4,6 +4,7 @@
 #include "mlx/c/private/mlx.h"
 
 #ifdef MLX_C_MIXED_STORAGE_GEMM
+#include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/primitives.h"
 
@@ -31,6 +32,14 @@ class MixedStorageGemm : public UnaryPrimitive {
 };
 } // namespace
 #endif
+
+extern "C" const char* mlx_metal_steel_gemm_preamble(void) {
+#ifdef MLX_C_MIXED_STORAGE_GEMM
+  return mlx::core::metal::gemm();
+#else
+  return nullptr;
+#endif
+}
 
 extern "C" int mlx_mixed_storage_gemm_workspace(
     bool* supported, uint64_t* partial_bytes, int rows, int outputs, int width,

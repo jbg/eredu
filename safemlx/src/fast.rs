@@ -12,6 +12,27 @@ use crate::utils::{IntoOption, VectorArray, SUCCESS};
 use crate::{Array, Dtype, Stream};
 use safemlx_internal_macros::generate_macro;
 
+/// The bundled Metal JIT's Steel GEMM definitions for custom Metal kernels.
+///
+/// Returns `None` when the bundled Metal JIT is unavailable. [`MetalKernel`]
+/// supplies MLX's ordinary Metal utility definitions before this preamble.
+#[cfg(feature = "metal")]
+pub fn metal_steel_gemm_preamble() -> Result<Option<&'static str>> {
+    static PREAMBLE: std::sync::OnceLock<
+        std::result::Result<Option<&'static str>, std::str::Utf8Error>,
+    > = std::sync::OnceLock::new();
+    let result = PREAMBLE.get_or_init(|| {
+        // SAFETY: the native function returns null or a process-lifetime C string.
+        let ptr = unsafe { safemlx_sys::mlx_metal_steel_gemm_preamble() };
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a non-null pointer references the bundled NUL-terminated source.
+        unsafe { CStr::from_ptr(ptr) }.to_str().map(Some)
+    });
+    (*result).map_err(|error| Exception::custom(format!("Metal Steel GEMM shader: {error}")))
+}
+
 /// Exact logical split-K partial payload for the pinned mixed-storage GEMM.
 /// A shape/device query only: it does not inspect tensors, evaluate or allocate.
 /// `None` means unsupported geometry/arithmetic path. The caller must establish

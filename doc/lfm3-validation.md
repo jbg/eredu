@@ -101,6 +101,39 @@ On M3 Ultra, all 12,582,912 decoded values match exactly.
 | F32 | 17 | 0.000211206 |
 | F16 | 17 | 0.000298098 |
 
+### Metal packed prefill
+
+With the bundled Metal JIT, MLX selects the 64-by-64 output tile for full
+Q4_K and Q6_K matrices with F32 activations and at least 385 activation rows
+in the projection call. Shorter calls retain the 64-by-32 tile for the same
+matrix class. The large tile unpacks a 16-value K panel into threadgroup memory,
+keeps the FP16 operand rounding and FP32 accumulation, and uses the original
+packed weight buffer throughout. The two panels use 10 KiB of threadgroup
+memory and require no additional MLX buffer.
+
+On the M3 Ultra with the pinned Q4_K_M artifact, forcing the large tile changes
+prefill throughput by −3.3% at 384 rows and +1.9% at 385 rows. The dispatch trace
+selects the smaller tile for both block encodings at 384 rows and the larger
+tile for both encodings at 385 rows.
+
+The release `checkpoint_probe` uses `MLX_ENABLE_TF32=0`, token IDs
+`1 + (13*i) % 128000`, one warmup, and `--decode-steps 0` for prefill timing.
+The table compares five interleaved runs per side against `5d75c0825`. Peak
+MLX allocator bytes agree in every pair.
+
+| Prompt tokens | Baseline tokens/s | Selected tokens/s | Peak MLX memory on both sides |
+| ---: | ---: | ---: | ---: |
+| 384 | 3,468 | 3,455 | 3,192.9 MiB |
+| 385 | 3,162 | 3,245 | 3,223.5 MiB |
+| 512 | 3,463 | 3,546 | 3,907.6 MiB |
+| 781 | 3,181 | 3,392 | 1,896.7 MiB |
+| 1,536 | 3,050 | 3,272 | 2,686.7 MiB |
+
+All timed runs produce bit-identical final prefill logits. Full-vocabulary
+prefill and eight cached rows are also bit-identical for the pinned short and
+781-token teacher-forced inputs and the 384-, 385-, 781- and 1,536-token greedy
+runs. Every predicted token ID agrees.
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same

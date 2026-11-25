@@ -540,22 +540,31 @@ pub(super) fn qk_matmul_kernel(format: NativeQuantizationFormat) -> Result<Metal
 
 pub(super) fn qk_f32_matmul_kernel(
     format: NativeQuantizationFormat,
+    steel_preamble: Option<&str>,
 ) -> Result<MetalKernel, Exception> {
-    let name = match format {
-        NativeQuantizationFormat::GgufQ4K => "native_q4k_f32_matmul_64x32",
-        NativeQuantizationFormat::GgufQ6K => "native_q6k_f32_matmul_64x32",
+    let prefix = match format {
+        NativeQuantizationFormat::GgufQ4K => "native_q4k_f32_matmul",
+        NativeQuantizationFormat::GgufQ6K => "native_q6k_f32_matmul",
         _ => {
             return Err(Exception::custom(format!(
                 "no specialized F32 K-quant tile for {format:?}"
             )))
         }
     };
+    let mut header = qk_matmul_header(format, true)?;
+    let (tile, source) = if let Some(preamble) = steel_preamble {
+        header.push('\n');
+        header.push_str(preamble);
+        ("64x64", include_str!("qk_f32_steel_matmul.metal"))
+    } else {
+        ("64x32", include_str!("qk_f32_matmul.metal"))
+    };
     MetalKernel::new(
-        name,
+        &format!("{prefix}_{tile}"),
         ["input", "weight"],
         ["out"],
-        include_str!("qk_f32_matmul.metal"),
-        qk_matmul_header(format, true)?,
+        source,
+        header,
         true,
         false,
     )
