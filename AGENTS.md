@@ -315,6 +315,12 @@ maintain. Test count and passing-result volume are not measures of completeness.
 
 ### Running verification
 
+- Before pushing a branch or publishing a pull request, run
+  `cargo fmt --all -- --check` from the workspace root using the toolchain
+  pinned in `rust-toolchain.toml`. This matches the CI formatting job and
+  applies when publishing previously committed work as well. If it fails,
+  run `cargo fmt --all`, review the formatting diff, include the fixes in
+  the branch, and rerun the check before publishing.
 - Before each run, identify the concrete uncertainty it resolves. Select the
   smallest applicable compiler check, acceptance case or shared conformance case.
 - Do not automatically run entire crates, workspaces, all families or broad

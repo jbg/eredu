@@ -430,13 +430,12 @@ where
         observer: &mut dyn crate::ActivationObserver<M::InvocationTensor, M::Error>,
     ) -> Result<M::Scores, M::Error> {
         let tokens = invocation_tensor::<M>(tokens);
-        let _projections = if !prefill
-            && invocation == eredu_core::decoding::AttentionInvocation::CAUSAL
-        {
-            scalar_projection_scope(&tokens, stream)
-        } else {
-            None
-        };
+        let _projections =
+            if !prefill && invocation == eredu_core::decoding::AttentionInvocation::CAUSAL {
+                scalar_projection_scope(&tokens, stream)
+            } else {
+                None
+            };
         let feedback = feedback.map(invocation_tensor::<M>);
         let pass = if prefill {
             crate::ExpertPass::Prefill
@@ -824,13 +823,12 @@ where
         observer: &mut dyn crate::ActivationObserver<M::InvocationTensor, M::Error>,
     ) -> Result<M::Scores, M::Error> {
         let part = token_part(M::prompt_tokens(tokens))?;
-        let _projections = if !prefill
-            && invocation == eredu_core::decoding::AttentionInvocation::CAUSAL
-        {
-            scalar_projection_scope(&invocation_tensor::<M>(tokens), stream)
-        } else {
-            None
-        };
+        let _projections =
+            if !prefill && invocation == eredu_core::decoding::AttentionInvocation::CAUSAL {
+                scalar_projection_scope(&invocation_tensor::<M>(tokens), stream)
+            } else {
+                None
+            };
         let prepared = prepare_composite_prompt::<A, B, S, M>(
             &self.ingress.admission,
             &self.ingress.processor,

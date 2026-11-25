@@ -127,17 +127,17 @@ fn k_quant_supports_tiled_matmul(view: &NativeQuantizedTensor) -> bool {
 
 mod decode;
 mod dispatch;
-mod scalar_window;
 mod packed_gated_decode;
+mod scalar_window;
 pub(crate) use packed_gated_decode::try_packed_gated_decode;
 mod kernels;
 mod packed_metal;
 mod storage;
 
 pub use dispatch::native_grouped_linear_from_array;
-pub use storage::{NativeQuantizationFormat, NativeQuantizedTensor};
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(crate) use scalar_window::{has_scalar_projection_scope, scope_scalar_projections};
+pub use storage::{NativeQuantizationFormat, NativeQuantizedTensor};
 
 /// Pure device selection shared by native execution and memory descriptions.
 pub(crate) fn uses_metal_device(device: DeviceType) -> bool {
