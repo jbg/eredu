@@ -15304,6 +15304,22 @@ The native regressions exercise scalar specialization, lazy outputs after cache
 erasure, cross-thread wrapper destruction, and wrapper teardown after the
 populated C++ thread-local cache.
 
+### Fixed-shape decode replay
+
+A family can delimit a pure tensor region with explicit inputs and ordered outputs
+through the neutral `Tensor` contract. MLX Metal records a bounded list of lazy
+primitive descriptors and small immutable constants. It checks stream, shape,
+dtype and input aliases before creating fresh output arrays. An unsupported
+region or binding uses the ordinary family operators. Replay uses the existing
+native scheduler and completion path.
+
+Replicated LFM3 text uses replay for single-token continuation. A convolution
+block binds incoming and outgoing carry explicitly and the portable block
+publishes replacement state. An attention block reuses its feed-forward region
+after running attention against the current KV history. Weights are explicit
+bindings. The replay description retains neither parameter storage nor session
+cache state. Component observations and interventions use the instrumented path.
+
 ### Mixed-storage FP32 GEMM
 
 `safemlx::fast::try_mixed_storage_gemm` is a native inference operation. Its distinct primitive delegates dispatch to the pinned

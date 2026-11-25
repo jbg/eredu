@@ -99,8 +99,58 @@ fn tensor(result: Result<Array, safemlx::error::Exception>) -> Result<MlxTensor,
     backend(result).map(MlxTensor::from_array)
 }
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[derive(Debug)]
+struct MlxFixedShapeReplay(safemlx::transforms::graph_replay::ReplayGraph);
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl eredu_nn::FixedShapeReplay<MlxTensor> for MlxFixedShapeReplay {
+    fn apply(
+        &self,
+        inputs: &[&MlxTensor],
+        context: &Stream,
+    ) -> Result<Option<Vec<MlxTensor>>, Error> {
+        let bindings: Vec<_> = inputs.iter().map(|value| value.as_array()).collect();
+        backend(self.0.apply(&bindings, context)).map(|result| {
+            result.map(|values| values.into_iter().map(MlxTensor::from_array).collect())
+        })
+    }
+}
+
 impl Tensor for MlxTensor {
     type Context = Stream;
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    fn supports_fixed_shape_replay(context: &Self::Context) -> bool {
+        context.get_device().and_then(|d| d.get_type()).ok() == Some(safemlx::DeviceType::Gpu)
+    }
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    fn record_fixed_shape_replay(
+        inputs: &[&Self],
+        outputs: &[&Self],
+        context: &Self::Context,
+    ) -> Result<Option<std::sync::Arc<dyn eredu_nn::FixedShapeReplay<Self>>>, Error> {
+        // These custom kernels read their input arrays and only write their
+        // declared outputs. All other custom kernels decline replay.
+        const REPLAYABLE_KERNELS: &[&str] = &[
+            "f32_pointwise",
+            "native_q4k_decode_2row",
+            "native_q6k_decode_2row",
+            "ordered_f32_attention_rows",
+            "wide_square_rms",
+            "wide_square_rms_multi",
+        ];
+        let inputs: Vec<_> = inputs.iter().map(|value| value.as_array()).collect();
+        let outputs: Vec<_> = outputs.iter().map(|value| value.as_array()).collect();
+        backend(safemlx::transforms::graph_replay::ReplayGraph::record(
+            &inputs,
+            &outputs,
+            context,
+            REPLAYABLE_KERNELS,
+        ))
+        .map(|result| result.map(|graph| std::sync::Arc::new(MlxFixedShapeReplay(graph)) as _))
+    }
 
     fn immutable_context_key(
         context: &Stream,

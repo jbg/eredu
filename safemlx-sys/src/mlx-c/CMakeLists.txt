@@ -182,6 +182,7 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/fast.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/fft.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/graph_utils.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/graph_replay.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/host_transfer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/io.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/io_types.cpp
