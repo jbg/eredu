@@ -519,10 +519,12 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
             .start_controlled(prepared, &[], Default::default(), emit, OutputMode::Text)
             .unwrap();
         assert_eq!(run.prompt_cache_stats().unwrap().reused_tokens, 0);
+        assert_eq!(run.prefill_chunk_tokens(), None);
         assert!(store.open().unwrap().is_none());
         run.enable_snapshots(limits).unwrap();
         let before_prefill = run.snapshot(emit).unwrap();
         run.step(emit).unwrap();
+        assert_eq!(run.prefill_chunk_tokens(), Some(3));
         run.cancel(emit).unwrap();
         assert!(store.open().unwrap().is_none());
         drop(run);
@@ -621,11 +623,44 @@ fn prompt_cache_stores_share_generation_identity_cancellation_and_budget_contrac
         let saved_manifest = pinned.manifest().clone();
         let warm = generate(&mut model, tokens.clone(), Default::default());
         assert!(warm.stats().prompt_cache.as_ref().unwrap().reused_tokens > 0);
+        let reused = warm.stats().prompt_cache.as_ref().unwrap().reused_tokens;
+        assert_eq!(
+            warm.stats().prefill_chunk_tokens,
+            Some((tokens.len() - reused).min(3))
+        );
         assert_eq!(warm.token_ids(), first.token_ids());
         assert_eq!(
             warm.token_ids(),
             generate(&mut cold, tokens.clone(), Default::default()).token_ids()
         );
+
+        let mut extended = tokens.clone();
+        extended.extend([1, 2, 1, 2]);
+        let expected = generate(&mut cold, extended.clone(), Default::default());
+        let reserved = PreparedChatGenerationSettings {
+            prefill: PrefillChunkPolicy::AutomaticWithReserve {
+                reserve_bytes: u64::MAX,
+            },
+            ..settings
+        };
+        let output = model
+            .session()
+            .generate(GenerationRequest {
+                input: PreparedChatInput::token_ids(&chat, extended),
+                output_mode: OutputMode::Text,
+                settings: reserved,
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                control_handle: None,
+                on_event: |_| {},
+            })
+            .unwrap();
+        assert_eq!(
+            output.stats().prompt_cache.as_ref().unwrap().reused_tokens,
+            reused
+        );
+        assert_eq!(output.stats().prefill_chunk_tokens, Some(1));
+        assert_eq!(output.token_ids(), expected.token_ids());
         let trace = TraceLimits {
             per_record_bytes: 16 << 10,
             total_bytes: 128 << 10,

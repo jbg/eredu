@@ -184,14 +184,14 @@ impl<B: TextGenerationBackend, S: TextExecutionSession<B>> AttachedPromptCache<B
         }
         let started = Instant::now();
         runtime.reset().map_err(PreparedChatError::Backend)?;
-        if config.prefill_chunk_policy() == PrefillChunkPolicy::Automatic {
-            let limit = S::automatic_prefill_chunk(runtime, tokens.len());
+        let reused = self.restore_prefix(runtime, identity, tokens)?;
+        if let Some(reserve) = config.prefill_chunk_policy().automatic_reserve_bytes() {
+            let limit = S::automatic_prefill_chunk(runtime, tokens.len() - reused, reused, reserve);
             *config = config
                 .clone()
                 .with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(limit));
         }
         let chunk = config.prefill_chunk_policy().unresolved_limit().get();
-        let reused = self.restore_prefix(runtime, identity, tokens)?;
         let chunks = tokens.len().saturating_sub(1) / chunk;
         Ok(Some(PromptCacheRun {
             attached: self,

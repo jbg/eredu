@@ -24,6 +24,8 @@ pub struct GenerationStats {
     pub drafting: Option<SpeculativeStats>,
     /// Present for bounded plain-text prefix reuse.
     pub prompt_cache: Option<super::PromptCacheStats>,
+    /// Largest completed plain-text prefill chunk, if its size is known.
+    pub prefill_chunk_tokens: Option<usize>,
 }
 
 /// A target-only source, requiring no speculative backend implementation.
@@ -278,7 +280,7 @@ fn speculative_output(
 ) -> GenerationOutput<GenerationStats> {
     output.map_stats(|stats| GenerationStats {
         drafting: Some(stats),
-        prompt_cache: None,
+        ..GenerationStats::default()
     })
 }
 
@@ -836,6 +838,7 @@ where
             session.timing(),
             GenerationStats {
                 prompt_cache: session.prompt_cache_stats().cloned(),
+                prefill_chunk_tokens: session.prefill_chunk_tokens(),
                 ..GenerationStats::default()
             },
         ))

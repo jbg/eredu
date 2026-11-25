@@ -414,6 +414,7 @@ impl<B: eredu_core::TextGenerationBackend, S: eredu_core::TextExecutionSession<B
             .map_err(map_committed_generation_error)?;
             let stats = super::GenerationStats {
                 prompt_cache: source.prompt_cache.take().map(|cache| cache.stats),
+                prefill_chunk_tokens: source.generator.prefill_chunk_tokens(),
                 ..Default::default()
             };
             Ok(GenerationOutput::new(

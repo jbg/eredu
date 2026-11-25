@@ -46,7 +46,7 @@ pub struct PreparedChatGenerationSettings {
     pub strategy: eredu_core::TextSamplingStrategy,
     /// Deterministic root seed used by the selected backend for stochastic sampling.
     pub seed: u64,
-    /// Prompt chunking for eligible ordinary text execution (default: 512 tokens).
+    /// Prompt chunking for eligible ordinary text execution (automatic by default).
     /// Media, bounded observations, and speculative execution retain their full pass.
     pub prefill: eredu_core::PrefillChunkPolicy,
     /// Initial decoding policy. Absence inherits the session's drafting selection,

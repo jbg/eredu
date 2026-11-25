@@ -308,6 +308,10 @@ impl<
     pub fn position(&self) -> eredu_core::refinement::GenerationPosition {
         self.state.position()
     }
+    /// Largest completed plain-text prefill chunk for this run, in tokens.
+    pub fn prefill_chunk_tokens(&self) -> Option<usize> {
+        self.state.prefill_chunk_tokens()
+    }
     /// Active/pending modes and last settled transition.
     pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState {
         self.state.decoding_state()

@@ -86,6 +86,10 @@ impl<B: LocalCausalBackend> TextOperationDriver<B> for LocalCausalSession<B> {
     type Prompt = TextPromptFor<B>;
     type TextGenerationState = CausalRequest<B>;
 
+    fn plain_text_prefill_tokens(prompt: &Self::Prompt) -> Option<usize> {
+        PlainTextPrefill::<B>::plain_token_count(prompt)
+    }
+
     fn prepare_text_prompt(backend: &B, ids: Vec<u32>) -> Result<Self::Prompt, BackendFailure> {
         prepare_plain_text_prompt(backend, ids)
     }

@@ -298,9 +298,11 @@ before generation. `--memory-budget-bytes` is a total model-plus-request plannin
 budget; `--memory-policy warn|refuse` controls predicted shortfalls. The default
 reserve is 256 MiB, configurable with `--memory-reserve-bytes`.
 
-Ordinary text prefill defaults to chunks of 512 tokens. Set
-`--prefill-chunk-size 0` for one pass. Reports preserve unknown costs and identify
-full-prompt fallbacks. See [formulas, coverage and calibration](../doc/generation-memory.md).
+Eligible text prefill automatically sizes chunks with the same memory reserve
+and uses a 512-token fallback when accounting is unavailable. Set
+`--prefill-chunk-size 0` to remove the caller-imposed chunk limit. Reports
+preserve unknown costs and identify full-prompt fallbacks. See
+[formulas, coverage and calibration](../doc/generation-memory.md).
 
 ## Turn-based audio
 

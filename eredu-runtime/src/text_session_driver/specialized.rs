@@ -113,11 +113,18 @@ where
     fn automatic_prefill_chunk(
         runtime: &ModelRuntime<B, Self>,
         input_tokens: usize,
+        restored_tokens: usize,
+        reserve_bytes: u64,
     ) -> NonZeroUsize {
         if runtime.session().prefill_chunking_support::<B>().is_err() {
             return eredu_core::PrefillChunkPolicy::AUTOMATIC_FALLBACK;
         }
-        super::forecast::automatic_prefill_chunk::<B, N>(runtime, input_tokens)
+        super::forecast::automatic_prefill_chunk::<B, N>(
+            runtime,
+            input_tokens,
+            restored_tokens,
+            reserve_bytes,
+        )
     }
 
     fn prepare_text_prompt(

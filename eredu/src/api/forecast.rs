@@ -439,19 +439,23 @@ impl<
         let (_, output) = self.resolve_text_generation_settings(settings)?;
         let profile = S::loaded_memory_profile(&self.runtime)?;
         let contract = S::forecast_execution_contract(&self.runtime, prompt, instrumented);
-        let prefill = if settings.prefill == eredu_core::PrefillChunkPolicy::Automatic
-            && !instrumented
-            && contract.full_pass_reason.is_none()
-            && input.media_positions == 0
-            && prompt.is_none_or(|prompt| S::plain_text_prefill_tokens(prompt).is_some())
-        {
-            let tokens = usize::try_from(input.text_tokens).map_err(failure)?;
-            eredu_core::PrefillChunkPolicy::Bounded(S::automatic_prefill_chunk(
-                &self.runtime,
-                tokens,
-            ))
-        } else {
-            settings.prefill
+        let prefill = match settings.prefill.automatic_reserve_bytes() {
+            Some(reserve)
+                if !instrumented
+                    && contract.full_pass_reason.is_none()
+                    && input.media_positions == 0
+                    && prompt
+                        .is_none_or(|prompt| S::plain_text_prefill_tokens(prompt).is_some()) =>
+            {
+                let tokens = usize::try_from(input.text_tokens).map_err(failure)?;
+                eredu_core::PrefillChunkPolicy::Bounded(S::automatic_prefill_chunk(
+                    &self.runtime,
+                    tokens,
+                    0,
+                    reserve,
+                ))
+            }
+            _ => settings.prefill,
         };
         let target_profile = profile.clone();
         let mut forecast = loaded_forecast(
