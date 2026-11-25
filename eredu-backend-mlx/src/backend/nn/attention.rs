@@ -369,8 +369,31 @@ pub(crate) const INPUT_SCORE_WORKSPACE: eredu_core::attention::InputScoreAttenti
 // softmax and projection temporaries do not. Small invocations stay lazy.
 const INPUT_SCORE_LIVE_TILE_BATCH: usize = 32;
 const INPUT_SCORE_KEY_TILE_POSITIONS: usize = 256;
+const INPUT_SCORE_BATCHED_KEY_QUERY_ROWS: u64 = 64;
 // Keep a decode group's score positions within the ordinary score workspace.
 const INPUT_SCORE_DECODE_KEY_TILE_BATCH: usize = 16;
+
+pub(crate) fn input_score_key_query_tile(
+    batch: u64,
+    queries: u64,
+    float32: bool,
+    device: Option<safemlx::DeviceType>,
+) -> usize {
+    if batch == 1
+        && queries > 1
+        && float32
+        && device == Some(safemlx::DeviceType::Gpu)
+        && cfg!(all(feature = "metal", not(feature = "cuda")))
+    {
+        queries.min(INPUT_SCORE_BATCHED_KEY_QUERY_ROWS) as usize
+    } else {
+        1
+    }
+}
+
+pub(crate) fn input_score_batched_key_tile_group(rows: usize) -> usize {
+    (INPUT_SCORE_TILE_ELEMENTS as usize / (rows * INPUT_SCORE_KEY_TILE_POSITIONS)).max(1)
+}
 
 pub(crate) fn input_score_key_tile_batch(
     queries: u64,
@@ -838,9 +861,6 @@ fn input_score_attention_with_tile_batches(
     live_tile_batch: usize,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    use crate::backend::runtime::cache::kv::{
-        BlockwiseAttentionAccumulator, KeyValueAttentionBlock,
-    };
     debug_assert!(live_tile_batch > 0);
     let mask = mask
         .map(|mask| {
@@ -851,35 +871,42 @@ fn input_score_attention_with_tile_batches(
             )
         })
         .transpose()?;
-    let prepared = (keys.dim(2) <= INPUT_SCORE_WORKSPACE.score_tile_elements as i32)
-        .then(|| {
-            PreparedAttentionKeyValues::new(
-                queries,
-                keys,
-                values,
-                eredu_nn::AttentionArithmetic::InputScores,
-                true,
-                stream,
-            )
-        })
-        .transpose()?;
+    if keys.dim(2) as u64 > INPUT_SCORE_TILE_ELEMENTS {
+        return key_tiled_input_score_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            mask.as_ref(),
+            sinks,
+            softcap,
+            stream,
+        );
+    }
+    let prepared = PreparedAttentionKeyValues::new(
+        queries,
+        keys,
+        values,
+        eredu_nn::AttentionArithmetic::InputScores,
+        true,
+        stream,
+    )?;
     let mut outputs = Vec::new();
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let wide_tile = prepared.as_ref().is_some_and(|prepared| {
-        prepared.ordered.is_some()
-            || (keys.dim(2) <= score_softmax::MAX_KEYS
-                && sinks.is_none()
-                && softcap.is_none()
-                && mask.as_ref().is_none_or(|value| {
-                    matches!(
-                        value.dtype(),
-                        Dtype::Bool | Dtype::Bfloat16 | Dtype::Float32
-                    )
-                })
-                && [queries, keys, values]
-                    .iter()
-                    .all(|value| value.dtype() == Dtype::Bfloat16))
-    }) && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu;
+    let wide_tile = (prepared.ordered.is_some()
+        || (keys.dim(2) <= score_softmax::MAX_KEYS
+            && sinks.is_none()
+            && softcap.is_none()
+            && mask.as_ref().is_none_or(|value| {
+                matches!(
+                    value.dtype(),
+                    Dtype::Bool | Dtype::Bfloat16 | Dtype::Float32
+                )
+            })
+            && [queries, keys, values]
+                .iter()
+                .all(|value| value.dtype() == Dtype::Bfloat16)))
+        && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu;
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     let wide_tile = false;
     let score_tile_elements = if wide_tile {
@@ -891,11 +918,7 @@ fn input_score_attention_with_tile_batches(
         .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
     // Wider ordered tiles share K/V layout work. Preserve the narrow path's
     // live score-row bound and its evaluation boundary across layers.
-    let live_tile_batch = if wide_tile
-        && prepared
-            .as_ref()
-            .is_some_and(|prepared| prepared.ordered.is_some())
-    {
+    let live_tile_batch = if wide_tile && prepared.ordered.is_some() {
         let narrow_step = (INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
             .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
         (live_tile_batch.saturating_mul(narrow_step as usize) / query_step as usize).max(1)
@@ -903,17 +926,7 @@ fn input_score_attention_with_tile_batches(
         live_tile_batch
     };
     let tile_count = (queries.dim(2) as usize).div_ceil(query_step as usize);
-    let evaluate_batches = prepared.is_some() && tile_count > live_tile_batch;
-    let key_tile_batch = if prepared.is_none() {
-        input_score_key_tile_batch(
-            queries.dim(2) as u64,
-            queries.dtype() == Dtype::Float32,
-            Some(stream.get_device()?.get_type()?),
-        )
-    } else {
-        1
-    };
-    let key_group_positions = (INPUT_SCORE_KEY_TILE_POSITIONS * key_tile_batch) as i32;
+    let evaluate_batches = tile_count > live_tile_batch;
     let mut completed_tiles = 0;
     for start in (0..queries.dim(2)).step_by(query_step as usize) {
         let end = (start + query_step).min(queries.dim(2));
@@ -922,27 +935,71 @@ fn input_score_attention_with_tile_batches(
             .as_ref()
             .map(|mask| mask.try_index_device((.., .., start..end, ..), stream))
             .transpose()?;
-        if let Some(prepared) = &prepared {
-            outputs.push(attention_with_prepared_key_values(
-                &query,
-                prepared,
-                scale,
-                mask.as_ref(),
-                sinks,
-                softcap,
-                stream,
-            )?);
-            if evaluate_batches
-                && (outputs.len() - completed_tiles == live_tile_batch || end == queries.dim(2))
-            {
-                // eval completes these arrays and detaches their dependency
-                // graphs, releasing tile-local temporaries before constructing
-                // the next group. Keep every finished output for concatenation.
-                safemlx::transforms::eval(&outputs[completed_tiles..])?;
-                completed_tiles = outputs.len();
-            }
-            continue;
+        outputs.push(attention_with_prepared_key_values(
+            &query,
+            &prepared,
+            scale,
+            mask.as_ref(),
+            sinks,
+            softcap,
+            stream,
+        )?);
+        if evaluate_batches
+            && (outputs.len() - completed_tiles == live_tile_batch || end == queries.dim(2))
+        {
+            // Complete and detach tile-local temporaries before constructing
+            // the next group. Keep finished outputs for concatenation.
+            safemlx::transforms::eval(&outputs[completed_tiles..])?;
+            completed_tiles = outputs.len();
         }
+    }
+    concatenate_axis(&outputs, 2, stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn key_tiled_input_score_attention(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    use crate::backend::runtime::cache::kv::{
+        BlockwiseAttentionAccumulator, KeyValueAttentionBlock,
+    };
+    let device = Some(stream.get_device()?.get_type()?);
+    let float32 = queries.dtype() == Dtype::Float32;
+    let query_tile = input_score_key_query_tile(
+        queries.dim(0) as u64,
+        queries.dim(2) as u64,
+        float32,
+        device,
+    );
+    let decode_key_tiles = input_score_key_tile_batch(queries.dim(2) as u64, float32, device);
+    let positions = keys.dim(2);
+    let mut outputs = Vec::new();
+    for start in (0..queries.dim(2)).step_by(query_tile) {
+        let end = start.saturating_add(query_tile as i32).min(queries.dim(2));
+        let rows = end - start;
+        let mut query = queries.try_index_device((.., .., start..end, ..), stream)?;
+        let mut mask = mask
+            .map(|mask| mask.try_index_device((.., .., start..end, ..), stream))
+            .transpose()?;
+        if rows > 1 {
+            // The batch axis lets both products retain their single matrix
+            // row and its reduction, while sharing broadcast K/V views.
+            query = query.swap_axes(0, 2, stream)?;
+            mask = mask.map(|mask| mask.swap_axes(0, 2, stream)).transpose()?;
+        }
+        let key_tiles = if query_tile > 1 {
+            input_score_batched_key_tile_group(rows as usize)
+        } else {
+            decode_key_tiles
+        };
+        let key_group_positions = (INPUT_SCORE_KEY_TILE_POSITIONS * key_tiles) as i32;
         let mut accumulator = BlockwiseAttentionAccumulator::new(
             &query,
             scale,
@@ -951,7 +1008,7 @@ fn input_score_attention_with_tile_batches(
             None,
             0,
             sinks,
-            i64::from(keys.dim(2)),
+            i64::from(positions),
             stream,
         )?;
         accumulator.set_arithmetic(eredu_nn::AttentionArithmetic::InputScores, stream)?;
@@ -961,19 +1018,38 @@ fn input_score_attention_with_tile_batches(
             if pass > 0 {
                 accumulator.begin_pass(pass, stream)?;
             }
-            for key_start in (0..keys.dim(2)).step_by(INPUT_SCORE_KEY_TILE_POSITIONS) {
-                let key_end = (key_start + INPUT_SCORE_KEY_TILE_POSITIONS as i32).min(keys.dim(2));
+            for key_start in (0..positions).step_by(INPUT_SCORE_KEY_TILE_POSITIONS) {
+                let key_end = key_start
+                    .saturating_add(INPUT_SCORE_KEY_TILE_POSITIONS as i32)
+                    .min(positions);
+                let extent = key_end - key_start;
+                let mut keys = keys.try_index_device((.., .., key_start..key_end, ..), stream)?;
+                let mut values =
+                    values.try_index_device((.., .., key_start..key_end, ..), stream)?;
+                if rows > 1 {
+                    keys = broadcast_to(&keys, &[rows, keys.dim(1), extent, keys.dim(3)], stream)?;
+                    values = broadcast_to(
+                        &values,
+                        &[rows, values.dim(1), extent, values.dim(3)],
+                        stream,
+                    )?;
+                }
                 let block = KeyValueAttentionBlock::unleased(
                     i64::from(key_start),
                     i64::from(key_end),
-                    keys.try_index_device((.., .., key_start..key_end, ..), stream)?,
-                    values.try_index_device((.., .., key_start..key_end, ..), stream)?,
+                    keys,
+                    values,
                 );
-                let complete_group = key_end % key_group_positions == 0 || key_end == keys.dim(2);
+                let complete_group = key_end % key_group_positions == 0 || key_end == positions;
                 accumulator.accumulate_contiguous(&block, complete_group, stream)?;
             }
         }
-        outputs.push(accumulator.finish(stream)?);
+        let output = accumulator.finish(stream)?;
+        outputs.push(if rows > 1 {
+            output.swap_axes(0, 2, stream)?
+        } else {
+            output
+        });
     }
     concatenate_axis(&outputs, 2, stream)
 }

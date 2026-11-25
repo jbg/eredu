@@ -305,6 +305,32 @@ An isolated attention comparison also produces identical outputs in
 30 cases across the cutoffs, including strided KV, boolean and FP16 additive
 masks, batched heads, and partial value tiles.
 
+### Metal multi-query attention beyond 8,192 keys
+
+For contiguous single-batch FP32 attention, MLX uses up to 64 independent
+query rows as a native batch inside the key-tiled scan. The score and value
+products keep a singleton matrix row and the two sweeps preserve each query's
+reduction order. The native memory report accounts for batched score tiles.
+
+On M3 Ultra, the isolated 32-query, 8,193-key case matches the former scan
+bit for bit and takes 22.82 ms compared with 604.96 ms. Peak MLX scratch above
+preloaded inputs is 4,747,800 bytes compared with 586,124 bytes. Isolated
+bitwise comparisons also cover strided layouts, grouped and equal head counts,
+additive masks, sinks, soft caps, and a partial final query tile.
+
+On the pinned Q4_K_M, the release comparison against `82e7895c0` uses an
+8,192-token prefix and 16 teacher-forced tokens starting at `i = 12000`, split
+into two eight-token appends. Prompt IDs, TF32 settings, and warmup follow the
+long-context check above. Total completed append time is 0.166 s compared with
+1.918 s. The final prefill score row and both returned append rows match bit
+for bit, and peak decode allocation decreases by 147,456 bytes in the pair.
+
+An 8,193-token cold prefill completes in 21.96 s and peaks at 10,313,950,572
+MLX allocator bytes. The last prefill row and eight subsequent single-token
+score rows match the previously measured batched prototype bit for bit.
+Ordinary, explicitly advanced, and snapshot-restored generation on the same
+prefix agree on 16 token IDs and the finish reason.
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same

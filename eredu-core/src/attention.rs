@@ -230,7 +230,7 @@ mod tests {
 pub struct InputScoreAttentionMechanism {
     /// Query-by-key elements per head before query tiling.
     pub score_tile_elements: u64,
-    /// Maximum query rows in one tile.
+    /// Maximum query rows for complete-key score tiling.
     pub max_query_rows: u64,
     /// Fallback expanded K/V and contiguous projection copies per query tile,
     /// used when `full_key_tiles` is absent or does not cover the key length.
@@ -244,8 +244,9 @@ pub struct InputScoreAttentionMechanism {
 }
 
 impl InputScoreAttentionMechanism {
-    /// Upper bound on one query tile for a given key length. A wider full-key
-    /// path may require exact dtype and operator support at execution time.
+    /// Score-element bound for complete-key query tiling. Beyond the full-key
+    /// coverage this returns the ordinary tiling threshold. A wider full-key
+    /// tile may require exact dtype and operator support at execution time.
     pub fn query_tile_score_bound(&self, keys: u64) -> u64 {
         self.full_key_tiles
             .filter(|full| keys <= full.max_key_positions)

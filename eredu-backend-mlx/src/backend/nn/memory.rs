@@ -676,7 +676,14 @@ fn describe_selected(
                 } else {
                     4
                 };
-                let tile = super::attention::memory_tile_geometry(queries, keys, path);
+                let mut tile = super::attention::memory_tile_geometry(queries, keys, path);
+                let key_tiled = path == super::attention::AttentionMemoryPath::KeyTiles;
+                let float32 = element == TensorElementType::F32;
+                if key_tiled {
+                    tile.0 = super::attention::input_score_key_query_tile(
+                        batch, queries, float32, device,
+                    ) as u64;
+                }
                 if arithmetic == eredu_nn::AttentionArithmetic::InputScores
                     && element == TensorElementType::Bf16
                     && device == Some(safemlx::DeviceType::Cpu)
@@ -821,14 +828,28 @@ fn describe_selected(
                     }
                 }
                 result.missing.push(format!("selected {path:?}: lazy graph retention follows tile evaluation policy; tile count and overlap require lifetime composition"));
-                if path == super::attention::AttentionMemoryPath::KeyTiles {
-                    let batch = super::attention::input_score_key_tile_batch(
+                if key_tiled {
+                    let possible_device = device.or(Some(safemlx::DeviceType::Gpu));
+                    let query_rows = super::attention::input_score_key_query_tile(
+                        batch,
                         queries,
-                        element == TensorElementType::F32,
-                        device.or(Some(safemlx::DeviceType::Gpu)),
+                        float32,
+                        possible_device,
                     );
-                    if batch > 1 {
-                        result.missing.push(format!("each storage payload describes one key tile; up to {batch} key-tile graphs may remain live until grouped evaluation"));
+                    let groups = if query_rows > 1 {
+                        let tail = queries % query_rows as u64;
+                        let smallest_tile = if tail == 0 { query_rows } else { tail as usize };
+                        result.missing.push(format!("Metal can batch up to {query_rows} query rows per key tile with shared K/V views; native layout copies depend on bound strides"));
+                        super::attention::input_score_batched_key_tile_group(smallest_tile)
+                    } else {
+                        super::attention::input_score_key_tile_batch(
+                            queries,
+                            float32,
+                            possible_device,
+                        )
+                    };
+                    if groups > 1 {
+                        result.missing.push(format!("each storage payload describes one key tile; up to {groups} key-tile graphs may remain live until grouped evaluation"));
                     }
                 }
             }

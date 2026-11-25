@@ -1383,9 +1383,14 @@ of score and probability rows plus kernel-local state.
 Key rows beyond the complete-row workspace cap use the two-scan bounded
 mechanism. For contiguous single-query FP32 Metal attention, each sweep
 completes up to 16 adjacent 256-position tiles per evaluation. Tile products and
-recurrence merges keep their original order. The native storage description
-reports individual tile payloads and the group retention bound. Paged scans
-complete each block at its cache-owned boundary.
+recurrence merges keep their original order. Contiguous FP32 Metal invocations
+with one input batch can place up to 64 independent query rows on the native
+batch axis. Score and value products retain a singleton matrix row. Each
+query tile shares broadcast views of the 256-position K/V tiles and completes
+bounded groups of key tiles in both sweeps. The native storage description
+reports the query and key tile payloads and the group retention bound. The
+portable workspace estimate retains its conservative key-tiled allowance.
+Paged scans complete each block at its cache-owned boundary.
 Explicit rotary input products retain inverse frequencies directly so positions
 multiply the same rounded coefficients instead of dividing by reconstructed
 denominators.
