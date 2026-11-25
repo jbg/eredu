@@ -13,7 +13,7 @@ thread_local! {
     static ROWS: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SOFTMAX: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static FUSED_ATTENTION: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
-    static DECODE_SCORES: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static ATTENTION_SCORES: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static DECODE_VALUES: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
 
@@ -52,12 +52,16 @@ pub(super) fn fused_attention(
     let kv_heads = keys.dim(1);
     let output_width = transposed_values.dim(2);
     let decode = query_rows == 1;
-    let supported_positions = if decode {
-        1..=SOFTMAX_MAX_WIDTH
+    let staged_prefill = !decode
+        && positions > INLINE_ATTENTION_MAX_POSITIONS
+        && mask.is_some_and(|mask| mask.dtype() == Dtype::Bool);
+    let max_positions = if decode || staged_prefill {
+        SOFTMAX_MAX_WIDTH
     } else {
-        128..=INLINE_ATTENTION_MAX_POSITIONS
+        INLINE_ATTENTION_MAX_POSITIONS
     };
-    if !supported_positions.contains(&positions)
+    let min_positions = if decode { 1 } else { 128 };
+    if !(min_positions..=max_positions).contains(&positions)
         || query.size() == 0
         || output_width == 0
         || !metal(stream)?
@@ -96,14 +100,14 @@ pub(super) fn fused_attention(
         &[6],
     );
     let scale = Array::from_slice(&[scale], &[1]);
-    if decode {
-        let scores = DECODE_SCORES.with(|cell| {
+    if decode || staged_prefill {
+        let scores = ATTENTION_SCORES.with(|cell| {
             if cell.borrow().is_none() {
                 *cell.borrow_mut() = Some(MetalKernel::new(
-                    "ordered_f32_decode_scores",
+                    "ordered_f32_attention_scores",
                     ["query", "keys", "mask", "shape", "scale"],
                     ["out"],
-                    include_str!("ordered_f32_decode_scores.metal"),
+                    include_str!("ordered_f32_attention_scores.metal"),
                     "#pragma clang fp contract(off)\n",
                     false,
                     false,
@@ -116,9 +120,14 @@ pub(super) fn fused_attention(
                 .with_output_arg(shape, Dtype::Float32);
             cell.borrow()
                 .as_ref()
-                .expect("ordered decode score kernel initialized")
+                .expect("ordered attention score kernel initialized")
                 .apply_one_device([query, keys, &mask, &dimensions, &scale], &config, stream)
         })?;
+        if staged_prefill {
+            let probabilities = softmax(&scores, stream)?;
+            return attention_product(&probabilities, transposed_values, true, query_rows, stream)
+                .map(Some);
+        }
         // Long rows share one ordered softmax across all value-column groups.
         // The inline path keeps short rows in threadgroup memory.
         let normalized = positions > INLINE_ATTENTION_MAX_POSITIONS;

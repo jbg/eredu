@@ -28,6 +28,10 @@ if (MASK_MODE != 0) {
 uint score_lane = tid % 16;
 uint score_end = width / 16 * 16;
 for (uint position = tid / 16; position < positions; position += THREADS / 16) {
+    if (MASK_MODE == 1 && !bool(mask[mask_base + position * mask_step])) {
+        if (score_lane == 0) probabilities[position] = -INFINITY;
+        continue;
+    }
     size_t key = key_base + size_t(position) * width;
     float sum = 0.0f;
     for (uint i = score_lane; i < score_end; i += 16) {
@@ -44,9 +48,7 @@ for (uint position = tid / 16; position < positions; position += THREADS / 16) {
             score = fma(query[query_base + i], keys[key + i], score);
         }
         score *= scale[0];
-        if (MASK_MODE == 1 && !bool(mask[mask_base + position * mask_step])) {
-            score = -INFINITY;
-        } else if (MASK_MODE == 2) {
+        if (MASK_MODE == 2) {
             score += float(mask[mask_base + position * mask_step]);
         }
         probabilities[position] = score;
