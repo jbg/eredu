@@ -821,6 +821,16 @@ fn describe_selected(
                     }
                 }
                 result.missing.push(format!("selected {path:?}: lazy graph retention follows tile evaluation policy; tile count and overlap require lifetime composition"));
+                if path == super::attention::AttentionMemoryPath::KeyTiles {
+                    let batch = super::attention::input_score_key_tile_batch(
+                        queries,
+                        element == TensorElementType::F32,
+                        device.or(Some(safemlx::DeviceType::Gpu)),
+                    );
+                    if batch > 1 {
+                        result.missing.push(format!("each storage payload describes one key tile; up to {batch} key-tile graphs may remain live until grouped evaluation"));
+                    }
+                }
             }
         }
         IndexedAttention {

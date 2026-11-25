@@ -254,6 +254,18 @@ impl BlockwiseAttentionAccumulator {
         self.accumulate_with_bias(block, None, stream)
     }
 
+    /// Appends an unleased contiguous tile. The caller completes each bounded
+    /// group at its last tile, including any tail before changing sweeps.
+    pub(crate) fn accumulate_contiguous(
+        &mut self,
+        block: &KeyValueAttentionBlock,
+        complete_group: bool,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        debug_assert!(!self.causal && self.retained_start.is_none());
+        self.accumulate_visible_with_bias(block, None, complete_group, stream)
+    }
+
     /// Submits the current recurrence before the next cache-block dependency
     /// is inserted, allowing the dedicated transfer stream to prefetch the
     /// following block while this block's attention executes.
@@ -290,17 +302,18 @@ impl BlockwiseAttentionAccumulator {
                     .map(|bias| bias.try_index_device((.., .., .., range), stream))
                     .transpose()?;
                 let part = KeyValueAttentionBlock::unleased(begin, end, keys, values);
-                self.accumulate_visible_with_bias(&part, bias.as_ref(), stream)?;
+                self.accumulate_visible_with_bias(&part, bias.as_ref(), true, stream)?;
             }
             return Ok(());
         }
-        self.accumulate_visible_with_bias(block, additive_bias, stream)
+        self.accumulate_visible_with_bias(block, additive_bias, true, stream)
     }
 
     fn accumulate_visible_with_bias(
         &mut self,
         block: &KeyValueAttentionBlock,
         additive_bias: Option<&Array>,
+        complete_group: bool,
         stream: &Stream,
     ) -> Result<(), Exception> {
         let block_start = block.start;
@@ -455,7 +468,9 @@ impl BlockwiseAttentionAccumulator {
                 Some(previous) => previous.add(&product, stream)?,
                 None => product,
             });
-            safemlx::transforms::eval(self.accumulator.iter())?;
+            if complete_group {
+                safemlx::transforms::eval(self.accumulator.iter())?;
+            }
             return Ok(());
         }
         let block_max = scores.max_axis(-1, true, stream)?;
@@ -520,17 +535,19 @@ impl BlockwiseAttentionAccumulator {
                 }
             }
         }
-        safemlx::transforms::eval([
-            self.running_max
-                .as_ref()
-                .expect("blockwise attention initialized row maximum"),
-            self.running_sum
-                .as_ref()
-                .expect("blockwise attention initialized normalization"),
-            self.accumulator
-                .as_ref()
-                .expect("blockwise attention initialized accumulator"),
-        ])?;
+        if complete_group {
+            safemlx::transforms::eval([
+                self.running_max
+                    .as_ref()
+                    .expect("blockwise attention initialized row maximum"),
+                self.running_sum
+                    .as_ref()
+                    .expect("blockwise attention initialized normalization"),
+                self.accumulator
+                    .as_ref()
+                    .expect("blockwise attention initialized accumulator"),
+            ])?;
+        }
         Ok(())
     }
 

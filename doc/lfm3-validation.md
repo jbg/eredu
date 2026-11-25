@@ -228,6 +228,30 @@ released Q6_K as draft, both modes accept 41 of 43 proposals and match serial
 generation and termination over 48 committed tokens. The Metal dispatch
 trace confirms both packed window kernels execute during verification.
 
+### Metal long-context decode
+
+Above 8,192 key positions, contiguous single-query FP32 attention completes
+groups of up to 16 key tiles per sweep. Each tile still covers up to 256
+positions and the merge order is preserved.
+
+On M3 Ultra with the pinned Q4_K_M, the release checkpoint probe uses
+`MLX_ENABLE_TF32=0`, prompt IDs `1 + (13*i) % 128000`, one warmup, and 24
+single-token appends with the same ID sequence starting at `i = 12000`.
+With an 8,184-token prefix, the median post-boundary step is 29.52 ms across
+three runs, compared with 102.20 ms at revision `fe2ea85b1`. Median pre-boundary
+steps measure 9.78 and 9.39 ms respectively. With an 8,192-token prefix, the
+24 steps sustain 28.30 tokens/s compared with 9.29 tokens/s. That pair
+has the same peak MLX decode allocation of 1,673,225,155 bytes. In the three
+boundary-crossing runs, the largest peak difference is 4,048 bytes. Full
+prefill and decode vocabulary scores match bit for bit in all comparisons,
+including the 781-token prefix control. Ordinary, explicitly advanced, and
+snapshot-restored generation produce the same 16 token IDs and finish reason
+from an 8,188-token prefix.
+
+Isolated FP32 attention also matches bit for bit with and without a boolean
+mask at 8,193, 16,385, and 32,769 key positions. The grouped operator peaks
+at about 1 MiB of active allocation above its preloaded inputs in those cases.
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same

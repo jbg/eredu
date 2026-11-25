@@ -1371,9 +1371,15 @@ memory for a complete key row. The fused operator applies post-product scaling
 and masking, preserves the compensated softmax sum, and preserves the score and
 value reduction lanes. Unsupported geometry and requests with score caps or
 sink logits use the explicit products and softmax.
-Larger key rows retain the two-scan bounded mechanism. Explicit rotary input
-products retain inverse frequencies directly so positions multiply the same
-rounded coefficients instead of dividing by reconstructed denominators.
+Key rows beyond the complete-row workspace cap use the two-scan bounded
+mechanism. For contiguous single-query FP32 Metal attention, each sweep
+completes up to 16 adjacent 256-position tiles per evaluation. Tile products and
+recurrence merges keep their original order. The native storage description
+reports individual tile payloads and the group retention bound. Paged scans
+complete each block at its cache-owned boundary.
+Explicit rotary input products retain inverse frequencies directly so positions
+multiply the same rounded coefficients instead of dividing by reconstructed
+denominators.
 Nontraditional piecewise wavelength-scaled RoPE and native YaRN return the input
 dtype after their FP32 rotary calculation and preserve unrotated trailing
 features. YaRN applies its amplitude only to rotated features before the final
