@@ -189,7 +189,13 @@ pub(super) fn q4k_linear_metal(
             })?
         }
         KQuantLinearKernelClass::SmallBatch => {
-            q4k_batch_linear_metal(&flat, view, outer, dtype, stream)?
+            if let Some(output) =
+                super::scalar_window::project(&flat, view, outer, dtype, stream)?
+            {
+                output
+            } else {
+                q4k_batch_linear_metal(&flat, view, outer, dtype, stream)?
+            }
         }
         KQuantLinearKernelClass::MatrixMatrix if k_quant_supports_tiled_matmul(view) => {
             qk_matmul_metal(
@@ -278,9 +284,18 @@ pub(super) fn q6k_linear_metal(
     let output = match k_quant_linear_kernel_class(outer) {
         KQuantLinearKernelClass::MatrixVector => {
             let config = qk_decode_config(view, dtype, 2);
-            Q6K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
+            // Wide FP32 outputs benefit from coalescing the packed block loads.
+            let (slot, make_kernel) = if dtype == Dtype::Float32
+                && view.columns <= 2048
+                && view.rows >= 65_536
+            {
+                (&Q6K_WIDE_OUTPUT_KERNEL, q6k_wide_output_kernel as fn() -> _)
+            } else {
+                (&Q6K_LINEAR_KERNEL, q6k_linear_kernel as fn() -> _)
+            };
+            slot.with(|cell| -> Result<_, Exception> {
                 if cell.borrow().is_none() {
-                    *cell.borrow_mut() = Some(q6k_linear_kernel()?);
+                    *cell.borrow_mut() = Some(make_kernel()?);
                 }
                 cell.borrow()
                     .as_ref()
@@ -289,7 +304,13 @@ pub(super) fn q6k_linear_metal(
             })?
         }
         KQuantLinearKernelClass::SmallBatch => {
-            qk_batch_linear_metal(&flat, view, outer, dtype, false, stream)?
+            if let Some(output) =
+                super::scalar_window::project(&flat, view, outer, dtype, stream)?
+            {
+                output
+            } else {
+                qk_batch_linear_metal(&flat, view, outer, dtype, false, stream)?
+            }
         }
         KQuantLinearKernelClass::MatrixMatrix if k_quant_supports_tiled_matmul(view) => {
             qk_matmul_metal(

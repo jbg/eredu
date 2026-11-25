@@ -445,6 +445,12 @@ fn softmax_kernel() -> Result<MetalKernel, Exception> {
     )
 }
 
+pub(super) fn packed_gated_silu_header() -> String {
+    // Suppress contraction only in the activation code, leaving the packed
+    // projection body on the same arithmetic as its standalone kernel.
+    format!("#define EREDU_LOCAL_EXP_CONTRACTION\n{}", row_arithmetic_header())
+}
+
 fn row_arithmetic_header() -> String {
     [
         super::arithmetic::metal_arithmetic_header(),

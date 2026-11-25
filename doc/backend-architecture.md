@@ -15320,6 +15320,33 @@ after running attention against the current KV history. Weights are explicit
 bindings. The replay description retains neither parameter storage nor session
 cache state. Component observations and interventions use the instrumented path.
 
+### Packed gated projection
+
+The neutral projected gated-product operator composes two linear projections
+and their gating equation. MLX Metal selects a fused step for compatible
+single-row FP32 inputs, two ordinary unscaled and unbiased packed Q4_K
+bindings, and ordered SiLU. Adjacent SIMD groups share the completed
+projection values through threadgroup memory and write the product directly.
+The fused and standalone Q4_K shaders share their dot-product source.
+A separate wide-output Q6_K projection coalesces packed block loads and
+restores the reference lane order for reduction. Both mechanisms bind the
+original packed weights and emit ordinary lazy tensors for replay and
+submission. The family owns the projection topology and gating policy.
+
+### Packed causal projection windows
+
+The portable text binding requests scalar-order projection selection while
+constructing a multi-token causal append. MLX uses a stream-scoped guard on
+the submitting host thread and binds the original Q4_K or Q6_K weight blocks
+once per tile across two through eight FP32 activation rows. Each row keeps
+its scalar projection accumulation and reduction order. The guard covers
+graph construction and restores the prior selection at scope exit.
+
+The text driver owns the verification width, score sampling, accepted-prefix
+publication and rollback. Prefill and other attention invocations use their
+existing projection selection. The window kernels produce ordinary lazy
+tensors and require no persistent storage beyond the existing packed buffers.
+
 ### Mixed-storage FP32 GEMM
 
 `safemlx::fast::try_mixed_storage_gemm` is a native inference operation. Its distinct primitive delegates dispatch to the pinned

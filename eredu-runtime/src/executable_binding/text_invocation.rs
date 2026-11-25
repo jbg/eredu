@@ -112,6 +112,19 @@ fn invocation_tensor<M: TextTensorMechanisms>(value: &M::InvocationTensor) -> M:
         .clone()
 }
 
+fn scalar_projection_scope<T: Tensor>(
+    tokens: &T,
+    context: &T::Context,
+) -> Option<eredu_nn::ScalarProjectionScope> {
+    let &[1, rows] = tokens.shape() else {
+        return None;
+    };
+    if rows <= 1 {
+        return None;
+    }
+    T::scope_scalar_projections(context, rows)
+}
+
 pub(super) fn token_part<T>(tokens: T) -> Result<eredu_core::PreparedInputPart<T>, BackendFailure> {
     eredu_core::PreparedInputPart::new_with_extents(
         eredu_core::InputModality::Text,
@@ -417,6 +430,13 @@ where
         observer: &mut dyn crate::ActivationObserver<M::InvocationTensor, M::Error>,
     ) -> Result<M::Scores, M::Error> {
         let tokens = invocation_tensor::<M>(tokens);
+        let _projections = if !prefill
+            && invocation == eredu_core::decoding::AttentionInvocation::CAUSAL
+        {
+            scalar_projection_scope(&tokens, stream)
+        } else {
+            None
+        };
         let feedback = feedback.map(invocation_tensor::<M>);
         let pass = if prefill {
             crate::ExpertPass::Prefill
@@ -567,6 +587,10 @@ where
         observer: &mut dyn crate::ActivationObserver<M::InvocationTensor, M::Error>,
     ) -> Result<M::Scores, M::Error> {
         let tokens = tokens.map(M::decode_tensor);
+        let _projections = tokens
+            .as_ref()
+            .ok()
+            .and_then(|tokens| scalar_projection_scope(tokens, stream));
         let committed = self.session.tracks_local_tokens().then(|| {
             tokens
                 .as_ref()
@@ -800,6 +824,13 @@ where
         observer: &mut dyn crate::ActivationObserver<M::InvocationTensor, M::Error>,
     ) -> Result<M::Scores, M::Error> {
         let part = token_part(M::prompt_tokens(tokens))?;
+        let _projections = if !prefill
+            && invocation == eredu_core::decoding::AttentionInvocation::CAUSAL
+        {
+            scalar_projection_scope(&invocation_tensor::<M>(tokens), stream)
+        } else {
+            None
+        };
         let prepared = prepare_composite_prompt::<A, B, S, M>(
             &self.ingress.admission,
             &self.ingress.processor,

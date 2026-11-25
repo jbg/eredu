@@ -5472,6 +5472,20 @@ pub trait NeuralBackend: Sized + 'static {
     ) -> Result<Self::Tensor, Error> {
         Self::rms_norm_without_weight(input, epsilon, context)?.multiply(weight, context)
     }
+    /// Applies two linear projections to a common input and combines them with
+    /// the selected gated-product equation.
+    fn project_gated_product(
+        gate: &mut Self::Linear,
+        up: &mut Self::Linear,
+        input: &Self::Tensor,
+        policy: GatedProductPolicy,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let gate = gate.forward(input, context)?;
+        let up = up.forward(input, context)?;
+        Self::gated_product(gate, up, policy, context)
+    }
+
     /// Applies a validated gated-product equation.
     fn gated_product(
         gate: Self::Tensor,
@@ -6143,6 +6157,31 @@ pub trait FixedShapeReplay<T: Tensor>: Debug + Send + Sync {
     fn apply(&self, inputs: &[&T], context: &T::Context) -> Result<Option<Vec<T>>, Error>;
 }
 
+/// RAII guard for an invocation's scalar-order projection selection.
+#[must_use]
+pub struct ScalarProjectionScope(Option<Box<dyn FnOnce()>>);
+
+impl ScalarProjectionScope {
+    /// Retains thread-local cleanup until the caller finishes building the invocation.
+    pub fn new(restore: impl FnOnce() + 'static) -> Self {
+        Self(Some(Box::new(restore)))
+    }
+}
+
+impl Debug for ScalarProjectionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScalarProjectionScope").finish_non_exhaustive()
+    }
+}
+
+impl Drop for ScalarProjectionScope {
+    fn drop(&mut self) {
+        if let Some(restore) = self.0.take() {
+            restore();
+        }
+    }
+}
+
 /// Opaque tensor handle and the neural operations required by shared Eredu
 /// architectures.
 ///
@@ -6151,6 +6190,16 @@ pub trait FixedShapeReplay<T: Tensor>: Debug + Send + Sync {
 pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Backend execution context, such as a stream or command queue.
     type Context: ?Sized;
+
+    /// Requests scalar-row projection arithmetic for a causal append with
+    /// several rows. A backend may decline. This scope selects lazy operators
+    /// for the current invocation and does not submit or own session state.
+    fn scope_scalar_projections(
+        _context: &Self::Context,
+        _rows: i32,
+    ) -> Option<ScalarProjectionScope> {
+        None
+    }
 
     /// Reports whether this context supports recording fixed-shape regions.
     fn supports_fixed_shape_replay(_context: &Self::Context) -> bool {

@@ -121,6 +121,14 @@ impl Tensor for MlxTensor {
     type Context = Stream;
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    fn scope_scalar_projections(
+        context: &Self::Context,
+        rows: i32,
+    ) -> Option<eredu_nn::ScalarProjectionScope> {
+        crate::backend::nn::native_quantization::scope_scalar_projections(context, rows)
+    }
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     fn supports_fixed_shape_replay(context: &Self::Context) -> bool {
         context.get_device().and_then(|d| d.get_type()).ok() == Some(safemlx::DeviceType::Gpu)
     }
@@ -137,7 +145,9 @@ impl Tensor for MlxTensor {
             "f32_pointwise",
             "gated_causal_depthwise_step",
             "native_q4k_decode_2row",
+            "native_q4k_decode_gated_pair",
             "native_q6k_decode_2row",
+            "native_q6k_decode_wide_output",
             "ordered_f32_attention_rows",
             "wide_square_rms",
             "wide_square_rms_multi",
@@ -160,6 +170,10 @@ impl Tensor for MlxTensor {
         let kind = u32::from(backend(device.get_type())?);
         let index = backend(device.get_index())?;
         let stream = backend(context.get_index())?;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if crate::backend::nn::native_quantization::has_scalar_projection_scope(stream) {
+            return Ok(None);
+        }
         Ok(Some(eredu_nn::TensorContextKey::new([
             u64::from(kind),
             index as u64,

@@ -663,6 +663,31 @@ impl NeuralBackend for MlxNeuralBackend {
         })
     }
 
+    fn project_gated_product(
+        gate: &mut MlxLinear,
+        up: &mut MlxLinear,
+        input: &MlxTensor,
+        policy: GatedProductPolicy,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        if policy == GatedProductPolicy::ordinary_silu()
+            && gate.arithmetic == eredu_nn::LinearArithmetic::Native
+            && up.arithmetic == eredu_nn::LinearArithmetic::Native
+        {
+            if let Some(value) = compute(common::native_quantization::try_packed_gated_decode(
+                &gate.module,
+                &up.module,
+                input.as_array(),
+                context,
+            ))? {
+                return Ok(MlxTensor::from_array(value));
+            }
+        }
+        let gate = gate.forward(input, context)?;
+        let up = up.forward(input, context)?;
+        Self::gated_product(gate, up, policy, context)
+    }
+
     fn gated_product(
         gate: MlxTensor,
         up: MlxTensor,
