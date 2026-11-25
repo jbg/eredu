@@ -472,6 +472,7 @@ where
     pub(super) completions: Vec<B::TextCompletion>,
     pub(super) remaining_tokens: Option<usize>,
     pub(super) prefill: PrefillChunkPolicy,
+    pub(super) prefill_chunk_tokens: Option<usize>,
     pub(super) position: crate::refinement::GenerationPosition,
     pub(super) cancellation: Option<crate::GenerationCancellationToken>,
     pub(super) retained_output: Option<B::Token>,
@@ -559,11 +560,11 @@ where
             admission,
             ControlledTextGenerationError::Preparation,
         )?;
-        if config.prefill_chunk_policy() == PrefillChunkPolicy::Automatic {
+        if let Some(reserve) = config.prefill_chunk_policy().automatic_reserve_bytes() {
             let limit = S::plain_text_prefill_tokens(&prompt)
                 .filter(|&tokens| tokens != 0 && config.sampling().max_new_tokens != Some(0))
                 .map_or(PrefillChunkPolicy::AUTOMATIC_FALLBACK, |tokens| {
-                    S::automatic_prefill_chunk(runtime, tokens)
+                    S::automatic_prefill_chunk(runtime, tokens, 0, reserve)
                 });
             config = config.with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(limit));
         }
@@ -585,6 +586,7 @@ where
             position: crate::refinement::GenerationPosition::default(),
             remaining_tokens: config.sampling().max_new_tokens,
             prefill: config.prefill_chunk_policy(),
+            prefill_chunk_tokens: None,
             cancellation: None,
             decoding: decoding.expect("mode admission agreed before state construction"),
         })
@@ -659,13 +661,24 @@ where
             self.step = Some(step);
             return Ok(false);
         };
+        let before = S::plain_text_prefill_tokens(&prompt);
         let advanced =
             S::prefill_text_prefix(runtime, &mut prompt, max_tokens, &mut self.backend_state)?;
-        self.step = Some(PendingTextInput::Prefill(prompt));
         if advanced {
+            let consumed = before
+                .zip(S::plain_text_prefill_tokens(&prompt))
+                .and_then(|(before, after)| before.checked_sub(after));
+            self.record_prefill_chunk(consumed);
             self.position.execution_step += 1;
         }
+        self.step = Some(PendingTextInput::Prefill(prompt));
         Ok(advanced)
+    }
+
+    fn record_prefill_chunk(&mut self, tokens: Option<usize>) {
+        if let Some(tokens) = tokens.filter(|&tokens| tokens != 0) {
+            self.prefill_chunk_tokens = self.prefill_chunk_tokens.max(Some(tokens));
+        }
     }
 
     fn advance(
@@ -697,6 +710,12 @@ where
                 .map_err(ControlledTextGenerationError::Backend)?;
         }
         let kind = S::text_operation_kind(runtime, &step, &self.backend_state);
+        let prefill_tokens = match &step {
+            PendingTextInput::Prefill(prompt) if kind == TextOperationKind::CausalDecision => {
+                S::plain_text_prefill_tokens(prompt)
+            }
+            _ => None,
+        };
         let decision = match kind {
             TextOperationKind::Progress(_) => None,
             TextOperationKind::CausalDecision | TextOperationKind::Decision(_) => Some(
@@ -739,6 +758,7 @@ where
                 };
                 self.resolve_completions_before_decode()
                     .map_err(ControlledTextGenerationError::Backend)?;
+                self.record_prefill_chunk(prefill_tokens);
                 let token_id = token
                     .token_id()
                     .map_err(ControlledTextGenerationError::Backend)?;

@@ -14283,14 +14283,17 @@ native backend still establishes completion before releasing native resources.
 
 ### Request memory forecasts and prefill chunks
 
-Automatic prefill sizing for a fresh, local plain-text request uses the
-installed execution geometry and observed physical memory headroom. The
-portable runtime chooses among bounded chunk sizes using prefill-only forecasts.
-The shared generation driver retains the selected bound for the request,
-including controlled advancement and automatic prompt-cache publication.
-Explicit bounds and unchunked requests override the automatic choice.
-Unavailable accounting and collective schedules use the portable fallback bound.
-Native implementations supply placement, workspace, and memory observations.
+Automatic prefill sizing for local plain text uses installed execution geometry,
+observed physical headroom, and the caller's reserve. The facade restores an
+eligible cached prefix before asking the portable runtime to size the suffix.
+The runtime forecasts query rows from the suffix and uses the absolute position
+for attention keys and persistent state. Restored state without a physical
+backing measurement receives no additional residency credit in the headroom
+comparison. The shared generation driver enforces the chosen bound and records
+the largest completed plain-text chunk for uninterrupted and controlled runs.
+Explicit bounds and unchunked requests override the automatic choice. Unavailable
+accounting and collective schedules use the portable fallback bound. Native
+implementations supply placement, workspace, and memory observations.
 
 Cold options can derive physical placement and available capacities through the
 portable facade's `GenerationMemoryOptions::for_hardware_device`. It matches

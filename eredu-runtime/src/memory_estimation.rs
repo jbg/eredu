@@ -670,6 +670,33 @@ pub(crate) fn fit(
     })
 }
 
+fn prefill_phases(
+    plan: &DomainMemoryPlan,
+    request: &GenerationMemoryRequest,
+    restored_positions: u64,
+    chunk: u64,
+) -> Result<impl Iterator<Item = PhaseMemoryEstimate>, CapabilityError> {
+    let suffix = request.input.model_positions;
+    let frontier = add(restored_positions, suffix)?;
+    let chunk = chunk.min(suffix);
+    let remainder = suffix % chunk;
+    let final_query = if remainder == 0 { chunk } else { remainder };
+    // The last full chunk can exceed the final partial chunk's workspace.
+    let preceding = (suffix > final_query)
+        .then(|| {
+            phase(
+                plan,
+                request,
+                MemoryPhase::Prefill,
+                frontier - final_query,
+                chunk,
+            )
+        })
+        .transpose()?;
+    let final_phase = phase(plan, request, MemoryPhase::Prefill, frontier, final_query)?;
+    Ok(preceding.into_iter().chain(std::iter::once(final_phase)))
+}
+
 /// Estimates overlapping request phase costs and compares every physical pool
 /// independently. Work is bounded by the number of supplied ranks and state layers,
 /// not by the prompt length or number of prefill chunks.
@@ -704,32 +731,11 @@ pub fn estimate_generation_memory(
         .max_output_tokens
         .unwrap_or(request.forecast_output_tokens);
     let positions = add(request.input.model_positions, output)?;
-    let chunk = request
-        .prefill_chunk_tokens
-        .min(request.input.model_positions);
-    let remainder = request.input.model_positions % chunk;
-    let final_query = if remainder == 0 { chunk } else { remainder };
     let mut domains = Vec::with_capacity(request.domains.len());
     for plan in &request.domains {
         plan.loading_peak.validate()?;
-        let mut phases = Vec::new();
-        // The last full chunk can exceed the final partial chunk's workspace.
-        if request.input.model_positions > final_query {
-            phases.push(phase(
-                plan,
-                request,
-                MemoryPhase::Prefill,
-                request.input.model_positions - final_query,
-                chunk,
-            )?);
-        }
-        phases.push(phase(
-            plan,
-            request,
-            MemoryPhase::Prefill,
-            request.input.model_positions,
-            final_query,
-        )?);
+        let mut phases: Vec<_> =
+            prefill_phases(plan, request, 0, request.prefill_chunk_tokens)?.collect();
         if output > 0 {
             phases.push(phase(plan, request, MemoryPhase::Decode, positions, 1)?);
         }
@@ -925,10 +931,12 @@ pub fn estimate_prefill_candidates(
 }
 
 /// Selects the largest supported prefill chunk with a usable memory estimate.
-/// The request describes prompt execution with no output allowance.
+/// The request describes the pending suffix with no output allowance. Restored
+/// positions still contribute to persistent state and the attention key extent.
 /// Unknown headroom cannot increase the default prefill bound.
 pub(crate) fn select_prefill_chunk(
     request: &GenerationMemoryRequest,
+    restored_positions: u64,
 ) -> Option<std::num::NonZeroUsize> {
     let fallback = eredu_core::PrefillChunkPolicy::AUTOMATIC_FALLBACK.get() as u64;
     let positions = request.input.model_positions;
@@ -939,6 +947,17 @@ pub(crate) fn select_prefill_chunk(
     {
         return None;
     }
+    if request.domains.iter().any(|plan| {
+        [
+            plan.budget.available_bytes,
+            plan.budget.application_limit_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|limit| plan.budget.reserve_bytes > limit)
+    }) {
+        return std::num::NonZeroUsize::new(1);
+    }
     let mut chunks = vec![positions.min(fallback * 4)];
     for limit in [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1] {
         if limit < *chunks.last()? {
@@ -946,26 +965,30 @@ pub(crate) fn select_prefill_chunk(
         }
     }
     let mut uncertain = None;
-    for (chunk, estimate) in estimate_prefill_candidates(request, &chunks).ok()? {
+    for chunk in chunks {
+        let mut likely_fit = true;
+        let mut shortfall = false;
+        for plan in &request.domains {
+            let peak = prefill_phases(plan, request, restored_positions, chunk)
+                .ok()?
+                .fold(MemoryBytes::exact(0), |peak, phase| {
+                    peak.maximum(&phase.total)
+                });
+            let verdict = fit(&peak, plan.already_resident_bytes, &plan.budget).ok()?;
+            likely_fit &= verdict == MemoryFit::LikelyFit;
+            shortfall |= verdict == MemoryFit::LikelyShortfall;
+        }
         let size = std::num::NonZeroUsize::new(usize::try_from(chunk).ok()?);
-        if estimate
-            .domains
-            .iter()
-            .all(|domain| domain.generation_fit == MemoryFit::LikelyFit)
-        {
+        if likely_fit {
             return size;
         }
-        if chunk <= fallback
-            && uncertain.is_none()
-            && estimate
-                .domains
-                .iter()
-                .all(|domain| domain.generation_fit != MemoryFit::LikelyShortfall)
-        {
+        if chunk <= fallback && uncertain.is_none() && !shortfall {
             uncertain = size;
         }
     }
-    uncertain
+    // If even one token exceeds a known budget, minimize the chunk. Sizing is
+    // advisory and cannot make the retained model and state fit.
+    uncertain.or(std::num::NonZeroUsize::new(1))
 }
 
 /// Parameter placement derived from an existing static report. Unified memory

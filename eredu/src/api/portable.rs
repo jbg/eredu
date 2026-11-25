@@ -168,6 +168,11 @@ pub struct TextGeneration<'a, B: TextGenerationBackend, S: TextExecutionSession<
 }
 
 impl<B: TextGenerationBackend, S: TextExecutionSession<B>> TextGeneration<'_, B, S> {
+    /// Largest completed plain-text prefill chunk, if its size is known.
+    pub fn prefill_chunk_tokens(&self) -> Option<usize> {
+        self.inner.prefill_chunk_tokens()
+    }
+
     /// Settles retained submissions without consuming another token. Useful before
     /// observing a continuation forecast; failures close the iterator.
     pub fn synchronize(&mut self) -> Result<(), eredu_core::BackendFailure> {

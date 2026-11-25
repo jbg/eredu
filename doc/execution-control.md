@@ -6,8 +6,9 @@ Ordinary, controlled, and observed generation share automatic prompt-cache
 reuse for admitted resident or paged state with local plain text and bounded
 autoregressive prefill. Startup
 validates and restores the same pinned generation before executing the
-remaining suffix. Traces and snapshots retain the full input IDs, and
-restored state counts toward the ordinary snapshot budget.
+remaining suffix. Automatic sizing observes memory at that restored boundary
+and applies the caller's reserve. Traces and snapshots retain the full input
+IDs, and restored state counts toward the ordinary snapshot budget.
 
 On a miss, publication begins after the last nonfinal prefill chunk has
 settled and its records have been delivered. The store reserves staging
@@ -321,7 +322,9 @@ Ordinary and controlled generation share prompt chunking in the core driver.
 `TextGenerationConfig::with_prefill_chunk_policy` and
 `PreparedChatGenerationSettings::prefill` default to `PrefillChunkPolicy::Automatic`.
 Eligible local text requests use observed memory headroom to size chunks, with a
-512-token fallback. Callers can also select `Bounded` or `Unchunked`.
+512-token fallback. Callers can choose `AutomaticWithReserve`, `Bounded`, or
+`Unchunked`. The controlled session reports the largest completed plain-text
+chunk through `prefill_chunk_tokens()`.
 Each nonfinal chunk completes before the next begins and advances the model cache without sampling. Only the final chunk
 predicts a token. A controlled step can publish `Progress` and pause at a
 completed nonfinal chunk; it consumes no output token or controller decision.

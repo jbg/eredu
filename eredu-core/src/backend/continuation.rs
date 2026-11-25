@@ -93,6 +93,11 @@ where
         self.inner.position
     }
 
+    /// Largest completed plain-text prefill chunk for this run, in tokens.
+    pub fn prefill_chunk_tokens(&self) -> Option<usize> {
+        self.inner.prefill_chunk_tokens
+    }
+
     /// Active and pending policies owned by this logical continuation.
     pub fn decoding_state(&self) -> crate::decoding::DecodingState {
         self.inner.decoding.state()
@@ -571,6 +576,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController, S: TextExecutionSession
                     remaining_tokens,
                     position,
                     prefill: self.state.inner.prefill,
+                    prefill_chunk_tokens: None,
                     cancellation: None,
                     decoding: self.state.inner.decoding.fork(decoding),
                 },

@@ -441,6 +441,12 @@ impl<B: TextGenerationBackend, S: eredu_core::TextExecutionSession<B>>
         self.delivery.timing
     }
 
+    /// Largest completed plain-text prefill chunk for the active run, if known.
+    /// This diagnostic retains the maximum across snapshot restores in that run.
+    pub fn prefill_chunk_tokens(&self) -> Option<usize> {
+        self.state.prefill_chunk_tokens()
+    }
+
     /// Returns the current lifecycle state.
     pub fn status(&self) -> GenerationStatus {
         self.lifecycle.status()

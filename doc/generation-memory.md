@@ -251,12 +251,22 @@ fresh inspection because conversion and transfer costs can change the result.
 ## Chunked prefill
 
 Ordinary text generation sizes eligible prefill chunks using installed execution
-geometry and observed physical headroom. It uses a 512-token fallback when
-accounting is unavailable. A positive `--prefill-chunk-size` overrides the
-automatic bound. A zero value removes the caller-imposed limit. The shared generation driver
-settles intermediate chunks before proceeding and samples only after the final
-chunk. Controlled generation uses that same driver. Chunk boundaries preserve
-cache positions and cancellation is checked between completed chunks.
+geometry and observed physical headroom. With an automatic prompt-cache hit, it
+observes memory after restoration and sizes only the remaining suffix, including
+the cached positions in attention and state estimates. Use
+`PrefillChunkPolicy::AutomaticWithReserve { reserve_bytes }` to set aside memory
+in each physical pool. The CLI passes `--memory-reserve-bytes` to the chooser.
+Sizing is advisory and uses a 512-token fallback when accounting is unavailable.
+A positive `--prefill-chunk-size` overrides the automatic bound. A zero value
+removes the caller-imposed limit. The shared generation driver settles
+intermediate chunks before proceeding and samples only after the final chunk.
+Chunk boundaries preserve cache positions and cancellation is checked between
+completed chunks.
+
+`GenerationStats::prefill_chunk_tokens`, `ControlledGenerationSession::prefill_chunk_tokens()`
+and `TextGeneration::prefill_chunk_tokens()` report the largest completed
+plain-text chunk when its size is known. A short suffix can report fewer tokens
+than the selected bound.
 
 Requests whose capture, media, speculative or distributed execution contract
 requires a full prompt retain their existing execution behavior. The memory

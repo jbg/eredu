@@ -2646,7 +2646,7 @@ where
         bail!("the prompt produced no input tokens");
     }
     let settings = PreparedChatGenerationSettings {
-        prefill: prefill_chunk_policy(args.prefill_chunk_size),
+        prefill: prefill_chunk_policy(args.prefill_chunk_size, args.memory_reserve_bytes),
         overrides: GenerationConfigOverrides {
             max_new_tokens: Some(max_tokens),
             ..generation_overrides
@@ -2761,7 +2761,7 @@ where
         }
         let config = TextGenerationConfig::new(resolved_generation)
             .with_seed(args.common.seed.unwrap_or(0))
-            .with_prefill_chunk_policy(prefill_chunk_policy(args.prefill_chunk_size));
+            .with_prefill_chunk_policy(settings.prefill);
         let config = if args.mirostat_v2 {
             config.with_mirostat_v2(args.mirostat_tau, args.mirostat_eta)?
         } else {
@@ -3801,10 +3801,10 @@ fn select_revision<'a>(
         .context("the cached repository contains no snapshots")
 }
 
-fn prefill_chunk_policy(size: Option<usize>) -> eredu::api::PrefillChunkPolicy {
+fn prefill_chunk_policy(size: Option<usize>, reserve_bytes: u64) -> eredu::api::PrefillChunkPolicy {
     use eredu::api::PrefillChunkPolicy;
     match size {
-        None => PrefillChunkPolicy::Automatic,
+        None => PrefillChunkPolicy::AutomaticWithReserve { reserve_bytes },
         Some(size) => std::num::NonZeroUsize::new(size)
             .map_or(PrefillChunkPolicy::Unchunked, PrefillChunkPolicy::Bounded),
     }

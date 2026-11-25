@@ -14,7 +14,7 @@ use super::{
     InstalledTextState, TextPromptFor, TextSessionDriver,
 };
 use crate::executable_binding::ErasedTextExecutable;
-use crate::memory_estimation::{LogitsWorkspace, MemoryBytes};
+use crate::memory_estimation::{LogitsWorkspace, MemoryBudget, MemoryBytes};
 use crate::memory_forecast::*;
 use eredu_core::{
     backend::TextOperationDriver, BackendFailure, CapabilityError, ModelCapabilitySession,
@@ -266,6 +266,8 @@ where
 pub(super) fn automatic_prefill_chunk<B, N>(
     runtime: &ModelRuntime<B, TextSessionDriver<N::Resources, N>>,
     tokens: usize,
+    restored_tokens: usize,
+    reserve_bytes: u64,
 ) -> std::num::NonZeroUsize
 where
     B: TextGenerationBackend,
@@ -279,10 +281,13 @@ where
         return fallback;
     }
     let model = session.resources().model.as_ref();
-    if model.forecast_state_offset().ok() != Some(Some(0)) {
+    let Ok(offset) = i32::try_from(restored_tokens) else {
+        return fallback;
+    };
+    if model.forecast_state_offset().ok() != Some(Some(offset)) {
         return fallback;
     }
-    let Ok(profile) = memory_profile::<B, N, _>(runtime, false) else {
+    let Ok(profile) = memory_profile::<B, N, _>(runtime, restored_tokens != 0) else {
         return fallback;
     };
     let contract = ForecastExecutionContract {
@@ -295,17 +300,27 @@ where
         // Prefix invocations and instrumented requests can expose every row.
         logits: LogitsWorkspace::EveryPosition,
     };
+    let budget = MemoryBudget {
+        reserve_bytes,
+        ..Default::default()
+    };
+    let options = GenerationForecastOptions {
+        budget: budget.clone(),
+        host_budget: budget,
+        ..Default::default()
+    };
     let Ok((request, _)) = loaded_generation_request(
         profile,
         InputTokenCount::text(tokens as u64),
         0,
         PrefillChunkPolicy::Automatic,
         contract,
-        &GenerationForecastOptions::default(),
+        &options,
     ) else {
         return fallback;
     };
-    crate::memory_estimation::select_prefill_chunk(&request).unwrap_or(fallback)
+    crate::memory_estimation::select_prefill_chunk(&request, restored_tokens as u64)
+        .unwrap_or(fallback)
 }
 impl<B, N, G> ContinuationForecastSession<B> for TextSessionDriver<N::Resources, N, G>
 where

@@ -1640,6 +1640,11 @@ pub struct TextGenerationConfig {
 pub enum PrefillChunkPolicy {
     /// Selects a chunk for the request using installed execution and memory facts.
     Automatic,
+    /// Selects a chunk while reserving these bytes in each physical memory pool.
+    AutomaticWithReserve {
+        /// Bytes set aside for other work and uncertainty.
+        reserve_bytes: u64,
+    },
     /// Add no caller-imposed chunk limit; architecture invocation limits remain.
     Unchunked,
     /// Process at most this many tokens in each eligible prefill pass.
@@ -1657,10 +1662,19 @@ impl PrefillChunkPolicy {
     pub const AUTOMATIC_FALLBACK: std::num::NonZeroUsize =
         std::num::NonZeroUsize::new(512).unwrap();
 
+    /// The caller's reserve for automatic sizing, or None for explicit chunking.
+    pub const fn automatic_reserve_bytes(self) -> Option<u64> {
+        match self {
+            Self::Automatic => Some(0),
+            Self::AutomaticWithReserve { reserve_bytes } => Some(reserve_bytes),
+            Self::Unchunked | Self::Bounded(_) => None,
+        }
+    }
+
     /// Effective explicit bound, or the automatic fallback before selection.
     pub const fn unresolved_limit(self) -> std::num::NonZeroUsize {
         match self {
-            Self::Automatic => Self::AUTOMATIC_FALLBACK,
+            Self::Automatic | Self::AutomaticWithReserve { .. } => Self::AUTOMATIC_FALLBACK,
             Self::Unchunked => std::num::NonZeroUsize::MAX,
             Self::Bounded(limit) => limit,
         }
@@ -2074,9 +2088,12 @@ pub trait TextOperationDriver<B: TextGenerationBackend>: BackendSession<B> + Siz
     }
 
     /// Resolves automatic prefill sizing without submitting model work.
+    /// The input count excludes the verified prefix already restored.
     fn automatic_prefill_chunk(
         _runtime: &ModelRuntime<B, Self>,
         _input_tokens: usize,
+        _restored_tokens: usize,
+        _reserve_bytes: u64,
     ) -> std::num::NonZeroUsize {
         PrefillChunkPolicy::AUTOMATIC_FALLBACK
     }
@@ -3305,6 +3322,10 @@ where
     pub fn position(&self) -> crate::refinement::GenerationPosition {
         self.inner.position
     }
+    /// Largest completed plain-text prefill chunk for this run, in tokens.
+    pub fn prefill_chunk_tokens(&self) -> Option<usize> {
+        self.inner.prefill_chunk_tokens
+    }
     /// Active/pending mode and effective handoff position of this shared driver.
     pub fn decoding_state(&self) -> crate::decoding::DecodingState {
         self.inner.decoding.state()
@@ -3498,6 +3519,11 @@ pub struct TextGeneration<'a, B: TextGenerationBackend, S: TextExecutionSession<
 }
 
 impl<'a, B: TextGenerationBackend, S: TextExecutionSession<B>> TextGeneration<'a, B, S> {
+    /// Largest completed plain-text prefill chunk for this run, in tokens.
+    pub fn prefill_chunk_tokens(&self) -> Option<usize> {
+        self.inner.prefill_chunk_tokens
+    }
+
     /// Establishes a healthy settled boundary without consuming pending input.
     /// Completion failure closes the iterator; it must not resume unknown state.
     pub fn synchronize(&mut self) -> Result<(), BackendFailure> {
