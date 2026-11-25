@@ -179,6 +179,55 @@ prefill and cached decode score across eight decode steps.
 | 781 | 156.72 | 170.93 | 1,032,276 bytes |
 | 1,536 | 150.34 | 163.08 | 1,065,012 bytes |
 
+### Metal packed gated projections
+
+The resident FP32 Metal route fuses the two packed Q4_K feed-forward
+projections with ordered SiLU. The Q6_K vocabulary projection uses
+coalesced packed loads and preserves the reference reduction order.
+The release comparison on M3 Ultra uses the pinned Q4_K_M artifact and
+the five-pair, 48-step protocol above against revision `4fadab21a`.
+Full-vocabulary F32 prefill and decode scores match bit for bit in the
+paired runs and in greedy continuation at 781 and 1,536 prompt tokens.
+Ordinary, controlled, and snapshot-restored generation match over 24
+greedy tokens. The BF16 SafeTensors fallback matches its base prefill
+and eight cached decode rows.
+
+| Prompt tokens | Base decode tok/s | Packed fused decode tok/s | Median decode peak reduction |
+| ---: | ---: | ---: | ---: |
+| 128 | 183.84 | 187.59 | 1,572,960 bytes |
+| 781 | 175.66 | 179.48 | 1,572,872 bytes |
+| 1,536 | 166.98 | 171.07 | 1,572,884 bytes |
+
+### Metal packed causal projection windows
+
+For a 781-token prefix on the pinned Q4_K_M, the release probe appends 48
+known tokens with one warmup and reports medians over five paired runs.
+The reference uses the existing small-batch kernels with the same packed
+gate/up and Q6_K vocabulary paths. Target-side throughput measures cached
+appends from submission through completion.
+
+| Tokens per append | Reference tok/s | Scalar-order tiled tok/s | Peak decode allocation |
+| ---: | ---: | ---: | ---: |
+| 4 | 105.09 | 209.81 | 1,185,163,672 bytes |
+| 8 | 138.67 | 276.82 | 1,210,458,946 bytes |
+
+Peak decode allocation matches the reference at each width. Serial decode
+on the same integration measures 173.65 tok/s. The eight-token window
+uses 66.02 MiB more peak decode allocation than serial. Five retained
+Q4_K/Q6_K matrices compare bit for bit with scalar projections at all seven
+window widths. A seven-token prefill followed by single-token decode also
+matches bit for bit. The checked window-end token predictions agree with
+serial at every width. The cached-append probe returns the last score row
+of each window. The largest absolute difference over those rows at width
+eight is `2.91e-5`.
+
+The facade pair uses seven proposals per round. With the Q4_K_M as its own
+draft, ordinary and explicitly advanced speculation each accept 42 of 42
+proposals and match serial generation over 48 committed tokens. With the
+released Q6_K as draft, both modes accept 41 of 43 proposals and match serial
+generation and termination over 48 committed tokens. The Metal dispatch
+trace confirms both packed window kernels execute during verification.
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same

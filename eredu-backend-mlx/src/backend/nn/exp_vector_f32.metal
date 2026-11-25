@@ -1,8 +1,13 @@
 
+#ifndef EREDU_LOCAL_EXP_CONTRACTION
 #pragma clang fp contract(off)
+#endif
 // Port of the FP32 vector exponential used by the CPU mechanism.
 // See THIRD-PARTY-NOTICES for Arm Optimized Routines and ggml attribution.
 inline float vector_exp_f32(float x) {
+#ifdef EREDU_LOCAL_EXP_CONTRACTION
+#pragma clang fp contract(off)
+#endif
     const float biased = fma(x, 0x1.715476p0f, 12582912.f);
     const float n = biased - 12582912.f;
     if (!isfinite(x) || abs(n) > 126.f) return stable_exp_f32(x);

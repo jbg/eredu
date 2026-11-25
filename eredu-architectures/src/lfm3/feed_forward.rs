@@ -71,9 +71,7 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let gate = self.gate.forward(input, context)?;
-        let up = self.up.forward(input, context)?;
-        B::gated_product(gate, up, self.policy, context)
+        B::project_gated_product(&mut self.gate, &mut self.up, input, self.policy, context)
     }
 
     pub(crate) fn forward_instrumented(
