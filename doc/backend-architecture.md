@@ -1371,6 +1371,12 @@ memory for a complete key row. The fused operator applies post-product scaling
 and masking, preserves the compensated softmax sum, and preserves the score and
 value reduction lanes. Unsupported geometry and requests with score caps or
 sink logits use the explicit products and softmax.
+Eligible single-query FP32 Metal attention uses the decode score and value kernels
+through 8,192 key positions. For rows above 4,096 positions, one staged
+ordered softmax per query head supplies the value-column groups. The score
+kernel applies scaling and masking, and the value kernel reads the original
+KV strides while preserving the 16-lane accumulation order. Scratch consists
+of score and probability rows plus kernel-local state.
 Key rows beyond the complete-row workspace cap use the two-scan bounded
 mechanism. For contiguous single-query FP32 Metal attention, each sweep
 completes up to 16 adjacent 256-position tiles per evaluation. Tile products and
