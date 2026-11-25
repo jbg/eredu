@@ -369,6 +369,24 @@ pub(crate) const INPUT_SCORE_WORKSPACE: eredu_core::attention::InputScoreAttenti
 // softmax and projection temporaries do not. Small invocations stay lazy.
 const INPUT_SCORE_LIVE_TILE_BATCH: usize = 32;
 const INPUT_SCORE_KEY_TILE_POSITIONS: usize = 256;
+// Keep a decode group's score positions within the ordinary score workspace.
+const INPUT_SCORE_DECODE_KEY_TILE_BATCH: usize = 16;
+
+pub(crate) fn input_score_key_tile_batch(
+    queries: u64,
+    float32: bool,
+    device: Option<safemlx::DeviceType>,
+) -> usize {
+    if queries == 1
+        && float32
+        && device == Some(safemlx::DeviceType::Gpu)
+        && cfg!(all(feature = "metal", not(feature = "cuda")))
+    {
+        INPUT_SCORE_DECODE_KEY_TILE_BATCH
+    } else {
+        1
+    }
+}
 
 /// Scaled attention with an optional score transform, before masks and sink logits.
 #[allow(clippy::too_many_arguments)]
@@ -886,6 +904,16 @@ fn input_score_attention_with_tile_batches(
     };
     let tile_count = (queries.dim(2) as usize).div_ceil(query_step as usize);
     let evaluate_batches = prepared.is_some() && tile_count > live_tile_batch;
+    let key_tile_batch = if prepared.is_none() {
+        input_score_key_tile_batch(
+            queries.dim(2) as u64,
+            queries.dtype() == Dtype::Float32,
+            Some(stream.get_device()?.get_type()?),
+        )
+    } else {
+        1
+    };
+    let key_group_positions = (INPUT_SCORE_KEY_TILE_POSITIONS * key_tile_batch) as i32;
     let mut completed_tiles = 0;
     for start in (0..queries.dim(2)).step_by(query_step as usize) {
         let end = (start + query_step).min(queries.dim(2));
@@ -941,7 +969,8 @@ fn input_score_attention_with_tile_batches(
                     keys.try_index_device((.., .., key_start..key_end, ..), stream)?,
                     values.try_index_device((.., .., key_start..key_end, ..), stream)?,
                 );
-                accumulator.accumulate(&block, stream)?;
+                let complete_group = key_end % key_group_positions == 0 || key_end == keys.dim(2);
+                accumulator.accumulate_contiguous(&block, complete_group, stream)?;
             }
         }
         outputs.push(accumulator.finish(stream)?);
