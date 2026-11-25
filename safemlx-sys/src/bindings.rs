@@ -4946,6 +4946,7 @@ extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn mlx_metal_steel_gemm_preamble() -> *const ::std::os::raw::c_char;
     pub fn mlx_mixed_storage_gemm_workspace(
         supported: *mut bool,
         partial_bytes: *mut u64,

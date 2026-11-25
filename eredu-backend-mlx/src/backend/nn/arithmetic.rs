@@ -1,6 +1,5 @@
 //! Native pointwise and softmax arithmetic with explicit rounding.
 use safemlx::{error::Exception, Array, Stream};
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(crate) fn metal_arithmetic_header() -> &'static str {
     static HEADER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HEADER.get_or_init(|| {

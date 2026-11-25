@@ -8,6 +8,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Process-lifetime UTF-8 Steel GEMM shader definitions, or NULL when the
+ * bundled Metal JIT is unavailable. */
+const char* mlx_metal_steel_gemm_preamble(void);
 /* Inference-only operation: F32 [...,K] times narrow [N,K] transposed.
  * Unsupported cases return success with supported=false and leave res unchanged.
  * Does not evaluate inputs. Requires settled contiguous weights and native SIMD
