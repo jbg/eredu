@@ -7,8 +7,8 @@ use eredu_nn::{
     AttentionCache, CausalDepthwiseConvolutionSpec, ConvolutionActivation,
     DeclareLogicalParameters, Error, FixedShapeReplay, GatedShortConvolution,
     GatedShortConvolutionSpec, GroupedNeuralBackend, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, RotarySpec, Tensor,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, RotarySpec,
+    Tensor,
 };
 use eredu_runtime::RuntimeStateComponents;
 
