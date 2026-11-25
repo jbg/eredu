@@ -134,6 +134,29 @@ prefill and eight cached rows are also bit-identical for the pinned short and
 781-token teacher-forced inputs and the 384-, 385-, 781- and 1,536-token greedy
 runs. Every predicted token ID agrees.
 
+### Metal boolean-masked prefill
+
+FP32 Metal attention writes negative infinity for a masked score before
+evaluating its QK product. From 4,097 through 8,192 key positions the
+boolean-masked path uses the shared strided score kernel within the bounded
+query tiles. The score, softmax, and value reductions retain their order.
+
+On M3 Ultra with the pinned Q4_K_M, the release checkpoint probe compares
+this path against `c3e628dbc` using `MLX_ENABLE_TF32=0`, prompt IDs
+`1 + (13*i) % 128000`, one warmup, and three interleaved pairs per length.
+The first 2,048- and 8,192-token pairs also compare eight teacher-forced
+cached rows with the same ID sequence starting at `i = 12000`. Final prefill
+scores and all checked cached scores and token IDs match bit for bit.
+Ordinary, explicitly advanced, and snapshot-restored generation agree on
+all 16 generated token IDs and the finish reason from an 8,188-token prefix.
+
+| Prompt tokens | Reference tokens/s | Masked-score tokens/s | Peak MLX allocation change |
+| ---: | ---: | ---: | ---: |
+| 781 | 3,415 | 3,612 | 0 bytes |
+| 2,048 | 3,071 | 3,483 | 0 bytes |
+| 4,096 | 1,237 | 1,605 | 0 bytes |
+| 8,192 | 1,029 | 1,142 | −262,172 bytes |
+
 ### Metal decode graph replay
 
 On the M3 Ultra with the pinned Q4_K_M artifact, the resident single-device

@@ -1369,8 +1369,11 @@ conservative scratch and dependency-release accounting.
 Ordered FP32 Metal prefill can retain scores and probabilities in threadgroup
 memory for a complete key row. The fused operator applies post-product scaling
 and masking, preserves the compensated softmax sum, and preserves the score and
-value reduction lanes. Unsupported geometry and requests with score caps or
-sink logits use the explicit products and softmax.
+value reduction lanes. A boolean mask excludes its QK product before the
+score kernel reads Q or K. Rows from 4,097 to 8,192 keys with a boolean mask
+use the shared score kernel inside the existing bounded query tiles, then the
+ordered softmax and value product. Unsupported geometry and requests with
+score caps or sink logits use the explicit products and softmax.
 Eligible single-query FP32 Metal attention uses the decode score and value kernels
 through 8,192 key positions. For rows above 4,096 positions, one staged
 ordered softmax per query head supplies the value-column groups. The score
