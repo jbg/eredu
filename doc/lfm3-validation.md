@@ -158,6 +158,27 @@ controlled advancement and after snapshot restore.
 | 781 | 145.93 | 155.22 | 200 bytes |
 | 1,536 | 139.26 | 150.31 | 224 bytes |
 
+### Metal fused FP32 gated convolution
+
+The single-token Metal operator fuses the input gate, ordered four-lane
+depthwise sum, output gate, and replacement carry. The native step uses one
+shader for FP32 and BF16, with rounding at the activation dtype after the
+input gate and the ordered sum. The portable model installs the returned carry
+through its usual state path. The fused step is eligible for fixed-shape replay.
+
+On the pinned Q4_K_M artifact, the same five-pair release schedule compares
+the fused step against replay at revision `4aa0c9c5e`. Prefill and every
+decode vocabulary row match bit for bit, including greedy runs. Ordinary,
+controlled, and snapshot-restored generation agree over 24 generated tokens.
+The 269-token BF16 SafeTensors case also matches its base revision on every
+prefill and cached decode score across eight decode steps.
+
+| Prompt tokens | Base decode tok/s | Fused decode tok/s | Median decode peak reduction |
+| ---: | ---: | ---: | ---: |
+| 128 | 163.42 | 179.24 | 1,065,012 bytes |
+| 781 | 156.72 | 170.93 | 1,032,276 bytes |
+| 1,536 | 150.34 | 163.08 | 1,065,012 bytes |
+
 ## Same-artifact GGUF interoperability
 
 Eredu Metal with `MLX_ENABLE_TF32=0` and pinned llama.cpp Metal execute the same
