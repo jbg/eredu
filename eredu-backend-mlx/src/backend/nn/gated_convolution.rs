@@ -25,34 +25,36 @@ pub(crate) fn causal_depthwise_step(
         let [channels, 1, taps] = *weight.shape() else {
             return Ok(None);
         };
+        let dtype = projected.dtype();
         if batch <= 0
             || channels <= 0
             || channels.checked_mul(3) != Some(width)
             || taps <= 1
             || history.shape() != [batch, taps - 1, channels]
-            || [projected, history, weight]
-                .iter()
-                .any(|array| array.dtype() != Dtype::Bfloat16)
+            || !matches!(dtype, Dtype::Float32 | Dtype::Bfloat16)
+            || history.dtype() != dtype
+            || weight.dtype() != dtype
             || stream.get_device()?.get_type()? != DeviceType::Gpu
         {
             return Ok(None);
         }
 
         let config = CustomKernelConfig::new()
+            .with_template_arg_dtype("T", dtype)
             .with_template_arg_int("CHANNELS", channels)
             .with_template_arg_int("TAPS", taps)
             .with_grid([channels, batch, 1])
             .with_thread_group([128, 1, 1])
-            .with_output_arg(&[batch, 1, channels], Dtype::Bfloat16)
-            .with_output_arg(history.shape(), Dtype::Bfloat16);
+            .with_output_arg(&[batch, 1, channels], dtype)
+            .with_output_arg(history.shape(), dtype);
         return KERNEL.with(|cell| {
             let mut kernel = cell.borrow_mut();
             if kernel.is_none() {
                 *kernel = Some(MetalKernel::new(
-                    "bf16_gated_causal_depthwise_step",
+                    "gated_causal_depthwise_step",
                     ["projected", "history", "weights"],
                     ["output", "next_history"],
-                    include_str!("bf16_gated_causal_depthwise_step.metal"),
+                    include_str!("gated_causal_depthwise_step.metal"),
                     "",
                     true,
                     false,

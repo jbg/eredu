@@ -135,6 +135,7 @@ impl Tensor for MlxTensor {
         // declared outputs. All other custom kernels decline replay.
         const REPLAYABLE_KERNELS: &[&str] = &[
             "f32_pointwise",
+            "gated_causal_depthwise_step",
             "native_q4k_decode_2row",
             "native_q6k_decode_2row",
             "ordered_f32_attention_rows",
